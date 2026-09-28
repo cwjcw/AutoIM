@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AutoIM runtime output
+logs/*.log
+outputs/wecom-uia-tree.txt
+outputs/clipboard-diagnostics.txt
+outputs/clipboard-diagnostics-summary.txt
