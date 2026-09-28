@@ -70,7 +70,8 @@ def _yes_no(value: bool) -> str:
 
 
 def _attempt_section(result: CopyAttempt, contact_name: str,
-                     chat_message_state: str, unrelated_state: str) -> list[str]:
+                     chat_message_state: str, unrelated_state: str,
+                     save_body: bool) -> list[str]:
     contact_present = _yes_no(bool(contact_name and contact_name in result.text)) if contact_name else "未填写联系人名称，无法判断"
     return [
         result.name,
@@ -85,15 +86,15 @@ def _attempt_section(result: CopyAttempt, contact_name: str,
         f"是否出现界面无关文本：{unrelated_state}",
         f"耗时：{result.elapsed_ms} ms",
         f"错误：{result.error or '无'}",
-        "文本内容（完整）：",
-        result.text if result.text else "<无文本>",
+        "文本内容（完整）：" if save_body else "文本正文：默认未保存（可启用开发诊断正文保存）",
+        (result.text if result.text else "<无文本>") if save_body else "<未保存>",
         "",
     ]
 
 
 def _render_outputs(results: list[dict[str, Any]], metadata: dict[str, Any],
                     contact_name: str, chat_message_state: str,
-                    unrelated_state: str) -> tuple[str, str]:
+                    unrelated_state: str, save_body: bool = False) -> tuple[str, str]:
     hwnd = int(metadata["hwnd"])
     pid = metadata.get("pid")
     window_title = metadata.get("window_title", "")
@@ -109,7 +110,7 @@ def _render_outputs(results: list[dict[str, Any]], metadata: dict[str, Any],
         "",
     ]
     for result in records:
-        transcript.extend(_attempt_section(result, contact_name, chat_message_state, unrelated_state))
+        transcript.extend(_attempt_section(result, contact_name, chat_message_state, unrelated_state, save_body))
 
     lines = [
         "AutoIM 企业微信剪贴板诊断汇总",
@@ -129,7 +130,7 @@ def _render_outputs(results: list[dict[str, Any]], metadata: dict[str, Any],
             f"剪贴板是否变化：{_yes_no(result.clipboard_changed)}",
             f"是否获得文本：{_yes_no(result.has_text)}",
             f"文本长度：{result.text_length}",
-            f"文本内容前 500 字符：{result.text[:500] or '<无文本>'}",
+            f"文本内容前 500 字符：{(result.text[:500] or '<无文本>') if save_body else '<未保存>'}",
             f"是否出现联系人名称：{contact_present}",
             f"是否出现聊天消息：{chat_message_state}",
             f"是否出现界面无关文本：{unrelated_state}",
@@ -143,10 +144,10 @@ def _render_outputs(results: list[dict[str, Any]], metadata: dict[str, Any],
 
 def update_manual_copy_report(result: dict[str, Any], contact_name: str,
                               chat_message_state: str,
-                              unrelated_state: str) -> dict[str, str]:
+                              unrelated_state: str, save_body: bool = False) -> dict[str, str]:
     transcript, summary = _render_outputs(
         result["results"], result["metadata"], contact_name,
-        chat_message_state, unrelated_state,
+        chat_message_state, unrelated_state, save_body,
     )
     output_path = Path(result["output_path"])
     summary_path = Path(result["summary_path"])
@@ -160,7 +161,8 @@ def update_manual_copy_report(result: dict[str, Any], contact_name: str,
 def run_manual_copy_test(contact_name: str,
                          output_path: Path, summary_path: Path,
                          timeout: float = 3.0,
-                         driver: WeComDriver | None = None) -> dict[str, Any]:
+                         driver: WeComDriver | None = None,
+                         save_body: bool = False) -> dict[str, Any]:
     """Run Ctrl+C and Ctrl+A+Ctrl+C after the user manually focuses a chat area."""
     driver = driver or WeComDriver()
     attempts = [
@@ -187,7 +189,7 @@ def run_manual_copy_test(contact_name: str,
         "output_path": str(output_path),
         "summary_path": str(summary_path),
     }
-    rendered = update_manual_copy_report(result, contact_name, "待人工核对", "待人工核对")
+    rendered = update_manual_copy_report(result, contact_name, "待人工核对", "待人工核对", save_body)
     result.update(rendered)
     logger.info("手工复制诊断完成，结果=%s 汇总=%s", output_path, summary_path)
     return result

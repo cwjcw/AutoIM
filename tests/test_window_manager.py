@@ -105,6 +105,13 @@ class WindowManagerTests(unittest.TestCase):
             self.manager.verify_foreground()
         self.assertFalse(any(item[0] == "foreground" for item in self.api.calls))
 
+    def test_is_foreground_is_passive(self):
+        self.api.foreground = 100
+        self.assertTrue(self.manager.is_foreground(100))
+        self.api.foreground = 999
+        self.assertFalse(self.manager.is_foreground(100))
+        self.assertFalse(any(item[0] == "foreground" for item in self.api.calls))
+
     def test_clipboard_action_is_not_reached_if_foreground_guard_fails(self):
         self.api.activate = False
         with patch("autoim.wecom.driver.clipboard.clear_clipboard") as clear:

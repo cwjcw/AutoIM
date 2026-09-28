@@ -222,3 +222,5 @@ logs/*.log
 outputs/wecom-uia-tree.txt
 outputs/clipboard-diagnostics.txt
 outputs/clipboard-diagnostics-summary.txt
+config/wecom-calibration.json
+outputs/vision-diagnostics/copied-message.txt

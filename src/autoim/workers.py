@@ -23,6 +23,8 @@ class ClientInfo:
     uia_accessible: bool = False
     detail: str = ""
     class_name: str = ""
+    rect: tuple[int, int, int, int] | None = None
+    is_foreground: bool = False
 
 
 class WorkerSignals(QObject):
@@ -96,7 +98,43 @@ def detect_wecom() -> ClientInfo:
         detail = f"UI Automation 不可访问：{exc}"
     return ClientInfo(
         True, window.pid, window.process_path, window.title, window.hwnd,
-        accessible, detail, window.class_name,
+        accessible, detail, window.class_name, window.rect,
+        WeComWindowManager().is_foreground(window.hwnd),
+    )
+
+
+def refresh_wecom_status() -> ClientInfo:
+    """Refresh window identity and foreground status without activating WeCom."""
+    if os.name != "nt":
+        return ClientInfo(False, detail="企业微信检测仅支持 Windows。")
+    process_names = {"wxwork.exe", "wecom.exe", "wxworklocal.exe"}
+    processes = []
+    for proc in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            if str(proc.info.get("name") or "").casefold() in process_names:
+                processes.append(proc.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    if not processes:
+        return ClientInfo(False, detail="未检测到运行中的企业微信进程。")
+
+    from autoim.wecom.window_manager import WeComWindowManager
+
+    manager = WeComWindowManager()
+    try:
+        window = manager.resolve_window()
+    except Exception as exc:
+        info = processes[0]
+        return ClientInfo(
+            True,
+            int(info["pid"]),
+            str(info.get("exe") or ""),
+            detail=f"进程已运行，但未能唯一确认可见主窗口：{exc}",
+        )
+    return ClientInfo(
+        True, window.pid, window.process_path, window.title, window.hwnd,
+        False, "", window.class_name, window.rect,
+        manager.is_foreground(window.hwnd),
     )
 
 

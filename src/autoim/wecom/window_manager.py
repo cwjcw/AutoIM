@@ -165,6 +165,18 @@ class WeComWindowManager:
             raise WindowResolutionError(error)
         return info
 
+    def is_foreground(self, hwnd: int | None = None) -> bool:
+        """Passively report whether the freshly resolved WeCom window is foreground."""
+        try:
+            info = self.resolve_window()
+            if hwnd is not None and info.hwnd != int(hwnd):
+                return False
+            win32gui, _ = self._windows_api()
+            return bool(win32gui.IsWindow(info.hwnd) and int(win32gui.GetForegroundWindow()) == info.hwnd)
+        except Exception:
+            logger.debug("无法被动确认企业微信前台状态", exc_info=True)
+            return False
+
     def ensure_foreground(self) -> WeComWindowInfo:
         last_foreground = 0
         for attempt in range(1, self.max_activation_attempts + 1):

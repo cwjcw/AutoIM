@@ -2,7 +2,7 @@
 
 AutoIM 是面向 Windows 的桌面 IM 自动化能力验证工具。当前阶段仅支持**企业微信 Windows 客户端**，提供 PySide6 GUI、进程和主窗口检测、UI Automation 诊断，以及用户手动选择后的剪贴板复制可行性测试。
 
-当前开发阶段为 **P1.6：安全企业微信窗口管理与 Driver 基础架构**。剪贴板可行性已由用户确认：正常复制可包含 Unicode 文本及企业微信格式数据。
+当前开发阶段为 **P1.7：安全定位与当前可见消息读取 PoC**。P1.6 的窗口管理基础已由用户在 Windows 11 / 企业微信 5.1+ 真机验证。用户已确认选中文字后可由 AutoIM 激活企业微信并通过 Ctrl+C 复制到 Windows Clipboard。
 
 架构将 IM 客户端探测与界面分开，后续可以添加微信、钉钉、飞书或其他 IM 的适配器；当前版本不包含这些适配器。
 
@@ -19,7 +19,12 @@ AutoIM 是面向 Windows 的桌面 IM 自动化能力验证工具。当前阶段
 - 多后端报告保存在 `outputs/uia-diagnostics/`：`uiautomation.txt`、`pywinauto-uia.txt`、`pywinauto-win32.txt`、`raw-view.txt` 和 `summary.txt`。
 - “剪贴板诊断”提供企业微信激活、读取 / 清空剪贴板、Ctrl+C、Ctrl+A + Ctrl+C、Ctrl+V、Esc 和手工复制测试。测试开始前由用户手动打开聊天并聚焦目标消息/区域；AutoIM 只恢复企业微信前台并发送快捷键，不自动选择联系人或消息。
 - 企业微信桌面动作经 `WeComWindowManager` 动态重新解析并校验 PID/HWND、`WeWorkWindow` 类名和窗口标题；恢复最小化窗口后，最多尝试 3 次激活并核对 `GetForegroundWindow()`。目标歧义或前台校验失败时，快捷键和剪贴板动作取消并写日志。窗口变化会刷新 GUI 的 PID/HWND 信息。
-- `WeComDriver` 将键盘/剪贴板操作与 WeCom 窗口管理分开。剪贴板读取、清空、序列号检查都在前台校验之后进行；等待复制结果时会被动检查焦点，若用户切换到其他应用则立即取消，不再抢回焦点。窗口管理使用普通 Windows API，不设置置顶、不用屏幕坐标，不做隐蔽或规避检测操作。
+- 企业微信状态区显示连接状态、PID、HWND、标题、ClassName、Rectangle 和前台状态；后台每 2.5 秒被动刷新窗口身份，检测窗口重启和关闭。
+- `读取当前剪贴板` 只直接读取 Windows Clipboard，不激活或抢占企业微信前台。清空剪贴板、键盘快捷键及后续点击继续要求企业微信身份/前台 guard。
+- 界面标定支持会话列表、聊天标题、聊天消息和输入框。GUI 展示企业微信窗口截图，用户可拖框选区域并预览、保存、重新标定或删除。标定文件 `config/wecom-calibration.json` 只保存窗口内 0..1 相对坐标；窗口移动、大小变化后基于新窗口 rectangle 换算。
+- “测试当前消息定位（Dry Run）”只允许截图、点选、计算并显示计划位置，不调用真实鼠标/键盘 API。消息区未标定、窗口身份或 rectangle 改变、点位越出窗口/已标定消息区、前台验证失败时真实复制会停止。
+- “真实复制测试”在窗口截图中由用户点选一条当前可见文字消息，AutoIM 重新检查 PID/HWND/Rectangle 和前台状态后正常点击一次、发送 Ctrl+C，再读取变化后的 Windows Clipboard。消息正文默认仅显示在 GUI；普通日志只记录文本长度、Clipboard 方式、SHA256 和核验状态。开发诊断正文保存复选框默认关闭，启用后写到 `outputs/vision-diagnostics/copied-message.txt`。
+- 窗口截图只抓企业微信主窗口，不默认保存截图；聊天标题只展示经标定的局部截图并由用户人工核对，不对整个界面 OCR。
 - 剪贴板文本在 GUI 显示并写入 `outputs/clipboard-diagnostics.txt`；`outputs/clipboard-diagnostics-summary.txt` 记录是否有文本、长度、前 500 字符、剪贴板是否变化及联系人名匹配。聊天内容和无关界面文本由用户核对后在 GUI 标记。
 - 通用 Windows 剪贴板与键盘封装位于 `src/autoim/automation/`，不依赖企业微信页面实现。
 - `src/autoim/wecom/` 放置企业微信 `WeComWindowManager` 与 `WeComDriver`。
@@ -53,7 +58,11 @@ uv run autoim
 uv run python -m autoim
 ```
 
-进入“企业微信”页面点击“检测企业微信”。进入“剪贴板诊断”前，先在企业微信手动打开聊天并点击一条文字消息或聊天区域，再点击“开始手工复制测试”。测试会清空并覆盖当前剪贴板，然后依次发送 Ctrl+C 和 Ctrl+A + Ctrl+C；请先确认剪贴板中没有需要保留的内容。普通 UIA 扫描结果保存到 `outputs/wecom-uia-tree.txt`，UIA 多后端结果保存到 `outputs/uia-diagnostics/`，剪贴板结果保存到 `outputs/clipboard-diagnostics*.txt`。日志路径为 `logs/autoim.log`。
+进入“企业微信”页面后状态会自动刷新。使用“界面标定”时选择要标定的区域，在企业微信窗口截图中拖框并点击保存；建议先标定“聊天消息区域”。“测试标定”会显示该窗口相对区域对应的局部截图。
+
+Dry Run 会在截图中点选测试位置，显示计划屏幕点并明确提示未执行输入。真实复制测试前，用户应手动打开目标会话、确保屏幕上显示目标文字消息，并点选截图中对应的位置。AutoIM 会校验后执行正常点击和 Ctrl+C。完成后请对照企业微信可见内容确认剪贴板正文；只有明确人工确认后才会显示 `VERIFIED`。会话标题可以通过“聊天标题区域”的局部截图人工核对；当前不运行全界面 OCR。
+
+注意：“开始手工复制测试”属于早期剪贴板诊断，会清空并覆盖当前剪贴板并依次发送 Ctrl+C 与 Ctrl+A + Ctrl+C。请先确认剪贴板中没有需要保留的内容。普通 UIA 扫描结果在 `outputs/wecom-uia-tree.txt`，UIA 多后端结果在 `outputs/uia-diagnostics/`，剪贴板结果在 `outputs/clipboard-diagnostics*.txt`，P1.7 诊断正文仅在用户主动启用保存时写入 `outputs/vision-diagnostics/`。日志路径为 `logs/autoim.log`。
 
 ## 项目结构
 
@@ -63,7 +72,10 @@ uv run python -m autoim
 │   ├── app.py          # PySide6 界面、页面和日志配置
 │   ├── diagnostics.py  # 多 backend 扫描、Raw View、权限检查和汇总报告
 │   ├── backend_runner.py # 独立 backend 进程入口，用于硬超时隔离
-│   ├── automation/     # 通用 Windows 剪贴板与键盘模块
+│   ├── automation/     # 通用 Windows 剪贴板、键盘和鼠标模块
+│   ├── calibration.py  # 仅保存窗口相对标定区域
+│   ├── vision.py       # 相对坐标与点击边界验证
+│   ├── vision_widgets.py # 截图区域 / 点选窗口
 │   ├── wecom/          # 动态窗口管理与前台校验过的 Driver
 │   ├── safety.py       # BLOCKED_BY_SAFETY 日志标记 helper
 │   ├── clipboard_diagnostics.py # 用户手工选区复制测试与报告
