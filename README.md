@@ -2,6 +2,8 @@
 
 AutoIM 是面向 Windows 的桌面 IM 自动化能力验证工具。当前阶段仅支持**企业微信 Windows 客户端**，提供 PySide6 GUI、进程和主窗口检测、UI Automation 诊断，以及用户手动选择后的剪贴板复制可行性测试。
 
+仓库新增独立的 `android-agent/`：AutoIM Android Agent 0.1.2 离线消息解析与检测。Redmi Note 11R 已完成 P-A1.1 的正文、标题、左右消息、输入框和发送按钮验证；P-A1.2 新增普通一对一文本解析、方向、有序新消息检测、重复过滤与安全重同步，仍为 IN_PROGRESS，等待 0.1.2 真机验收。保留原结构诊断、快照搜索与完整树。Android Agent 不改变 Windows Agent 代码，也不含网络、自动点击或自动发送能力。详见 [android-agent/README.md](android-agent/README.md)。
+
 当前开发阶段为 **P1.7：安全定位与当前可见消息读取 PoC**。P1.6 的窗口管理基础已由用户在 Windows 11 / 企业微信 5.1+ 真机验证。用户已确认选中文字后可由 AutoIM 激活企业微信并通过 Ctrl+C 复制到 Windows Clipboard。
 
 架构将 IM 客户端探测与界面分开，后续可以添加微信、钉钉、飞书或其他 IM 的适配器；当前版本不包含这些适配器。
@@ -35,7 +37,7 @@ AutoIM 是面向 Windows 的桌面 IM 自动化能力验证工具。当前阶段
 
 ## 当前范围之外
 
-本阶段不实现 AI/LLM、自动回复、消息读取、未读消息监听、OCR、截图识别、Hook、DLL 注入、逆向工程、SQLite、Web API 或服务端。
+Windows P1.7 不实现 AI/LLM、自动回复、消息读取、未读消息监听、OCR、截图识别、Hook、DLL 注入、逆向工程、SQLite、Web API 或服务端。Android P-A1.2 仅解析当前可见普通文本并在本机检测变化，其余范围仍禁止。
 
 ## 环境
 
@@ -87,6 +89,7 @@ Dry Run 会在截图中点选测试位置，显示计划屏幕点并明确提示
 ├── docs/OPEN_SOURCE_RESEARCH.md # 指定开源项目的安全筛选研究
 ├── scripts/check_security_surface.py # 源码与依赖危险能力标记检查
 ├── tests/              # 窗口管理、Driver guard、GUI 同步与安全表层测试
+├── android-agent/      # 独立 Kotlin Android 诊断 APK 工程
 ├── pyproject.toml
 └── README.md
 ```

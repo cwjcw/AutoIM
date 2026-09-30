@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">AutoIM Agent</string>
+    <string name="accessibility_service_label">AutoIM 企业微信诊断</string>
+    <string name="accessibility_service_description">仅在诊断模式开启且企业微信位于前台时读取无障碍节点；不会点击或输入。</string>
+    <string name="notification_listener_label">AutoIM 企业微信通知诊断</string>
+    <string name="status_accessibility">Accessibility：%1$s%2$s</string>
+    <string name="status_worked"> / 已工作</string>
+    <string name="status_waiting">已授权 / 等待连接</string>
+    <string name="status_connected">已连接</string>
+    <string name="status_unauthorized">未授权</string>
+    <string name="status_notification">Notification Access：%1$s%2$s</string>
+    <string name="status_notification_connected"> / 已连接</string>
+    <string name="status_diagnostic">诊断模式：%1$s</string>
+    <string name="status_enabled">开启</string>
+    <string name="status_disabled">关闭</string>
+    <string name="diagnostic_section_title">%1$s %2$s</string>
+</resources>
