@@ -2,7 +2,7 @@
 
 AutoIM 是面向 Windows 的桌面 IM 自动化能力验证工具。当前阶段仅支持**企业微信 Windows 客户端**，提供 PySide6 GUI、进程和主窗口检测、UI Automation 诊断，以及用户手动选择后的剪贴板复制可行性测试。
 
-仓库新增独立的 `android-agent/`：AutoIM Android Agent 0.1.2 离线消息解析与检测。Redmi Note 11R 已完成 P-A1.1 的正文、标题、左右消息、输入框和发送按钮验证；P-A1.2 新增普通一对一文本解析、方向、有序新消息检测、重复过滤与安全重同步，仍为 IN_PROGRESS，等待 0.1.2 真机验收。保留原结构诊断、快照搜索与完整树。Android Agent 不改变 Windows Agent 代码，也不含网络、自动点击或自动发送能力。详见 [android-agent/README.md](android-agent/README.md)。
+仓库新增独立的 `android-agent/`：AutoIM Android Agent 0.1.3 离线消息解析与检测。Redmi Note 11R 已完成 P-A1.1 的正文、标题、左右消息、输入框和发送按钮验证；P-A1.2 已实现普通一对一文本解析、方向、有序新消息检测、重复过滤与安全重同步。0.1.3 修复标题组、主标题和身份/状态装饰解析，仍为 IN_PROGRESS，等待 0.1.3 真机验证。保留原结构诊断、快照搜索与完整树。Android Agent 不改变 Windows Agent 代码，也不含网络、自动点击或自动发送能力。详见 [android-agent/README.md](android-agent/README.md)。
 
 当前开发阶段为 **P1.7：安全定位与当前可见消息读取 PoC**。P1.6 的窗口管理基础已由用户在 Windows 11 / 企业微信 5.1+ 真机验证。用户已确认选中文字后可由 AutoIM 激活企业微信并通过 Ctrl+C 复制到 Windows Clipboard。
 
@@ -23,9 +23,11 @@ AutoIM 是面向 Windows 的桌面 IM 自动化能力验证工具。当前阶段
 - 企业微信桌面动作经 `WeComWindowManager` 动态重新解析并校验 PID/HWND、`WeWorkWindow` 类名和窗口标题；恢复最小化窗口后，最多尝试 3 次激活并核对 `GetForegroundWindow()`。目标歧义或前台校验失败时，快捷键和剪贴板动作取消并写日志。窗口变化会刷新 GUI 的 PID/HWND 信息。
 - 企业微信状态区显示连接状态、PID、HWND、标题、ClassName、Rectangle 和前台状态；后台每 2.5 秒被动刷新窗口身份，检测窗口重启和关闭。
 - `读取当前剪贴板` 只直接读取 Windows Clipboard，不激活或抢占企业微信前台。清空剪贴板、键盘快捷键及后续点击继续要求企业微信身份/前台 guard。
-- 界面标定支持会话列表、聊天标题、聊天消息和输入框。GUI 展示企业微信窗口截图，用户可拖框选区域并预览、保存、重新标定或删除。标定文件 `config/wecom-calibration.json` 只保存窗口内 0..1 相对坐标；窗口移动、大小变化后基于新窗口 rectangle 换算。
-- “测试当前消息定位（Dry Run）”只允许截图、点选、计算并显示计划位置，不调用真实鼠标/键盘 API。消息区未标定、窗口身份或 rectangle 改变、点位越出窗口/已标定消息区、前台验证失败时真实复制会停止。
-- “真实复制测试”在窗口截图中由用户点选一条当前可见文字消息，AutoIM 重新检查 PID/HWND/Rectangle 和前台状态后正常点击一次、发送 Ctrl+C，再读取变化后的 Windows Clipboard。消息正文默认仅显示在 GUI；普通日志只记录文本长度、Clipboard 方式、SHA256 和核验状态。开发诊断正文保存复选框默认关闭，启用后写到 `outputs/vision-diagnostics/copied-message.txt`。
+- 界面标定支持会话列表、聊天标题、聊天消息和输入框。GUI 展示企业微信窗口截图，用户可拖框选区域并预览、保存、重新标定或删除。标定文件 `config/wecom-calibration.json` 只保存窗口内 0..1 相对坐标；旧版坐标会被忽略，需重新标定。
+- 截图选区统一使用 `DisplayTransform`，从 Qt 控件鼠标坐标减去图片居中 offset，再按图片实际显示宽高映射至 0..1。QPixmap 的 DPR 只显示在诊断信息，不参与固定补偿；留白区的点和框会拒绝。诊断窗显示源图、控件、实际显示图尺寸、offset、DPR、拖框、源图矩形、normalized 和回显矩形。保存后重新读取配置并立即将区域叠加到当前截图；往返误差大于 2 控件像素时拒绝保存。
+- “测试当前消息定位（Dry Run）”只允许截图、点选、计算并显示计划位置，不调用真实鼠标/键盘 API。消息区未标定、窗口身份或 rectangle 改变、点位越出窗口/已标定消息区、前台验证失败时操作会停止。
+- **真实复制测试目前被安全闩禁用**：企业微信真机测试曾发现标定回显有明显比例偏差。GUI 按钮禁用，`WeComDriver` 真实点击和复制接口默认 Fail Closed；用户重新完成真机标定验收前不会执行真实鼠标或键盘动作。坐标单元测试通过不替代真机验收。
+- 复制/诊断正文默认不写入日志或报告。开发诊断正文保存复选框默认关闭，启用后才写到 `outputs/vision-diagnostics/copied-message.txt`。
 - 窗口截图只抓企业微信主窗口，不默认保存截图；聊天标题只展示经标定的局部截图并由用户人工核对，不对整个界面 OCR。
 - 剪贴板文本在 GUI 显示并写入 `outputs/clipboard-diagnostics.txt`；`outputs/clipboard-diagnostics-summary.txt` 记录是否有文本、长度、前 500 字符、剪贴板是否变化及联系人名匹配。聊天内容和无关界面文本由用户核对后在 GUI 标记。
 - 通用 Windows 剪贴板与键盘封装位于 `src/autoim/automation/`，不依赖企业微信页面实现。
@@ -62,7 +64,7 @@ uv run python -m autoim
 
 进入“企业微信”页面后状态会自动刷新。使用“界面标定”时选择要标定的区域，在企业微信窗口截图中拖框并点击保存；建议先标定“聊天消息区域”。“测试标定”会显示该窗口相对区域对应的局部截图。
 
-Dry Run 会在截图中点选测试位置，显示计划屏幕点并明确提示未执行输入。真实复制测试前，用户应手动打开目标会话、确保屏幕上显示目标文字消息，并点选截图中对应的位置。AutoIM 会校验后执行正常点击和 Ctrl+C。完成后请对照企业微信可见内容确认剪贴板正文；只有明确人工确认后才会显示 `VERIFIED`。会话标题可以通过“聊天标题区域”的局部截图人工核对；当前不运行全界面 OCR。
+Dry Run 会在截图中点选测试位置，显示计划屏幕点并明确提示未执行输入。当前真实复制测试禁用。用户应先重做标定，检查“保存标定”后显示的绿色区域是否与拖框重合，并将诊断值交由维护者确认；收到重新验收确认前不要解除代码中的真实输入安全闩。会话标题可通过“聊天标题区域”的局部截图人工核对；当前不运行全界面 OCR。
 
 注意：“开始手工复制测试”属于早期剪贴板诊断，会清空并覆盖当前剪贴板并依次发送 Ctrl+C 与 Ctrl+A + Ctrl+C。请先确认剪贴板中没有需要保留的内容。普通 UIA 扫描结果在 `outputs/wecom-uia-tree.txt`，UIA 多后端结果在 `outputs/uia-diagnostics/`，剪贴板结果在 `outputs/clipboard-diagnostics*.txt`，P1.7 诊断正文仅在用户主动启用保存时写入 `outputs/vision-diagnostics/`。日志路径为 `logs/autoim.log`。
 

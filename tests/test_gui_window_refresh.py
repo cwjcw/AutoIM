@@ -7,9 +7,11 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
 
-from autoim.app import LogBus, MainWindow
+from autoim.app import REAL_COPY_ENABLED, LogBus, MainWindow
 from autoim.wecom.window_manager import WeComWindowInfo
 from autoim.workers import ClientInfo
 from autoim.vision_widgets import ScreenshotSelectionDialog
@@ -47,8 +49,34 @@ class GuiWindowRefreshTests(unittest.TestCase):
 
     def test_screenshot_selection_dialog_constructs(self):
         dialog = ScreenshotSelectionDialog(QPixmap(640, 400), mode="region", title="区域标定")
-        self.assertEqual((dialog.view.width_px, dialog.view.height_px), (640, 400))
+        self.assertEqual((dialog.view.source_width, dialog.view.source_height), (640, 400))
         dialog.close()
+
+    def test_screenshot_mouse_drag_maps_through_display_transform(self):
+        pixmap = QPixmap(1920, 1080)
+        pixmap.setDevicePixelRatio(1.5)
+        dialog = ScreenshotSelectionDialog(pixmap, mode="region", title="拖框映射")
+        dialog.show()
+        self.app.processEvents()
+        canvas = dialog.canvas
+        t = canvas.transform
+        start = QPoint(round(t.offset_x + .31*t.displayed_width), round(t.offset_y + .12*t.displayed_height))
+        end = QPoint(round(t.offset_x + .68*t.displayed_width), round(t.offset_y + .72*t.displayed_height))
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(canvas, end)
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end)
+        self.assertIsNotNone(canvas.selected_normalized_rect)
+        self.assertTrue(canvas.selection_valid)
+        self.assertAlmostEqual(canvas.selected_normalized_rect.left, .31, delta=.003)
+        self.assertAlmostEqual(canvas.selected_normalized_rect.right, .68, delta=.003)
+        self.assertLessEqual(canvas.round_trip_error_px, 2)
+        dialog.close()
+
+    def test_real_copy_remains_disabled_pending_manual_revalidation(self):
+        window = MainWindow(LogBus())
+        self.assertFalse(REAL_COPY_ENABLED)
+        self.assertFalse(window.copy_visible_button.isEnabled())
+        window.close()
 
 
 if __name__ == "__main__":

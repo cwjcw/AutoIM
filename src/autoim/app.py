@@ -36,11 +36,15 @@ from autoim.clipboard_diagnostics import run_manual_copy_test, update_manual_cop
 from autoim.diagnostics import run_multi_backend_diagnostics
 from autoim.wecom.driver import WeComDriver
 from autoim.wecom.window_manager import WeComWindowInfo
-from autoim.vision import NormalizedRect, WindowCapture, relative_rect_from_pixels, relative_rect_to_pixels, validate_click_target
+from autoim.vision import (
+    NormalizedRect, WindowCapture, normalized_rect_to_source,
+    normalized_rect_to_widget, relative_rect_to_pixels, validate_click_target,
+)
 from autoim.vision_widgets import ScreenshotSelectionDialog
 from autoim.workers import ClientInfo, FunctionWorker, detect_wecom, refresh_wecom_status, scan_uia_tree
 
 ROOT = Path(__file__).resolve().parents[2]
+REAL_COPY_ENABLED = False  # Re-enable only after the user completes a fresh WeCom calibration acceptance.
 
 
 class LogBus(QObject):
@@ -100,7 +104,7 @@ class MainWindow(QMainWindow):
         self._status_refresh_running = False
         self.calibration = CalibrationStore(ROOT / "config" / "wecom-calibration.json")
         self._last_capture: WindowCapture | None = None
-        self._pending_region: NormalizedRect | None = None
+        self._pending_region: dict | None = None
         self.setWindowTitle("AutoIM")
         self.resize(1120, 760)
         self.setMinimumSize(900, 620)
@@ -309,6 +313,8 @@ class MainWindow(QMainWindow):
         action_row = QHBoxLayout()
         self.dry_run_button = QPushButton("测试当前消息定位（Dry Run）")
         self.copy_visible_button = QPushButton("真实复制测试")
+        self.copy_visible_button.setEnabled(REAL_COPY_ENABLED)
+        self.copy_visible_button.setToolTip("已因真机确认坐标偏差而禁用；完成新的真机标定验收前不会执行真实鼠标操作。")
         self.save_body_checkbox = QCheckBox("开发诊断模式：保存诊断消息正文（默认关闭）")
         action_row.addWidget(self.dry_run_button); action_row.addWidget(self.copy_visible_button); action_row.addWidget(self.save_body_checkbox)
         vision.addLayout(action_row)
@@ -606,9 +612,9 @@ class MainWindow(QMainWindow):
     def _refresh_calibration_label(self) -> None:
         try:
             regions = self.calibration.load()
-            current = self.region_combo.currentData() if hasattr(self, "region_combo") else None
             if not regions:
-                self.calibration_state.setText("标定状态：尚未设置")
+                message = "标定状态：旧版坐标已作废，请重新标定。" if self.calibration.has_legacy_data() else "标定状态：尚未设置"
+                self.calibration_state.setText(message)
             else:
                 keys = {"session_list": "会话列表", "chat_title": "聊天标题", "chat_area": "聊天消息", "input_area": "输入框"}
                 self.calibration_state.setText("标定区域：" + "、".join(keys.get(key, key) for key in regions))
@@ -637,7 +643,7 @@ class MainWindow(QMainWindow):
         if pixmap.isNull() or pixmap.width() <= 0 or pixmap.height() <= 0:
             raise RuntimeError("无法截取企业微信窗口")
         return WindowCapture(info.pid, info.hwnd, info.title, info.class_name, info.rect,
-                             pixmap.width(), pixmap.height(), pixmap)
+                             pixmap.width(), pixmap.height(), pixmap, float(pixmap.devicePixelRatioF()))
 
     def _start_screenshot_selection(self, mode: str, action: str) -> None:
         if not self.client or not self.client.connected or not self.client.hwnd:
@@ -648,6 +654,9 @@ class MainWindow(QMainWindow):
 
     def _selection_window_ready(self, info: WeComWindowInfo, mode: str, action: str) -> None:
         try:
+            if action == "copy" and not REAL_COPY_ENABLED:
+                self.plan_output.setPlainText("真实复制已 Fail Closed；完成新的真机标定验收前不允许进入复制流程。")
+                return
             capture = self._capture_pixmap(info)
             self._last_capture = capture
             regions = self.calibration.load()
@@ -659,13 +668,22 @@ class MainWindow(QMainWindow):
                 self.plan_output.setPlainText("已取消；未执行任何输入操作。")
                 return
             if mode == "region":
-                if not dialog.selected_rect:
-                    self.plan_output.setPlainText("未选择区域；请拖动选择一个矩形。")
+                if not dialog.selected_normalized_rect or not dialog.selection_valid:
+                    self.plan_output.setPlainText("标定无效；未保存。请在截图图像内部拖动选择区域，并确认往返偏差不超过 2 px。\n" + dialog.diagnostics)
                     return
-                rect = relative_rect_from_pixels(*dialog.selected_rect, capture.width, capture.height)
-                self._pending_region = rect
+                rect = dialog.selected_normalized_rect
+                self._pending_region = {
+                    "rect": rect,
+                    "transform": dialog.canvas.transform,
+                    "widget_rect": dialog.selected_widget_rect,
+                    "diagnostics": dialog.diagnostics,
+                    "round_trip_error_px": dialog.round_trip_error_px,
+                    "source_width": capture.width,
+                    "source_height": capture.height,
+                    "capture": capture,
+                }
                 left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
-                self.plan_output.setPlainText(f"区域预览：{self.region_combo.currentText()}\n窗口相对坐标：{left:.4f}, {top:.4f} - {right:.4f}, {bottom:.4f}\n点击“保存标定”以保存。")
+                self.plan_output.setPlainText(f"区域预览：{self.region_combo.currentText()}\n窗口相对坐标：{left:.4f}, {top:.4f} - {right:.4f}, {bottom:.4f}\n往返偏差：{dialog.round_trip_error_px:.3f} px\n点击“保存标定”以保存。\n\n{dialog.diagnostics}")
                 self.calibration_state.setText("待保存区域已显示；确认后点击“保存标定”。")
                 return
             if not dialog.selected_point:
@@ -705,9 +723,41 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "没有待保存区域", "先点“开始 / 重新标定”并在截图中拖动选择区域。")
             return
         key = self.region_combo.currentData()
-        self.calibration.save_region(key, self._pending_region)
+        pending = self._pending_region
+        if pending["round_trip_error_px"] > 2.0:
+            self.plan_output.setPlainText("标定往返偏差超过 2 px，拒绝保存。\n" + pending["diagnostics"])
+            return
+        previous = self.calibration.load().get(key)
+        rect = pending["rect"]
+        self.calibration.save_region(key, rect)
+        # Re-read the exact persisted value and paint it back through the same
+        # current widget transform before accepting the calibration.
+        saved = self.calibration.load().get(key)
+        if saved is None:
+            raise RuntimeError("标定保存后无法重新读取")
+        reverse = normalized_rect_to_widget(saved, pending["transform"])
+        error = max(abs(a-b) for a, b in zip(pending["widget_rect"], reverse))
+        if error > 2.0:
+            if previous is None:
+                self.calibration.delete_region(key)
+            else:
+                self.calibration.save_region(key, previous)
+            self._pending_region = None
+            self.plan_output.setPlainText(f"标定保存校验失败：回显偏差 {error:.3f} px，已撤销。\n{pending['diagnostics']}\nReverse-mapped widget rect: {reverse}")
+            return
         self._pending_region = None
         self._refresh_calibration_label()
+        source_rect = normalized_rect_to_source(saved, pending["source_width"], pending["source_height"])
+        self.plan_output.setPlainText(
+            f"标定保存并重新读取成功。回显误差：{error:.3f} px（阈值 2 px）。\n"
+            f"Converted source rect: {source_rect}\nNormalized rect: {saved}\n"
+            f"Reverse-mapped widget rect: {reverse}\n\n{pending['diagnostics']}"
+        )
+        # Paint the exact value read back from disk over the same live source
+        # screenshot; this is a visible post-save echo, not only a numeric check.
+        echo = ScreenshotSelectionDialog(pending["capture"].image, mode="preview",
+            title="标定保存回显校验（绿色线框=已读回区域）", allowed=saved, parent=self)
+        echo.exec()
         logging.info("已保存窗口相对标定区域：%s", key)
 
     def start_dry_run(self) -> None:
@@ -720,6 +770,9 @@ class MainWindow(QMainWindow):
         self._start_screenshot_selection("point", "dry")
 
     def start_visible_copy(self) -> None:
+        if not REAL_COPY_ENABLED:
+            self.plan_output.setPlainText("真实复制测试已 Fail Closed：真机已确认旧坐标转换存在明显偏差。完成新的真机标定验收并由项目维护者解除代码锁前，不会移动鼠标或执行真实点击。")
+            return
         try:
             if "chat_area" not in self.calibration.load():
                 QMessageBox.information(self, "需要标定", "没有聊天消息区域标定，禁止真实操作。")
@@ -743,13 +796,13 @@ class MainWindow(QMainWindow):
         try:
             capture = self._capture_pixmap(info)
             crop = capture.image.copy(*relative_rect_to_pixels(rect, capture.width, capture.height))
-            dialog = ScreenshotSelectionDialog(crop, mode="point", title=f"标定预览：{key}", parent=self)
+            dialog = ScreenshotSelectionDialog(crop, mode="preview", title=f"标定预览：{key}", parent=self)
             dialog.exec()
         except Exception as exc:
             QMessageBox.critical(self, "标定测试失败", str(exc))
 
     def visible_copy_finished(self, result: dict, capture: WindowCapture) -> None:
-        self.copy_visible_button.setEnabled(True)
+        self.copy_visible_button.setEnabled(REAL_COPY_ENABLED)
         snapshot = result["snapshot"]
         text = snapshot.text or ""
         session, ok = QInputDialog.getText(self, "当前会话名称", "请根据聊天标题区域核对并输入会话名称（可留空）：")
@@ -771,7 +824,7 @@ class MainWindow(QMainWindow):
         self._refresh_calibration_label()
 
     def visible_copy_failed(self, message: str) -> None:
-        self.copy_visible_button.setEnabled(True)
+        self.copy_visible_button.setEnabled(REAL_COPY_ENABLED)
         self.message_result.setPlainText(f"当前会话：未确认\n读取方式：Clipboard\n消息正文：\n\n文本长度：0\n操作时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n状态：失败 / UNVERIFIED\n原因：{message}")
         self.plan_output.setPlainText(f"操作已停止：{message}")
         logging.warning("可见消息复制失败或被安全 guard 取消：%s", message)

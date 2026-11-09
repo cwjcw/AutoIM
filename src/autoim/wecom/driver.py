@@ -11,6 +11,7 @@ from autoim.vision import NormalizedRect, WindowCapture, validate_click_target
 from autoim.wecom.window_manager import WeComWindowInfo, WeComWindowManager
 
 logger = logging.getLogger(__name__)
+REAL_INPUT_ENABLED = False  # Safety latch: only change after a fresh user-confirmed WeCom calibration test.
 
 
 class WeComDriver:
@@ -65,6 +66,8 @@ class WeComDriver:
         """
         if chat_area is None:
             raise RuntimeError("没有聊天消息区域标定；操作已取消")
+        if not dry_run and not REAL_INPUT_ENABLED:
+            raise RuntimeError("真实点击已 Fail Closed；等待用户完成新的真机标定验收")
         current = self.window_manager.resolve_window()
         if current.pid != capture.pid or current.hwnd != capture.hwnd:
             raise RuntimeError("企业微信 PID/HWND 已变化；必须重新截图定位")
@@ -86,6 +89,8 @@ class WeComDriver:
             raise ValueError("timeout 必须非负")
         if chat_area is None:
             raise RuntimeError("没有聊天消息区域标定；真实操作已取消")
+        if not REAL_INPUT_ENABLED:
+            raise RuntimeError("真实复制已 Fail Closed；等待用户完成新的真机标定验收")
         current = self.window_manager.resolve_window()
         if (current.pid, current.hwnd, current.rect) != (capture.pid, capture.hwnd, capture.rect):
             raise RuntimeError("企业微信窗口身份、位置或尺寸已变化；必须重新截图定位")

@@ -647,9 +647,17 @@ ClassName='WeWorkWindow'
 
 标定区包括会话列表、聊天标题、聊天消息、输入框，JSON 只保存企业微信窗口内 0..1 相对坐标，不保存屏幕绝对坐标。截图仅抓企业微信窗口，默认不落盘；可以在 GUI 截图上拖框、预览、保存、重新标定、删除和测试区域。
 
-Dry Run 通过截图点选并计算计划屏幕点，显示窗口/区域/动作，代码路径不调用鼠标、键盘输入接口。真实复制要求聊天区域标定，重新验证 PID/HWND/Rectangle、前台状态、窗口内点位及聊天标定边界后才正常点击一次并发出 Ctrl+C；前台失效、窗口变化或越界立即停止。复制结果默认不写入日志；日志只记长度、Clipboard 方法、SHA256 和 UNVERIFIED 状态。GUI 提供默认关闭的诊断正文保存选项。
+真机标定测试确认标定数据能写入配置，但“测试标定”回显区域与用户实际拖框存在明显比例偏差（示例左边界实际约 0.31、保存为 0.178）。代码根因是旧选区控件把 `QGraphicsView.mapToScene()` 的 scene 坐标当成原始截图像素：scene 矩形取 `QPixmap.width/height`（设备像素），而 `QGraphicsPixmapItem` 按 QPixmap 的 device-independent size 绘制；DPR 不为 1 时，两者单位不同，scene 坐标除以原始尺寸会系统性缩小（例如约 1/1.75）。此外旧逻辑会将图片外的留白点击 clamp 到 scene 边缘，而不是拒绝。`fitInView()` 的 resizeEvent 虽会重算视图缩放，但这不能修复像素与逻辑单位混用。
 
-当前阶段还需在真实企业微信上由用户验证标定准确性、Dry Run 标记位置及“真实复制测试”文本是否和点选的可见消息一致。通过前不得开始后续阶段。
+真机测试确认标定持久化正常，但 GUI 缩放截图与原图之间的坐标转换存在明显偏差，当前阻塞真实点击测试。
+
+已改为单一 `DisplayTransform`：使用原始截图像素宽高和交互控件当前逻辑像素宽高计算 KeepAspectRatio 下的实际显示尺寸、offset；输入按“鼠标控件坐标 - offset → 除以图片显示尺寸 → normalized”计算。DPR 只作为诊断值显示，不使用固定补偿系数；绘制前将 QPixmap DPR 元数据归一为 1，并通过显式 target rect 画到计算出的显示矩形。正反变换使用同一组几何，留白点拒绝。
+
+标定保存前做 normalized 往返回显检查，最大边误差须不超过 2 个控件像素；保存后立即重新读取文件，再反算并叠加到相同截图供用户查看。诊断窗显示原始截图/QPixmap/控件/显示图片尺寸、offset、DPR、拖框控件矩形、原图矩形、normalized 矩形、回显矩形及误差。旧版本 1 标定数据不再加载，必须重新标定。
+
+**安全闩：**用户明确要求暂停真实点击，因此 GUI 的“真实复制测试”保持禁用，`WeComDriver` 的真实点击/复制接口默认也会 Fail Closed；Dry Run 和标定回显仍可运行。坐标自动测试通过不等于真机标定已验收。只有用户重新完成真机标定验收后，才能另行解除该安全闩。默认日志和报告不保存聊天正文。
+
+当前阶段还需由用户在真实企业微信核对拖框、保存后绿色回显和 Dry Run 标记。坐标回显偏差通过、用户确认新的真机标定前，不允许真实复制，也不得开始后续阶段。
 
 阶段已按用户提供的真机验收结果关闭。安全窗口管理器和 Driver 作为 P1.7 的基础继续使用。
 
@@ -797,7 +805,7 @@ DEFERRED
 - P1.7 安全定位与当前可见消息读取 PoC：`IN_PROGRESS`
 - P-A1 Android WeCom Readability PoC：`IN_PROGRESS`（Accessibility 核心读取可行性已真机验证；通知实际接收等剩余验收未宣称完成）
 - P-A1.1 企业微信消息结构解析诊断：`DONE / 已验证`
-- P-A1.2 企业微信文本消息解析、新消息识别与去重：`IN_PROGRESS`（0.1.2 实现与本机构建已完成，等待真机验收，不标记 DONE）
+- P-A1.2 企业微信文本消息解析、新消息识别与去重：`IN_PROGRESS`（0.1.2 真机标题解析失败；0.1.3 修复标题组与身份/装饰解析，等待真机验证，不标记 DONE）
 
 ## P-A1 Android WeCom Readability PoC
 
@@ -885,7 +893,7 @@ P-A1 验收条件：
 
 目标：基于现有 AccessibilitySnapshot 解析普通一对一可见文本，识别当前会话、INBOUND / OUTBOUND / UNKNOWN，检测新增 occurrence 并过滤重复事件。只产生本地诊断事件，不进入 P-A1.3。
 
-当前实现（Android Agent 0.1.2 / versionCode 3）：
+0.1.2 实现记录（versionCode 3；0.1.3 保留以下消息与检测逻辑）：
 
 - `WeComSnapshotParser` 使用顶部文本、有限祖先工具栏结构、可编辑输入区和相对几何定义消息区；viewId 仅写入 evidence，不参与唯一识别。键盘抬高输入区仍可解析；不固定节点索引、树深度、分辨率或设备型号。
 - 可见普通 TextView 正文按 top / left / nodeIndex 排序。标题、输入、Button、时间、系统提示和区域外文字排除；隐藏节点排除。方向综合正文/容器边距与同一行头像位置，冲突或居中且无可靠锚点时为 UNKNOWN；卡片/媒体/多段文本行不作为可靠普通文本。
@@ -897,7 +905,7 @@ P-A1 验收条件：
 - 主界面增加消息解析与最近检测状态/原因/conversation/messageCount/newMessageCount、正文/方向/localEventId/时间；支持重建当前基线、清空检测日志、复制消息解析诊断。重建后下一份实时快照仍只建立基线，避免 UI 已保存快照变旧。清空日志不破坏去重状态。
 - 最近 100 次检测日志仅在内存，进程/服务重建清空；最新原始快照与最近 20 条企微通知继续只存 app private files。通知仅作诊断，不生成 ParsedMessage 或打开会话。原完整树与结构诊断保留并可折叠。
 
-本轮只做本机开发验证；0.1.2 仍等待用户安装到 Redmi Note 11R 按 `android-agent/README.md` 验收普通消息、同文重复、滚动和会话切换。测试通过不代替真机解析验收。
+后续 0.1.2 真机反馈见下方修复记录；普通消息、同文重复、滚动和会话切换仍需真机验收。测试通过不代替真机解析验收。
 
 0.1.2 最终构建记录（2026-09-30）：
 
@@ -907,6 +915,24 @@ P-A1 验收条件：
 - aapt 确认 `com.autoim.agent` / versionName 0.1.2 / versionCode 3 / minSdk 26 / targetSdk 36；apksigner 验证通过（v2）。SHA-256：`4F3F50712D633DF78D55F77BAFC97CAB67C3D05FFEA5AA8AC0FDCB8986DFD6DB`。
 - APK permission dump 无 uses-permission；源码/Manifest 未增加 INTERNET、网络客户端、Accessibility 操作/手势、自动点击/输入/发送、Root 或 Hook。
 - `adb devices` 无连接设备；未自动安装或宣称完成 0.1.2 真机验收。P-A1.2 保持 IN_PROGRESS；停止于本阶段，不开发 P-A1.3。
+
+0.1.3 标题解析修复（2026-10-01 / versionCode 4）：
+
+- 用户提供的 Redmi Note 11R 0.1.2 真机结果：Accessibility 已工作、Notification Access 已授权；`com.tencent.wework` 快照 80 nodes / depth 17 / textNodeCount 4 / truncated=false，正确读取“崔玮杰”、`下午 7:17`、`CUSTOMER_NEW_001` 和输入提示。解析却得到 title=null / visibleMessageCount=0 / reliable=false，检测器为 BLOCKED_LOW_CONFIDENCE。
+- 用户反馈顶部存在多个候选导致 Fail Closed。旧 resolver 要求候选数量恰好为 1，没有先区分主标题、身份 metadata 和状态 decoration，且要求祖先宽度至少屏幕 65%、顶部不低于屏幕 2.5%。旧诊断“会话标题缺失或存在多个候选”合并了零候选和多候选分支，现有反馈不足以还原真机精确候选数；合成测试同时覆盖多候选、窄标题父容器和 top=0 工具栏。
+- 已确认业务规则：同一可靠标题组中的 `@微信` 表示个人微信用户 PERSONAL_WECHAT；可靠一对一标题无 `@微信` 表示企业微信用户 ENTERPRISE_WECHAT。标题旁可能有状态图标；ImageView/View、contentDescription 和符号 decoration 不能作为 conversationTitle，也不能改变联系人身份。
+- 新增纯 Kotlin `ConversationHeaderResolver`：按相对屏幕几何、父/祖父关系和邻近同行节点形成 TitleGroup，分别保存 Primary Title、Identity Metadata、Status Decoration。排除时间/日期、输入提示、按钮、正文列表和纯符号。候选逐项评分，主标题最低 90 分、与次高分至少相差 12 分；固定 viewId 仅加 3 分辅助证据，不能单独识别或打破同等标题歧义。真正同等主标题、缺少结构或低分仍 Fail Closed。
+- 主界面和复制诊断展示标题组数量、主标题候选数、候选 text/index/parent/grandparent/bounds/class/viewId、评分与正负证据、metadata、selectedTitle/peerType/selectedScore/runnerUpScore/header.reliable/confidenceReason。正文/方向流程保留；检测器只修改诊断展示，没有重写 occurrence、去重、滚动、切换或重同步逻辑。
+- 新增 40 项合成回归测试，使用用户明确指定的测试标题/正文与几何；不提交真实客户快照。1080×2408 / 80 nodes / depth 17 / 4 text nodes fixture 解析“崔玮杰”及唯一 INBOUND `CUSTOMER_NEW_001`，reliable=true；有/无 `@微信` 分别为 PERSONAL_WECHAT/ENTERPRISE_WECHAT。首次 BASELINE_CREATED、newMessageCount=0；追加 `CUSTOMER_NEW_002` 仅产生一条 INBOUND NEW_MESSAGE。
+- 当前等待用户覆盖安装 0.1.3，并按 Android README 的 10 步在同一会话验证标题、身份、基线与新增消息。P-A1.1 保持 DONE / 已验证；P-A1.2 保持 IN_PROGRESS；不开发 P-A1.3。
+
+0.1.3 最终构建记录（2026-10-01）：
+
+- 实际分别运行 `gradlew.bat test`、`gradlew.bat lintDebug`、`gradlew.bat assembleDebug`，均 BUILD SUCCESSFUL。
+- 共 143 项单元测试（既有 103 + 新增 40），Debug / Release 各 143 项，共 286 次执行；failure/error/skipped 均为 0。覆盖标题与身份/装饰、时间/日期排除、未知/空 ID、不同分辨率、长名称、歧义低分阻断、解析与检测器集成回归。
+- lintDebug：`No issues found.`。APK 实际存在：`E:\code\AutoIM\AutoIM\android-agent\app\build\outputs\apk\debug\app-debug.apk`，1,026,823 bytes。
+- aapt 确认 `com.autoim.agent` / versionName 0.1.3 / versionCode 4 / minSdk 26 / targetSdk 36；apksigner v2 验证通过。SHA-256：`7F09930F2B64B16CE1E6203F3F72C3EBAA8FBEC2C780C5FD242BC7E6D6DAC728`。
+- APK permission dump 无 uses-permission；源码/Manifest 未增加 INTERNET、网络客户端、自动点击/输入/发送、Root 或 Hook。本机测试和构建通过，不代表已完成 0.1.3 真机验证；P-A1.2 保持 IN_PROGRESS。
 
 ---
 
@@ -954,9 +980,9 @@ P-A1 验收条件：
 
 # 19. 当前下一步
 
-当前任务：完成 P1.7 标定与当前可见消息安全复制 PoC，并由用户在真实企业微信 GUI 验收。P1.7 完成后停止；不得自行进入 P1.8 未读消息检测或任何更后续阶段。
+当前任务：修复 P1.7 截图控件与原图的坐标转换，并由用户验收标定回显。真实复制安全闩保持关闭，直到用户重新完成真机标定验收。不得自行进入 P1.8 未读消息检测或任何更后续阶段。
 
-Android 当前任务：P-A1.1 已按 Redmi Note 11R 的真实结构结果标记 DONE / 已验证。P-A1.2 普通一对一文本解析、方向判断、新消息检测与去重已实现，状态保持 IN_PROGRESS，等待安装 0.1.2 后真机验收。只允许离线只读诊断；不进入 P-A1.3，不接服务器或开发自动发送。
+Android 当前任务：P-A1.1 保持 DONE / 已验证。P-A1.2 的 0.1.2 真机标题解析失败已反馈；0.1.3 完成 TitleGroup、Primary Title、身份 metadata 和状态 decoration 修复，状态保持 IN_PROGRESS，等待 Redmi Note 11R 安装 0.1.3 验证标题/peerType、首次基线和 CUSTOMER_NEW_002 新消息。只允许离线只读诊断；不进入 P-A1.3，不接服务器或开发自动发送。
 
 ---
 
@@ -1000,6 +1026,13 @@ Android 当前任务：P-A1.1 已按 Redmi Note 11R 的真实结构结果标记 
 计划阶段：P1.7 安全定位与当前可见消息读取 PoC
 备注：窗口截图不默认落盘，区域只存归一化相对坐标；只对用户可见并手动点选的信息操作，禁止自动发现会话、读取未读、自动发送或绕过安全边界。
 
+日期：2026-09-28
+需求：修复真机确认的标定显示比例错误；统一 Widget/source/normalized 坐标变换并覆盖 DPR 和留白；在完成重新验收前禁用所有真实点击/复制。
+状态：坐标修复开发中，真机回显验收待用户确认
+所属模块：企业微信 / automation / vision / 安全
+计划阶段：P1.7 安全定位与当前可见消息读取 PoC
+备注：已将旧版标定格式作废；仅允许截图、标定回显和 Dry Run，不允许真实鼠标/键盘输入。
+
 日期：2026-09-29
 需求：新增可安装的 Android Agent 0.1.0 离线诊断 APK，验证企业微信 Android 的 Accessibility Tree 与 NotificationListenerService 可见性。
 状态：开发中
@@ -1021,6 +1054,15 @@ Android 当前任务：P-A1.1 已按 Redmi Note 11R 的真实结构结果标记 
 所属模块：Android Agent / Snapshot / 消息解析与检测
 计划阶段：P-A1.2 企业微信文本消息解析、新消息识别与去重
 备注：纯 Kotlin 合成快照测试，无真实客户 fixture；签名不是 messageId，UUID 仅为本地事件 ID。禁止网络权限、自动点击/输入/发送、服务器、AI、OCR、Root、Hook、数据库或协议逆向；不进入 P-A1.3。
+
+---
+
+日期：2026-10-01
+需求：根据 Redmi Note 11R 的 0.1.2 标题解析失败，修复 TitleGroup / Primary Title / @微信 identity metadata / status decoration，升级 Android Agent 至 0.1.3 / versionCode 4。
+状态：IN_PROGRESS（修复与合成回归完成，等待 0.1.3 真机验证）
+所属模块：Android Agent / Snapshot / 会话标题解析与诊断
+计划阶段：P-A1.2 企业微信文本消息解析、新消息识别与去重
+备注：仅使用用户指定的测试标题、正文和几何构造合成 fixture；不重写检测器序列/滚动/切换/occurrence 逻辑，不开发 P-A1.3；禁止 INTERNET、自动点击/输入/发送、Root、Hook。
 
 ---
 
