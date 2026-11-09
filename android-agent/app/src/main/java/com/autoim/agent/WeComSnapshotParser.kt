@@ -40,16 +40,24 @@ data class ParsedConversationSnapshot(
     val reliable: Boolean,
     val reasons: List<String>,
     val titleEvidence: List<String> = emptyList(),
-)
+    val header: ConversationHeader? = null,
+    val organizationName: String? = header?.organizationName,
+    val identityConfidenceReason: String = header?.identityConfidenceReason ?: "标题解析未运行",
+    val titleReliable: Boolean = header?.titleReliable ?: false,
+) {
+    val peerType: PeerType get() = header?.peerType ?: PeerType.UNKNOWN
+}
 
 /** Offline heuristics from structure + relative geometry; IDs are diagnostic hints only. */
 class WeComSnapshotParser {
     fun parse(snapshot: AccessibilitySnapshot): ParsedConversationSnapshot {
-        fun blocked(reason: String) = ParsedConversationSnapshot(null, emptyList(), null,
-            snapshot.captureTime, snapshot.trigger, false, listOf(reason))
+        fun blocked(reason: String, header: ConversationHeader? = null) = ParsedConversationSnapshot(null, emptyList(), null,
+            snapshot.captureTime, snapshot.trigger, false, listOf(reason), header = header)
         if (snapshot.packageName != DiagnosticLogic.WECOM_PACKAGE) return blocked("非企业微信快照")
         if (snapshot.screenWidth <= 0 || snapshot.screenHeight <= 0) return blocked("屏幕尺寸缺失")
         if (!validStructure(snapshot)) return blocked("节点结构异常或不完整")
+        val header = ConversationHeaderResolver().resolve(snapshot)
+        if (!header.reliable) return blocked(header.evidence.confidenceReason, header)
         val width = snapshot.screenWidth.toDouble()
         val height = snapshot.screenHeight.toDouble()
         val nodes = snapshot.nodes
@@ -69,39 +77,17 @@ class WeComSnapshotParser {
             node.text.isNotBlank() && !node.editable && !node.password && node.visibleToUser
         val inputs = nodes.filter { it.editable && it.className.endsWith("EditText") && !it.password && it.visibleToUser }
             .mapNotNull { node -> bounds(node)?.takeIf { it.top >= height * .40 }?.let { node to it } }
-        if (inputs.size != 1) return blocked("无法唯一确定底部输入区")
+        if (inputs.size != 1) return blocked("无法唯一确定底部输入区", header)
         val input = inputs.single()
-        val titles = nodes.filter(::isText).mapNotNull { node ->
-            val rect = bounds(node) ?: return@mapNotNull null
-            val parent = ancestors(node).firstOrNull { ancestor ->
-                val box = bounds(ancestor)
-                !ancestor.scrollable && !ancestor.editable && !ancestor.className.endsWith("TextView") &&
-                    box != null && box.contains(rect) && box.top >= height * .025 &&
-                    box.bottom <= height * .22 && box.right - box.left >= width * .65 &&
-                    box.bottom - box.top <= height * .20
-            } ?: return@mapNotNull null
-            val parentRect = bounds(parent)!!
-            if (rect.top < height * .025 || rect.bottom > height * .20 ||
-                rect.centerX !in width * .25..width * .75 || node.scrollable ||
-                parent.scrollable || parent.editable || parent.className.endsWith("TextView") ||
-                !parentRect.contains(rect) || parentRect.top < height * .025 || parentRect.bottom > height * .22 ||
-                parentRect.right - parentRect.left < width * .65 ||
-                parentRect.bottom - parentRect.top > height * .20 ||
-                nonMessageText(node.text) || node.text.trim() in navigationLabels) return@mapNotNull null
-            // A title is in a dedicated top toolbar, never inside a scrolling message list.
-            if (ancestors(node).any { it.scrollable }) return@mapNotNull null
-            Triple(node, rect, parentRect)
-        }
-        if (titles.size != 1) return blocked("会话标题缺失或存在多个候选")
-        val (titleNode, titleBounds, toolbar) = titles.single()
-        val title = titleNode.text.trim()
+        val title = header.title!!
+        val toolbar = header.bounds!!
         val inputToolbar = ancestors(input.first).mapNotNull(::bounds).firstOrNull {
             it.contains(input.second) && it.top >= height * .35 && it.bottom - it.top <= height * .20
         }
         val regionBottom = inputToolbar?.top ?: input.second.top
         if (regionBottom <= toolbar.bottom || regionBottom - toolbar.bottom < height * .20)
-            return blocked("消息区域无法确定")
-        val region = SnapshotBounds(0, maxOf(toolbar.bottom, titleBounds.bottom), snapshot.screenWidth, regionBottom)
+            return blocked("消息区域无法确定", header)
+        val region = SnapshotBounds(0, toolbar.bottom, snapshot.screenWidth, regionBottom)
         val candidates = nodes.filter(::isText).filter {
             val rect = bounds(it)
             rect != null && region.contains(rect) && !nonMessageText(it.text) &&
@@ -181,8 +167,8 @@ class WeComSnapshotParser {
                 contentSignature = messageSignature(title, finalDirection, node.text), evidence = evidence)
         }.sortedWith(compareBy<ParsedMessage> { it.textBounds.top }.thenBy { it.textBounds.left }.thenBy { it.sourceNodeIndex })
         return ParsedConversationSnapshot(title, messages, region, snapshot.captureTime, snapshot.trigger,
-            reasons.isEmpty(), reasons.distinct(), listOf("顶部独立文本/工具栏结构", "titleBounds=$titleBounds",
-                "toolbarBounds=$toolbar", "inputBounds=${input.second}", "viewId辅助证据=${titleNode.viewIdResourceName}"))
+            reasons.isEmpty(), reasons.distinct(), listOf(header.evidence.confidenceReason,
+                "toolbarBounds=$toolbar", "inputBounds=${input.second}"), header)
     }
 
     private fun validStructure(snapshot: AccessibilitySnapshot): Boolean {
@@ -215,15 +201,13 @@ class WeComSnapshotParser {
 
     private fun nonMessageText(text: String): Boolean {
         val value = text.trim()
-        return timePattern.matches(value) || value in systemLabels ||
+        return isTimeLikeHeaderText(value) || value in systemLabels ||
             value.startsWith("以下为新消息") || value.contains("撤回了一条消息") ||
             value.contains("你已添加了") || value.contains("现在可以开始聊天")
     }
 
     companion object {
-        private val timePattern = Regex("(?:(?:\\d{2,4}[-年/.]\\d{1,2}[-月/.]\\d{1,2}日?|今天|昨天|前天|星期[一二三四五六日天]|周[一二三四五六日天])\\s*)?(?:(?:上午|下午|晚上|凌晨)\\s*)?\\d{1,2}:\\d{2}")
         private val systemLabels = setOf("发送", "发消息...", "发消息…", "更多", "按住说话", "切换到键盘", "以下为新消息")
-        private val navigationLabels = setOf("企业微信", "消息", "通讯录", "工作台", "我", "搜索", "返回")
     }
 }
 

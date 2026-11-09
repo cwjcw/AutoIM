@@ -165,8 +165,10 @@ data class MessageDiagnosticView(val parsed: ParsedConversationSnapshot?, val hi
 object MessageDiagnosticReport {
     fun parsed(snapshot: ParsedConversationSnapshot?): String = snapshot?.let {
         "当前会话：${it.conversationTitle ?: "无法可靠确定"}\n可见文本消息：${it.messages.size}\n" +
+            "conversationTitle=${it.conversationTitle}\norganizationName=${it.organizationName}\npeerType=${it.peerType}\n" +
+            "titleReliable=${it.titleReliable}\nidentityConfidenceReason=${it.identityConfidenceReason}\n" +
             "可靠：${it.reliable}\n原因：${it.reasons.joinToString("；")}\n区域：${it.messageRegion}\n" +
-            "标题证据：${it.titleEvidence.joinToString("；")}\n触发事件：${it.trigger}\n\n" +
+            "标题证据：${it.titleEvidence.joinToString("；")}\n${ConversationHeaderReport.render(it.header)}\n触发事件：${it.trigger}\n\n" +
             it.messages.joinToString("\n\n") { m ->
                 "[${m.direction}]\n${m.content}\nnode=${m.sourceNodeIndex}\ntextBounds=${m.textBounds}\n" +
                     "containerBounds=${m.containerBounds}\nobservedAt=${m.observedAt}\n" +
@@ -182,7 +184,9 @@ object MessageDiagnosticReport {
             }
     }.ifBlank { "暂无检测日志（仅本次运行，最多 100 次）。" }
 
-    fun export(view: MessageDiagnosticView) = "AutoIM Agent 0.1.2 消息解析诊断\n" +
+    fun export(view: MessageDiagnosticView) = "AutoIM Agent 0.1.5 消息解析诊断\n" +
         "localEventId 是本地 UUID，并非企业微信 messageId。\n\n【消息解析诊断】\n${parsed(view.parsed)}\n\n" +
         "【新消息检测】\n${detection(view.history)}"
 }
+
+

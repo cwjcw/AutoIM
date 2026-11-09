@@ -1,8 +1,8 @@
-# AutoIM Android Agent 0.1.2
+# AutoIM Android Agent 0.1.3
 
-An offline diagnostic APK using Android `AccessibilityService` and `NotificationListenerService`. Redmi Note 11R has verified **298 nodes, depth 18, actual message text, title, left/right layouts, editable input, and a standard send Button**. P-A1.1 is DONE / verified. P-A1.2 adds ordinary one-to-one text parsing and local occurrence-aware new-message detection; it stays IN_PROGRESS pending installation and acceptance of 0.1.2. It never clicks, types, sends, or connects to a network service. No P-A1.3 implementation is included.
+An offline diagnostic APK using Android `AccessibilityService` and `NotificationListenerService`. Redmi Note 11R has verified **298 nodes, depth 18, actual message text, title, left/right layouts, editable input, and a standard send Button**. P-A1.1 is DONE / verified. P-A1.2 adds ordinary one-to-one text parsing and local occurrence-aware new-message detection. After 0.1.2 failed title resolution on the phone, 0.1.3 separates title groups, primary titles, identity metadata and status decorations; it stays IN_PROGRESS pending 0.1.3 device verification. It never clicks, types, sends, or connects to a network service. No P-A1.3 implementation is included.
 
-Current version: **0.1.2 / versionCode 3**, package `com.autoim.agent`. Upgrade using the normal APK installer or `adb install -r` with the same debug signature. No automatic installation or permission grants are performed.
+Current version: **0.1.3 / versionCode 4**, package `com.autoim.agent`. Upgrade using the normal APK installer or `adb install -r` with the same debug signature. No automatic installation or permission grants are performed.
 
 ## Build on Windows
 
@@ -60,7 +60,7 @@ These paths are private to the app sandbox; no public storage permission or data
 
 ## P-A1.2 parsing and safe detection
 
-- A title must match top text, dedicated toolbar/ancestor structure and geometry; an editable input defines the lower boundary. The raised input when a keyboard is shown is supported. IDs only appear as evidence. Missing or ambiguous title/region blocks detection.
+- TitleGroup uses relative top geometry, ancestry and nearby row relationships; Primary Title scores structure and position without requiring a screen-wide toolbar. A fixed viewId is only a small secondary hint. `@微信` is personal-WeChat identity metadata; status icons/descriptions are decorations, never titles. A reliable one-to-one title without that badge is ENTERPRISE_WECHAT. A score below 90 or margin below 12 blocks detection. Detailed candidate/group evidence remains visible on success and failure. An editable input defines the lower boundary; a raised keyboard input is supported.
 - Only visible text inside this region is parsed. Original bodies remain unchanged. Message tokens use direction and text with CRLF/CR unified to LF and only leading/trailing whitespace trimmed. Numbers, punctuation, models, special characters and internal whitespace remain significant.
 - Direction combines text/bubble margins with optional avatar anchors in a bounded ancestor row. Conflicting or weak evidence gives UNKNOWN, which blocks NEW_MESSAGE. Media, cards, quotes and group sender parsing are outside this stage.
 - Messages sort by visual top, then left and node index. Exact ordered tokens and occurrence counts suppress duplicate events despite geometry changes. A complete previous prefix detects appended occurrences, including `你好` followed by another `你好`. A shifted visible window requires a unique suffix/prefix overlap with unique anchors in both sequences. Ambiguity, interior changes and no overlap resync without emitting history.
@@ -71,7 +71,7 @@ These paths are private to the app sandbox; no public storage permission or data
 
 ## P-A1.1 saved-snapshot structure diagnostics (retained)
 
-Introduced in **0.1.1 / versionCode 2**, retained in 0.1.2. P-A1.1 is now **DONE / 已验证** from the user's Redmi Note 11R structural evidence; internal IDs are secondary hints only.
+Introduced in **0.1.1 / versionCode 2**, retained in 0.1.3. P-A1.1 is now **DONE / 已验证** from the user's Redmi Note 11R structural evidence; internal IDs are secondary hints only.
 
 - Each node retains the original properties and now includes unique preorder `nodeIndex`, nullable `parentIndex`, `depth`, `childIndex`, and the original reported `childCount`. `index` remains the legacy sibling index. No platform node objects are persisted.
 - Key text diagnostics show self, parent, grandparent, and adjacent siblings. Missing relatives/slots are explicitly `null`; no inferred sender roles or hardcoded internal View IDs.
@@ -82,22 +82,22 @@ Introduced in **0.1.1 / versionCode 2**, retained in 0.1.2. P-A1.1 is now **DONE
 - **复制结构诊断** includes device info, WeCom version, snapshot summary and candidate sections, excluding the full tree. **单独复制完整 Node Tree** exports the original full structure separately. Clipboard exports contain chat text; copy/share only when appropriate. No automatic export or network upload occurs.
 - JSON reading, report generation and searches run on a worker thread. The tree display is created only when expanded. Notification retention remains unchanged; capture now additionally drives the offline parser/detector.
 
-### 下一轮 Redmi Note 11R 真机验收（0.1.2）
+### 下一轮 Redmi Note 11R 真机测试（0.1.3）
 
-安装 0.1.2，确认无障碍/通知权限，开启企微诊断。使用一对一固定测试联系人和非敏感短消息；所有打开、输入、发送和滚动都由用户手工操作。每步等约 2 秒后回到 AutoIM 查看消息解析与检测日志；页面中的检测记录按最近在前显示。
+本轮只验证标题修复、首次基线和新增消息。所有安装、进入会话和发送均由用户手工操作。
 
-1. 手工进入固定测试联系人；先用较少消息、当前可见区域有余量的会话测试。
-2. 检查当前会话标题和可见 INBOUND / OUTBOUND；首次应为 BASELINE_CREATED，newMessageCount=0，不回放历史。
-3. 返回该企微会话，保持不滚动，让对方发送 `CUSTOMER_NEW_001`。
-4. 检查日志仅新增这一个 INBOUND NEW_MESSAGE，有正文、localEventId 和时间。
-5. 返回同一会话，自己手工输入并发送 `ME_NEW_001`。
-6. 检查它是 OUTBOUND NEW_MESSAGE，输入框文字/发送按钮不是消息。
-7. 不操作等待几秒，再刷新 AutoIM；确认同一条 localEventId 不重复产生，重复快照为 DUPLICATE_EVENT/NO_CHANGE。
-8. 手工上下滚动聊天，检查 SCROLL_ONLY/RESYNC_REQUIRED，无新增历史消息事件；后续伴随内容变化也不得回放历史。
-9. 手工切换另一测试联系人，再返回原联系人；均只重建基线，不把可见旧记录当作新消息。
-10. 保持同一会话不滚动，连续手工发送两条完全相同的“你好”（建议每条间隔约 2 秒）；应保留两个 occurrence，第二条有新的 localEventId，而非被相同签名去重。若同一批次采到两条，也应产生两个本地事件。
+1. 覆盖安装 0.1.3。
+2. 检查 Accessibility 已连接 / 已工作，Notification Access 已授权。
+3. 开启企微诊断。
+4. 进入同一个“崔玮杰”测试会话。
+5. 等待约 2 秒。
+6. 回 AutoIM 查看消息解析诊断，期望 conversationTitle=崔玮杰、reliable=true；有 `@微信` 时 peerType=PERSONAL_WECHAT，无时为 ENTERPRISE_WECHAT。
+7. 第一次进入只允许 BASELINE_CREATED，newMessageCount=0。
+8. 让对方发送 `CUSTOMER_NEW_002`。
+9. 等待约 2 秒后回 AutoIM，期望 NEW_MESSAGE、direction=INBOUND、content=CUSTOMER_NEW_002、newMessageCount=1。
+10. 不继续开发 P-A1.3，完成后停止。
 
-若出现 BLOCKED_LOW_CONFIDENCE，使用 **复制消息解析诊断** 与原结构诊断定位标题/区域/方向证据。滚动后若一直 RESYNC_REQUIRED，可点 **重建当前会话基线**，回到企微等第一份实时基线建立，再继续发送测试消息；该保护阶段不补发漏报。P-A1.2 保持 **IN_PROGRESS**，真机验收后才另行决定下一阶段。
+P-A1.2 保持 **IN_PROGRESS**，等待本轮真机结果；同文重复、滚动和切换的既有验收要求仍保留在 PROJECT.md。失败时 **复制消息解析诊断** 可提供标题组、候选评分与排除原因。
 
 ## 0.1.1 local build checks (2026-09-30)
 
@@ -114,3 +114,10 @@ Introduced in **0.1.1 / versionCode 2**, retained in 0.1.2. P-A1.1 is now **DONE
 - APK exists at `E:\code\AutoIM\AutoIM\android-agent\app\build\outputs\apk\debug\app-debug.apk`, **1,098,235 bytes**. aapt confirms versionName 0.1.2 / versionCode 3 / package com.autoim.agent / minSdk 26 / targetSdk 36. apksigner v2 verification passes.
 - APK permission dump contains no uses-permission. Source checks found no action/gesture/network APIs. No connected Android device was available; 0.1.2 manual acceptance is still pending.
 - SHA-256: `4F3F50712D633DF78D55F77BAFC97CAB67C3D05FFEA5AA8AC0FDCB8986DFD6DB`.
+
+## 0.1.3 local build checks (2026-10-01)
+
+- Separately ran `gradlew.bat test`, `gradlew.bat lintDebug`, and `gradlew.bat assembleDebug`: all BUILD SUCCESSFUL; lint reports `No issues found.`
+- 143 tests per Debug/Release variant (103 existing + 40 new header/integration tests), 286 executions; zero failures/errors/skips. Synthetic fixture resolves 崔玮杰 / CUSTOMER_NEW_001 reliably, baselines with zero new messages, then emits only INBOUND CUSTOMER_NEW_002 on append.
+- APK: `E:\code\AutoIM\AutoIM\android-agent\app\build\outputs\apk\debug\app-debug.apk`, **1,026,823 bytes**; aapt confirms 0.1.3 / versionCode 4, minSdk 26, targetSdk 36. apksigner v2 verification passes. No uses-permission entries or action/network APIs were added.
+- SHA-256: `7F09930F2B64B16CE1E6203F3F72C3EBAA8FBEC2C780C5FD242BC7E6D6DAC728`. P-A1.2 remains IN_PROGRESS pending the 0.1.3 phone checklist above.

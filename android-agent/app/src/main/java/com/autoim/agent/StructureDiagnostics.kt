@@ -117,7 +117,7 @@ object StructureReport {
     }
 
     fun export(diagnostics: StructureDiagnostics, deviceInfo: String, wecomInfo: String): String =
-        "AutoIM Android Agent 0.1.2 结构诊断\n\n设备信息：\n$deviceInfo\n\n企业微信版本：\n$wecomInfo\n\n" +
+        "AutoIM Android Agent 0.1.3 结构诊断\n\n设备信息：\n$deviceInfo\n\n企业微信版本：\n$wecomInfo\n\n" +
             "Snapshot摘要：\n${summary(diagnostics.snapshot)}\n\n" +
             sections(diagnostics).filter { it.first != "可见文本" }
                 .joinToString("\n\n") { (title, body) -> "【$title】\n$body" }

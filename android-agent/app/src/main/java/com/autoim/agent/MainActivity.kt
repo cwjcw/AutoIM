@@ -38,7 +38,7 @@ class MainActivity : Activity() {
 
     private fun render() {
         content.removeAllViews()
-        addText("AutoIM Android Agent 0.1.2\n离线消息解析与检测：只读取企业微信无障碍节点与通知。", 20f)
+        addText("AutoIM Android Agent 0.1.5\n离线消息解析与检测：只读取企业微信无障碍节点与通知。", 20f)
         addText("设备", 18f, bold = true)
         addText("Manufacturer：${Build.MANUFACTURER}\nModel：${Build.MODEL}\nAndroid：${Build.VERSION.RELEASE}\nSDK：${Build.VERSION.SDK_INT}\nAgent：${packageManager.getPackageInfo(packageName, 0).versionName}")
 
@@ -139,7 +139,7 @@ class MainActivity : Activity() {
 
     private fun copyReport() {
         val snapshot = store.readSnapshot()
-        val report = "AutoIM Agent 0.1.2\n${wecomInfo()}\n诊断模式：${diagnosticButtonLabel()}\nAccessibility 已连接：${AutoIMAccessibilityService.connected}\nAccessibility 已工作：${AutoIMAccessibilityService.operational}\n通知监听已连接：${AutoIMNotificationListenerService.listenerConnected}\n\n快照：${snapshot?.let { "${it.nodeCount} nodes, depth=${it.maxDepth}, truncated=${it.truncated}" } ?: "none"}\n${snapshot?.let { DiagnosticLogic.visibleText(it.nodes).joinToString("\n") }.orEmpty()}\n\n企微通知数量：${store.readNotifications().size}"
+        val report = "AutoIM Agent 0.1.4\n${wecomInfo()}\n诊断模式：${diagnosticButtonLabel()}\nAccessibility 已连接：${AutoIMAccessibilityService.connected}\nAccessibility 已工作：${AutoIMAccessibilityService.operational}\n通知监听已连接：${AutoIMNotificationListenerService.listenerConnected}\n\n快照：${snapshot?.let { "${it.nodeCount} nodes, depth=${it.maxDepth}, truncated=${it.truncated}" } ?: "none"}\n${snapshot?.let { DiagnosticLogic.visibleText(it.nodes).joinToString("\n") }.orEmpty()}\n\n企微通知数量：${store.readNotifications().size}"
         val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("AutoIM diagnostics", report))
         Toast.makeText(this, "诊断结果已复制", Toast.LENGTH_SHORT).show()
@@ -159,3 +159,5 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }
+
+
