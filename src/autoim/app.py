@@ -25,6 +25,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +38,8 @@ from autoim.calibration import CalibrationStore
 from autoim.clipboard_diagnostics import run_manual_copy_test, update_manual_copy_report
 from autoim.diagnostics import run_multi_backend_diagnostics
 from autoim.wecom.driver import WeComDriver
+from autoim.wecom.chat_parser import ParseResult, parse_wecom_clipboard
+from autoim.wecom.visual_panel import VisualCapturePanel
 from autoim.wecom.window_manager import WeComWindowInfo
 from autoim.vision import (
     NormalizedRect, WindowCapture, normalized_rect_to_source,
@@ -242,6 +247,50 @@ class MainWindow(QMainWindow):
         self.diag_output = QPlainTextEdit(); self.diag_output.setReadOnly(True); self.diag_output.setPlaceholderText("诊断汇总将显示于此，并保存到 outputs/uia-diagnostics/summary.txt"); self.diag_output.setMinimumHeight(260); diag.addWidget(self.diag_output)
         layout.addWidget(diagnostics_panel)
 
+        self.visual_capture_panel = VisualCapturePanel(
+            ROOT / "config" / "wecom-pc-visual-calibration-v12.json", self._run_worker)
+        layout.addWidget(self.visual_capture_panel)
+
+        parse_panel = QFrame(); parse_panel.setObjectName("panel")
+        parse = QVBoxLayout(parse_panel); parse.setContentsMargins(22, 20, 22, 20); parse.setSpacing(12)
+        parse.addWidget(label("批量聊天记录解析", "font-size:16px;font-weight:700;color:#172235"))
+        parse.addWidget(label("只读取当前 Windows 剪贴板，不操作企业微信窗口、不清空剪贴板。身份和消息边界不确定时会明确标记。", "color:#66758a;word-wrap: true"))
+        parse_controls = QHBoxLayout()
+        self.parse_clipboard_button = QPushButton("解析当前剪贴板")
+        self.parse_clipboard_button.setObjectName("primaryButton")
+        self.parse_clipboard_button.clicked.connect(self.start_clipboard_parse)
+        parse_controls.addWidget(self.parse_clipboard_button)
+        self.parse_summary = label("总消息：0    成功解析：0    歧义 / 不完整：0", "font-weight:600;color:#27364b")
+        parse_controls.addWidget(self.parse_summary, 1)
+        self.parse_progress = QProgressBar(); self.parse_progress.setTextVisible(False); self.parse_progress.setMaximumHeight(6); self.parse_progress.hide()
+        parse.addLayout(parse_controls); parse.addWidget(self.parse_progress)
+        self.parse_status = label("解析状态：等待操作", "color:#8290a5")
+        parse.addWidget(self.parse_status)
+        self.parse_table = QTableWidget(0, 7)
+        self.parse_table.setHorizontalHeaderLabels(["序号", "时间", "发送人", "联系人类型", "企业名称", "消息内容", "解析状态"])
+        self.parse_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.parse_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.parse_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.parse_table.setWordWrap(True)
+        self.parse_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.parse_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.parse_table.setMinimumHeight(220)
+        self.parse_table.itemSelectionChanged.connect(self._show_selected_parse_message)
+        parse.addWidget(self.parse_table)
+        self.parse_detail = QPlainTextEdit(); self.parse_detail.setReadOnly(True)
+        self.parse_detail.setPlaceholderText("选中一行查看完整多行正文、身份依据和解析警告。解析失败时会在此保留原始剪贴板文本。")
+        self.parse_detail.setMinimumHeight(120)
+        parse.addWidget(self.parse_detail)
+        self._last_parse_result: ParseResult | None = None
+        self._last_parse_raw_text = ""
+        layout.addWidget(parse_panel)
+
         clipboard_panel = QFrame(); clipboard_panel.setObjectName("panel")
         clip = QVBoxLayout(clipboard_panel); clip.setContentsMargins(22, 20, 22, 20); clip.setSpacing(12)
         clip.addWidget(label("剪贴板诊断", "font-size:16px;font-weight:700;color:#172235"))
@@ -354,6 +403,11 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         if hasattr(self, "log_output"):
             self.log_output.appendPlainText(message)
+
+    def closeEvent(self, event) -> None:
+        self.visual_capture_panel.stop_monitoring()
+        self.status_timer.stop()
+        super().closeEvent(event)
 
     def _run_worker(self, fn, *args, on_result, on_error=None) -> None:
         worker = FunctionWorker(fn, *args)
@@ -493,6 +547,88 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _driver_read_clipboard() -> dict:
         return WeComDriver().read_clipboard()
+
+    @staticmethod
+    def _read_and_parse_clipboard() -> dict:
+        snapshot = WeComDriver().read_clipboard()
+        raw_text = snapshot.text or ""
+        try:
+            parsed = parse_wecom_clipboard(raw_text)
+        except Exception as exc:
+            # Retain the source even if a malformed input exposes a parser bug.
+            parsed = ParseResult(raw_text, (), "ERROR", (f"解析异常：{type(exc).__name__}: {exc}",))
+        return {"snapshot": snapshot, "raw_text": raw_text, "result": parsed}
+
+    def start_clipboard_parse(self) -> None:
+        self.parse_clipboard_button.setEnabled(False)
+        self.parse_progress.setRange(0, 0); self.parse_progress.show()
+        self.parse_status.setText("解析状态：正在读取剪贴板并解析…")
+        self._run_worker(self._read_and_parse_clipboard, on_result=self.clipboard_parse_finished,
+                         on_error=self.clipboard_parse_failed)
+
+    def clipboard_parse_finished(self, outcome: dict) -> None:
+        self.parse_clipboard_button.setEnabled(True); self.parse_progress.hide()
+        raw_text = outcome["raw_text"]
+        result: ParseResult = outcome["result"]
+        self._last_parse_raw_text = raw_text
+        self._last_parse_result = result
+        self.parse_table.setRowCount(0)
+        for message in result.messages:
+            row = self.parse_table.rowCount(); self.parse_table.insertRow(row)
+            content_preview = message.content if len(message.content) <= 300 else message.content[:300] + "…"
+            values = [str(message.sequence_number), message.raw_time, message.raw_sender,
+                      message.peer_type, message.organization_name or "—", content_preview,
+                      message.parse_status]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 5:
+                    item.setToolTip(message.content)
+                if column in (2, 3, 4, 6):
+                    item.setToolTip("\n".join((*message.identity_evidence, *message.parse_warnings)) or "身份依据不足")
+                self.parse_table.setItem(row, column, item)
+        successful = sum(message.parse_status == "PARSED" for message in result.messages)
+        ambiguous = result.ambiguous_count
+        self.parse_summary.setText(f"总消息：{len(result.messages)}    成功解析：{successful}    歧义 / 不完整：{ambiguous}")
+        if result.messages:
+            self.parse_status.setText(f"解析状态：{result.parse_status}" + ("；请查看边界与身份提示。" if result.warnings else ""))
+            self.parse_detail.setPlainText("\n".join(result.warnings) if result.warnings else "已解析。选择表格行查看消息详情。")
+            self.parse_table.selectRow(0)
+        else:
+            self.parse_status.setText(f"解析状态：{result.parse_status}；未生成消息记录。")
+            warnings = "\n".join(result.warnings)
+            self.parse_detail.setPlainText(f"解析说明：\n{warnings}\n\n原始剪贴板文本（未改写）：\n{raw_text}")
+        # Never log clipboard body or sender names.
+        logging.info("聊天记录解析完成：status=%s messages=%d ambiguous=%d chars=%d",
+                     result.parse_status, len(result.messages), ambiguous, len(raw_text))
+
+    def _show_selected_parse_message(self) -> None:
+        result = self._last_parse_result
+        rows = self.parse_table.selectionModel().selectedRows() if self.parse_table.selectionModel() else []
+        if not result or not rows:
+            return
+        row = rows[0].row()
+        if row >= len(result.messages):
+            return
+        message = result.messages[row]
+        detail = [f"原始消息块：\n{message.raw_message_block}", f"\n原始发送人：{message.raw_sender}",
+                  f"临时解析记录 ID：{message.local_record_id}",
+                  f"显示姓名：{message.display_name}", f"联系人类型：{message.peer_type}",
+                  f"企业名称：{message.organization_name or 'null'}", f"原始时间：{message.raw_time}",
+                  "解析时间：未补年份（date_year_reliable=false）", "消息方向：UNKNOWN",
+                  "contact_id：null", "conversation_id：null"]
+        if message.identity_evidence:
+            detail.append("身份依据：\n- " + "\n- ".join(message.identity_evidence))
+        if message.parse_warnings:
+            detail.append("解析提示：\n- " + "\n- ".join(message.parse_warnings))
+        detail.append(f"\n正文：\n{message.content}")
+        self.parse_detail.setPlainText("\n".join(detail))
+
+    def clipboard_parse_failed(self, error: str) -> None:
+        self.parse_clipboard_button.setEnabled(True); self.parse_progress.hide()
+        self.parse_status.setText("解析状态：读取剪贴板失败")
+        self.parse_summary.setText("总消息：0    成功解析：0    歧义 / 不完整：0")
+        self.parse_table.setRowCount(0)
+        self.parse_detail.setPlainText(f"无法读取当前剪贴板：\n{error}\n\n原始剪贴板文本不可用。")
 
     @staticmethod
     def _driver_clear_clipboard() -> dict:

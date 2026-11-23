@@ -18,6 +18,14 @@ class WindowResolutionError(RuntimeError):
     """No unique, verified Enterprise WeChat main window is available."""
 
 
+class WindowNotFoundError(WindowResolutionError):
+    """No visible main window met the local identity checks."""
+
+
+class WindowAmbiguousError(WindowResolutionError):
+    """More than one main window met the checks."""
+
+
 @dataclass(frozen=True, slots=True)
 class WeComWindowInfo:
     pid: int
@@ -52,12 +60,17 @@ class WeComWindowManager:
 
     def _processes(self) -> dict[int, str]:
         matches: dict[int, str] = {}
-        for proc in psutil.process_iter(["pid", "name", "exe"]):
+        for proc in psutil.process_iter(["pid", "name"]):
             try:
                 info = proc.info
                 name = str(info.get("name") or "").casefold()
                 if name in _PROCESS_NAMES:
-                    matches[int(info["pid"])] = str(info.get("exe") or "")
+                    pid = int(info["pid"])
+                    try:
+                        path = info["exe"] if "exe" in info else proc.exe()
+                    except psutil.AccessDenied:
+                        path = ""
+                    matches[pid] = str(path or "")
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
         return matches
@@ -101,13 +114,14 @@ class WeComWindowManager:
             raise
         return candidates
 
-    def resolve_window(self) -> WeComWindowInfo:
+    def resolve_window(self, *, quiet: bool = False) -> WeComWindowInfo:
         """Find the current exact main-window candidate, never reuse a cached HWND."""
         candidates = self._candidates()
         if not candidates:
             error = "没有找到标题和窗口类均匹配的企业微信主窗口。"
-            logger.warning(error)
-            raise WindowResolutionError(error)
+            if not quiet:
+                logger.warning(error)
+            raise WindowNotFoundError(error)
         if len(candidates) > 1:
             win32gui, _ = self._windows_api()
             foreground = int(win32gui.GetForegroundWindow())
@@ -115,8 +129,9 @@ class WeComWindowManager:
             if len(foreground_matches) == 1:
                 return foreground_matches[0]
             error = f"发现 {len(candidates)} 个企业微信主窗口，且无法唯一确认目标；操作已取消。"
-            logger.warning(error)
-            raise WindowResolutionError(error)
+            if not quiet:
+                logger.warning(error)
+            raise WindowAmbiguousError(error)
         return candidates[0]
 
     def is_valid(self, hwnd: int | None = None) -> bool:

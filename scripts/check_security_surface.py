@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,15 +17,59 @@ _MARKERS = (
     "decrypt " + "database",
 )
 
+_COLLECTOR_INPUT = frozenset({"mouse_event", "SetCursorPos", "click_screen_point", "SendInput"})
+_COLLECTOR_FORBIDDEN = frozenset({
+    "keybd_event", "SendInput", "PostMessage", "SendMessage", "send_shortcut", "send_keys", "type_keys",
+    "ensure_foreground", "SetForegroundWindow", "activate", "read_clipboard", "read_unicode_text",
+    "copy_visible_message", "safe_click",
+})
+
+
+def inspect_collector_input(path: Path, source: str) -> list[str]:
+    """Keep native collector input confined to the scoped B2 gateway."""
+    tree = ast.parse(source, filename=str(path))
+    checks = []
+    navigation = path.name == "collection_navigation.py"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imported = (*[alias.name for alias in node.names], getattr(node, "module", "") or "")
+            if any(value.rsplit(".", 1)[-1] in ("keyboard", "mouse", "driver", "pyautogui", "pynput")
+                   for value in imported):
+                checks.append(f"{node.lineno}: 采集器引入了通用输入能力")
+        if not isinstance(node, ast.Call):
+            continue
+        function = getattr(node.func, "attr", getattr(node.func, "id", ""))
+        if function in _COLLECTOR_FORBIDDEN or (function in _COLLECTOR_INPUT and not navigation):
+            checks.append(f"{node.lineno}: 采集器包含未授权调用 {function}")
+        if navigation and function == "mouse_event":
+            if not node.args or getattr(node.args[0], "attr", "") not in (
+                    "MOUSEEVENTF_LEFTDOWN", "MOUSEEVENTF_LEFTUP", "MOUSEEVENTF_WHEEL"):
+                checks.append(f"{node.lineno}: B2 网关包含未授权的鼠标事件")
+    if navigation:
+        gateway = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_act"), None)
+        guarded = {id(node) for node in ast.walk(gateway)} if gateway else set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and getattr(node.func, "attr", "") in _COLLECTOR_INPUT
+                    and id(node) not in guarded):
+                checks.append(f"{node.lineno}: 输入调用位于 B2 网关之外")
+        if gateway is None or not {"perform", "verify_view", "contains"} <= {
+                node.func.attr for node in ast.walk(gateway) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)}:
+            checks.append("缺少 B2 范围、窗口或模式许可复核")
+    return [f"{path.name}: {item}" for item in checks]
+
 
 def inspect_security_surface() -> list[str]:
     checked = [ROOT / "pyproject.toml", *(ROOT / "src" / "autoim").rglob("*.py")]
     findings: list[str] = []
     for path in checked:
-        content = path.read_text(encoding="utf-8", errors="replace").casefold()
+        source = path.read_text(encoding="utf-8", errors="replace")
+        content = source.casefold()
         for marker in _MARKERS:
             if marker in content:
                 findings.append(f"{path.relative_to(ROOT)}: 命中待人工审查标记 {marker!r}")
+        if path.name.startswith("collection_") and path.suffix == ".py":
+            findings.extend(inspect_collector_input(path, source))
     return findings
 
 

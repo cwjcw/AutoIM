@@ -223,6 +223,9 @@ outputs/wecom-uia-tree.txt
 outputs/clipboard-diagnostics.txt
 outputs/clipboard-diagnostics-summary.txt
 config/wecom-calibration.json
+config/wecom-pc-visual-calibration.json
+config/wecom-pc-visual-calibration-v12.json
+config/wecom-pc-visual-thresholds.json
 outputs/vision-diagnostics/copied-message.txt
 
 # Android Agent build/runtime configuration

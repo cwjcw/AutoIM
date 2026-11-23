@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from autoim.vision import (
     DisplayTransform, NormalizedRect, create_display_transform,
@@ -12,10 +12,29 @@ from autoim.vision import (
 )
 
 
+def fit_dialog_to_screen(dialog: QDialog, available=None) -> None:
+    screen = dialog.screen()
+    if available is None:
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+    handle = dialog.windowHandle()
+    margins = handle.frameMargins() if handle else None
+    horizontal = margins.left() + margins.right() if margins else 0
+    vertical = margins.top() + margins.bottom() if margins else 0
+    width = max(1, available.width() - horizontal)
+    height = max(1, available.height() - vertical)
+    dialog.setMaximumSize(width, height)
+    dialog.resize(min(dialog.width(), width), min(dialog.height(), height))
+    dialog.move(available.x() + (width - dialog.width()) // 2,
+                available.y() + (height - dialog.height()) // 2)
+
+
 class ScreenshotCanvas(QWidget):
     """Draw into one explicit KeepAspectRatio rectangle and map input through it."""
 
     selectionChanged = Signal()
+    viewportChanged = Signal()
 
     def __init__(self, pixmap: QPixmap, mode: str, allowed: NormalizedRect | None = None,
                  parent=None):
@@ -27,8 +46,11 @@ class ScreenshotCanvas(QWidget):
         # widget coordinates while retaining the original source pixel dimensions.
         self.pixmap = pixmap.copy()
         self.pixmap.setDevicePixelRatio(1.0)
+        self.image = self.pixmap.toImage()
+        self.image.setDevicePixelRatio(1.0)
         self.mode = mode
         self.allowed = allowed
+        self.overlays: tuple[tuple[str, NormalizedRect, str], ...] = ()
         self._drag_start: tuple[float, float] | None = None
         self._drag_end: tuple[float, float] | None = None
         self.selected_point: tuple[float, float] | None = None
@@ -36,7 +58,8 @@ class ScreenshotCanvas(QWidget):
         self.selected_normalized_rect: NormalizedRect | None = None
         self.selection_error = ""
         self.transform = self._make_transform()
-        self.setMinimumSize(640, 400)
+        self.setMinimumSize(120, 80)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
 
     def _make_transform(self) -> DisplayTransform:
@@ -50,6 +73,7 @@ class ScreenshotCanvas(QWidget):
         self.transform = self._make_transform()
         self.update()
         self.selectionChanged.emit()
+        self.viewportChanged.emit()
 
     def paintEvent(self, event):
         self.transform = self._make_transform()
@@ -57,8 +81,15 @@ class ScreenshotCanvas(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#202833"))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(QRectF(t.offset_x, t.offset_y, t.displayed_width, t.displayed_height),
-                           self.pixmap, QRectF(0, 0, self.source_width, self.source_height))
+        painter.drawImage(QRectF(t.offset_x, t.offset_y, t.displayed_width, t.displayed_height),
+                          self.image, QRectF(0, 0, self.source_width, self.source_height))
+        for name, bounds, color in self.overlays:
+            l, top, r, b = normalized_rect_to_widget(bounds, t)
+            painter.setPen(QPen(QColor(color), 2))
+            painter.drawRect(QRectF(l, top, r - l, b - top))
+            if name:
+                painter.fillRect(QRectF(l, top, 32, 19), QColor("#202833"))
+                painter.drawText(QRectF(l + 3, top, 29, 19), Qt.AlignmentFlag.AlignVCenter, name)
         if self.allowed is not None:
             l, top, r, b = normalized_rect_to_widget(self.allowed, t)
             painter.setPen(QPen(QColor("#22c55e"), 2, Qt.PenStyle.DashLine))
@@ -119,6 +150,18 @@ class ScreenshotCanvas(QWidget):
             f"Reverse-mapped widget rect: {self.reverse_mapped_widget_rect}",
             f"Round-trip max error: {self.round_trip_error_px if self.round_trip_error_px is not None else '—'} px",
         ))
+
+    def preview_geometry(self) -> str:
+        t = self._make_transform()
+        scale = t.displayed_width / t.source_width
+        fitted = (t.offset_x >= -.01 and t.offset_y >= -.01 and t.display_right <= self.width() + .01
+                  and t.display_bottom <= self.height() + .01)
+        return (f"QImage {self.image.width()}×{self.image.height()} DPR {self.image.devicePixelRatio():g} · "
+                f"QPixmap {self.source_width}×{self.source_height} 原始 DPR {self.source_dpr:g} · "
+                f"预览 {self.width()}×{self.height()} 逻辑像素 DPR {self.devicePixelRatioF():g}\n"
+                f"图像 {t.displayed_width:.1f}×{t.displayed_height:.1f} · 比例 {scale:.2%} · "
+                f"偏移 ({t.offset_x:.1f}, {t.offset_y:.1f}) · "
+                f"{'整图在视口内' if fitted else '视口裁切'} · 无预览滚动区")
 
     def _event_normalized(self, event) -> tuple[float, float]:
         self.transform = self._make_transform()
@@ -211,6 +254,10 @@ class ScreenshotSelectionDialog(QDialog):
         self.button_box = buttons
         self.canvas.selectionChanged.connect(self._refresh_diagnostics)
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        fit_dialog_to_screen(self)
 
     def _refresh_diagnostics(self):
         self.diagnostic_label.setText(self.canvas.diagnostics() + ("\n选择错误：" + self.canvas.selection_error if self.canvas.selection_error else ""))
