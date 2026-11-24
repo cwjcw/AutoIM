@@ -35,16 +35,66 @@ STAGES = {
     "NOTIFY": "向 Windows 提交通知",
     "CONTINUE": "处理后续联系人或继续巡检",
     "STOP": "撤销授权并停止 Worker",
+    "TEST_C1": "独立读取当前测试会话标题",
+    "TEST_C2": "独立识别可见消息",
+    "TEST_NAVIGATION": "仅导航到明确授权的隔离测试目标",
+    "TEST_CONVERSATION": "独立核实授权测试会话",
+    "TEST_SAVE": "隔离数据库提交与去重",
+    "TEST_NOTIFY": "提交 TEST 通知及人工可见确认",
+}
+SUBSTEPS = {
+    "WINDOW_LOCATED": ("WINDOW_LOCATE", "定位主窗口"),
+    "WINDOW_RESTORE": ("WINDOW_RESTORE", "恢复最小化窗口"),
+    "WINDOW_MAXIMIZE": ("WINDOW_MAXIMIZE", "最大化窗口"),
+    "WINDOW_ACTIVATE": ("WINDOW_ACTIVATE", "设置前台"),
+    "WINDOW_PREPARED": ("WINDOW_FINAL", "最终 Win32 状态核验"),
+    "A1_NAME_OBSERVED": ("A1_NAME", "识别 A1 姓名"),
+    "A1_AVATAR_OBSERVED": ("A1_AVATAR", "识别 A1 头像"),
+    "A1_CLICKED": ("A1_CLICK", "第一次头像点击"),
+    "POPUP_CAPTURED": ("MENU_SCREENSHOT", "截取个人菜单"),
+    "CARD_POPUP_CAPTURED": ("CARD_SCREENSHOT", "截取详细资料卡"),
+    "TEST_NOTIFICATION_API_CALL": ("TEST_NOTICE_API", "调用 TEST 通知 API"),
+    "TEST_WINDOWS_NOTIFICATION": ("TEST_NOTICE_RESULT", "取得 TEST 通知 API 结果"),
+    "TEST_NOTIFICATION_SEEN": ("TEST_NOTICE_SEEN", "人工确认看到 TEST 通知"),
+    "MENU_VERIFIED": ("MENU_VERIFY", "菜单视觉验证"),
+    "MENU_AVATAR_LOCATED": ("AVATAR_LOCATE", "定位菜单头像"),
+    "MENU_AVATAR_CLICKED": ("MENU_CLICK", "第二次头像点击"),
+    "CARD_WINDOW_ADMITTED": ("CARD_RELATION", "发现资料卡并验证窗口关系"),
+    "PROFILE_CARD_VERIFIED": ("CARD_VERIFY", "资料卡视觉确认"),
+    "FIRST_EMAIL_READ": ("EMAIL_FIRST", "第一次邮箱读取"),
+    "SECOND_EMAIL_READ": ("EMAIL_SECOND", "第二次邮箱读取"),
+    "EMAIL_COMPARE": ("EMAIL_COMPARE", "邮箱一致性核验"),
+    "CARD_CLOSE_CLICKED": ("CARD_CLOSE", "资料卡关闭动作"),
+    "MENU_CLOSE_CLICKED": ("MENU_CLOSE", "菜单关闭动作"),
+    "PROFILE_LAYERS_GONE": ("LAYERS_GONE", "确认资料层消失"),
+    "CHAT_VIEW_RESTORED": ("CHAT_RESTORE", "消息布局及 A1 恢复"),
+    "ACCOUNT_BOUND": ("ACCOUNT_BOUND", "本地账号绑定"),
+    "CONTACT_SCOPE_OBSERVED": ("CONTACT_CLASSIFY", "逐行会话分类观察"),
+    "B2_SCANNED": ("B2_SCAN", "识别 B2 和未读"),
+    "SCOPE_APPLIED": ("SCOPE_FILTER", "范围过滤"),
+    "TARGET_PRECHECK_PASSED": ("NAV_PRECHECK", "点击前复核"),
+    "TARGET_CLICKED": ("NAV_CLICK", "实际点击"),
+    "CONVERSATION_VERIFIED": ("C1_VERIFY", "点击后会话确认"),
+    "C2_RECOGNIZED": ("C2_OCR", "消息 OCR 与解析"),
+    "SQLITE_COMMIT": ("SQLITE_COMMIT", "事务提交与去重"),
+    "WINDOWS_NOTIFICATION": ("NOTICE_SUBMIT", "系统通知 API 结果"),
+    "POLL_RESUMED": ("POLL_CONTINUE", "持续巡检"),
+    "STOP_REQUESTED": ("STOP_REQUEST", "收到停止指令"),
+    "STOP_PERMISSION_REVOKED": ("STOP_PERMIT", "撤销许可"),
+    "STOP_SCHEDULING": ("STOP_SCHEDULE", "停止调度"),
+    "WORKER_DRAINED": ("STOP_WORKER", "Worker 退出"),
+    "STOP_NO_NEW_INPUT": ("STOP_INPUT", "已审核停止后的输入事件"),
 }
 RESULTS = {"AUTO_PASS", "MANUAL_ASSISTED", "PARTIAL", "FAILED", "SKIPPED",
            "BLOCKED_BY_DEPENDENCY", "NOT_RUN"}
 _EMAIL = re.compile(r"[^\s<>]+@[^\s<>]+\.[^\s<>]+")
 _SECRET = re.compile(r"(?i)\b(token|api[_-]?key|password|secret)\s*[:=]\s*\S+")
+_PHONE = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
 _MANAGED = re.compile(r"(?:autoim\.log|events\.jsonl)(?:\.\d+)?$")
 
 
 def safe_reason(value):
-    return _SECRET.sub(r"\1=[隐去]", _EMAIL.sub("[邮箱已隐去]", str(value)))[:1500]
+    return _PHONE.sub("[号码已隐去]", _SECRET.sub(r"\1=[隐去]", _EMAIL.sub("[邮箱已隐去]", str(value))))[:1500]
 
 
 def git_version():
@@ -146,6 +196,9 @@ class CollectionRuntime:
         self.lock = RLock()
         self.closed = False
         self.reports = {}
+        self.steps = {}
+        self.scopes = {}
+        self.stop_audit = {}
 
     def emit(self, mode, detection, stage, code, result="", *, level="INFO", task="",
              elapsed_ms=None, details=None, exception=None):
@@ -157,7 +210,7 @@ class CollectionRuntime:
             if "reason" in details:
                 details["reason"] = safe_reason(details["reason"])
             event = {"id": uuid4().hex, "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                     "app_version": __version__, "pc_version": "PC-V3.3", "git": self.revision,
+                     "app_version": __version__, "pc_version": "PC-V3.4", "git": self.revision,
                      "session": self.session, "detection": detection, "task": task, "mode": mode,
                      "stage": stage, "code": code, "result": result, "level": level, "elapsed_ms": elapsed_ms,
                      "details": details}
@@ -165,41 +218,74 @@ class CollectionRuntime:
                 event["exception"] = {"type": type(exception).__name__,
                                       "frames": [(Path(frame.filename).name, frame.lineno, frame.name)
                                                  for frame in extract_tb(exception.__traceback__)]}
-            if detection and stage in STAGES and result in RESULTS:
-                self._record_stage(event)
+            if detection:
+                scope = details.get("evidence_scope")
+                if scope:
+                    self.scopes.setdefault(detection, set()).add(scope)
+                if stage in STAGES and result in RESULTS:
+                    self._record_stage(self.reports, detection, stage, event, result)
+                if code in SUBSTEPS:
+                    name, _ = SUBSTEPS[code]
+                    assertion = result if result in RESULTS else "PARTIAL"
+                    self._record_stage(self.steps, detection, name, event, assertion)
+                audit = self.stop_audit.setdefault(detection, {"requested": False, "drained": False, "late_input": 0})
+                if code == "STOP_PERMISSION_REVOKED":
+                    audit["requested"] = True
+                elif code == "WORKER_DRAINED":
+                    audit["drained"] = True
+                elif code == "INPUT_EXECUTED" and audit["requested"]:
+                    audit["late_input"] += 1
             record = logging.LogRecord("autoim.collection", getattr(logging, level), "", 0, code, (), None)
             record.event = event
             self.handler.handle(record)
             return event["id"]
 
-    def _record_stage(self, event):
-        report = self.reports.setdefault(event["detection"], {})
-        stage = report.setdefault(event["stage"], {"attempts": 0, "duration_ms": 0, "counts": {}, "events": []})
+    @staticmethod
+    def _record_stage(index, detection, key, event, result):
+        stage = index.setdefault(detection, {}).setdefault(key, {
+            "attempts": 0, "duration_ms": 0, "counts": {}, "events": [],
+            "recovered_failures": 0, "unresolved_blockers": 0})
         stage["attempts"] += 1
         stage["duration_ms"] += event["elapsed_ms"] or 0
         counts = stage["counts"]
-        result = event["result"]
         counts[result] = counts.get(result, 0) + 1
         stage["events"] = (stage["events"] + [event["id"]])[-40:]
         stage["actual"] = event["code"]
-        if result in {"FAILED", "BLOCKED_BY_DEPENDENCY", "PARTIAL"}:
+        stage["last_attempt_status"] = result
+        if result in {"FAILED", "BLOCKED_BY_DEPENDENCY"}:
+            stage["unresolved_blockers"] += 1
             stage["reason"] = event["details"].get("reason", event["code"])
+        elif result in {"AUTO_PASS", "MANUAL_ASSISTED"}:
+            stage["recovered_failures"] += stage["unresolved_blockers"]
+            stage["unresolved_blockers"] = 0
+            stage["reason"] = ""
+            stage["completed_at"] = event["time"]
+        elif result == "PARTIAL":
+            stage["reason"] = event["details"].get("reason", event["code"])
+
+    @staticmethod
+    def _summaries(expected, source):
+        formatted = {}
+        for key, expectation in expected.items():
+            data = source.get(key, {})
+            counts = data.get("counts", {})
+            historical = next((status for status in ("MANUAL_ASSISTED", "AUTO_PASS", "PARTIAL", "FAILED",
+                                                     "BLOCKED_BY_DEPENDENCY", "SKIPPED") if status in counts),
+                              "NOT_RUN")
+            final = data.get("last_attempt_status", "NOT_RUN")
+            formatted[key] = {"attempts": 0, "duration_ms": 0, "actual": "", "reason": "", "completed_at": None,
+                              "last_attempt_status": "NOT_RUN", "recovered_failures": 0, "unresolved_blockers": 0,
+                              **data, "expected": expectation, "status": final, "final_status": final,
+                              "verification_status": historical, "manual_assisted": bool(counts.get("MANUAL_ASSISTED")),
+                              "completed": final in {"AUTO_PASS", "MANUAL_ASSISTED"},
+                              "waiting": final == "BLOCKED_BY_DEPENDENCY",
+                              "counts": dict(counts), "events": list(data.get("events", ()))}
+        return formatted
 
     def report(self, detection):
         with self.lock:
-            source = self.reports.get(detection, {})
-            stages = {}
-            for key, expected in STAGES.items():
-                data = source.get(key, {})
-                counts = data.get("counts", {})
-                status = next((status for status in ("MANUAL_ASSISTED", "PARTIAL", "AUTO_PASS", "FAILED",
-                                                      "BLOCKED_BY_DEPENDENCY", "SKIPPED") if status in counts),
-                              "NOT_RUN")
-                if counts.get("AUTO_PASS") and counts.get("FAILED") and status == "AUTO_PASS":
-                    status = "PARTIAL"
-                stages[key] = {"attempts": 0, "duration_ms": 0, "actual": "", "reason": "",
-                               **data, "expected": expected, "status": status, "counts": dict(counts),
-                               "events": list(data.get("events", ()))}
+            stages = self._summaries(STAGES, self.reports.get(detection, {}))
+            substeps = self._summaries(dict(SUBSTEPS.values()), self.steps.get(detection, {}))
             blockers = {
                 "MENU": ("WINDOW", "A1"), "CARD": ("MENU", "A1"), "EMAIL": ("CARD",),
                 "RESTORE": ("CARD",), "BIND": ("EMAIL", "RESTORE"), "B2": ("WINDOW",),
@@ -210,9 +296,24 @@ class CollectionRuntime:
                 upstream = next((name for name in dependencies if stages[name]["status"] in
                                  ("FAILED", "BLOCKED_BY_DEPENDENCY")), "")
                 if upstream and stages[key]["status"] == "NOT_RUN":
-                    stages[key].update(status="BLOCKED_BY_DEPENDENCY", reason=f"前置阶段 {upstream} 未通过")
-            return {"version": "PC-V3.3", "git": self.revision, "session": self.session,
-                    "detection": detection, "stages": stages}
+                    stages[key].update(status="BLOCKED_BY_DEPENDENCY", final_status="BLOCKED_BY_DEPENDENCY",
+                                       waiting=True, unresolved_blockers=1, reason=f"前置阶段 {upstream} 未通过")
+            audit = self.stop_audit.get(detection, {})
+            stop = stages["STOP"]
+            if audit.get("requested") and audit.get("drained"):
+                outcome = "FAILED" if audit["late_input"] else "AUTO_PASS"
+                substeps["STOP_INPUT"].update(status=outcome, final_status=outcome, completed=outcome == "AUTO_PASS",
+                                              attempts=1, actual="STOP_INPUT_AUDIT",
+                                              events=substeps["STOP_PERMIT"]["events"] + substeps["STOP_WORKER"]["events"])
+            if audit.get("late_input", 0):
+                stop.update(status="FAILED", final_status="FAILED", completed=False,
+                            reason="撤销许可后出现输入事件")
+            elif audit.get("requested") and not audit.get("drained"):
+                stop.update(status="PARTIAL", final_status="PARTIAL", completed=False, waiting=True,
+                            reason="已撤销许可，等待 Worker 退出")
+            return {"version": "PC-V3.4", "git": self.revision, "session": self.session,
+                    "detection": detection, "evidence_scopes": sorted(self.scopes.get(detection, ())),
+                    "stop_audit": dict(audit), "stages": stages, "substeps": substeps}
 
     def sync(self):
         from threading import Event
@@ -272,7 +373,7 @@ class CollectionRuntime:
                                 copyfileobj(stream, entry)
                         archive.writestr("environment.json", json.dumps({"platform": platform.system(),
                                           "release": platform.release(), "python": platform.python_version(),
-                                          "app_version": __version__, "pc_version": "PC-V3.3", "git": self.revision}))
+                                          "app_version": __version__, "pc_version": "PC-V3.4", "git": self.revision}))
                         archive.writestr("diagnostic.json", json.dumps(snapshot, ensure_ascii=False, indent=2))
                         archive.writestr("flow-report.json", json.dumps(self.report(detection), ensure_ascii=False, indent=2))
         except BaseException:

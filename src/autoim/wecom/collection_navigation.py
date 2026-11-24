@@ -14,6 +14,7 @@ from threading import Event, Lock
 import numpy as np
 
 from autoim.wecom.collection_runtime import safe_reason
+from autoim.wecom.collection_profile import PopupEvidence, ProfileWindows, owner_chain
 from autoim.wecom.collection_profile import ProfileAction, ProfileSurface, changed_regions
 from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client, _render_complete_client, capture_visible_window)
 from autoim.wecom.visual_contacts import ContactObservation
@@ -215,7 +216,9 @@ class CollectionNavigation:
             check()
 
         check()
-        return self.manager.prepare_collection_window(self._probe, self.permit.perform, check, wait)
+        return self.manager.prepare_collection_window(
+            self._probe, self.permit.perform, check, wait,
+            report=lambda code, result, details: self.report("WINDOW", code, result=result, details=details))
 
     def mark_started(self):
         self._started = monotonic()
@@ -288,13 +291,12 @@ class CollectionNavigation:
 
         return unobscured, activity
 
-    def _owned_profile_windows(self, health):
+    def _profile_inventory(self, health):
         import win32gui as gui
         import win32process as process
 
-        found = []
+        found = {}
         root, pid = health.window.hwnd, health.window.pid
-
         origin = gui.ClientToScreen(root, (0, 0))
         client_width, client_height = health.last.client_size
         reached_root = False
@@ -305,41 +307,35 @@ class CollectionNavigation:
                 reached_root = True
                 return True
             try:
-                if process.GetWindowThreadProcessId(hwnd)[1] != pid:
+                thread, current_pid = process.GetWindowThreadProcessId(hwnd)
+                if current_pid != pid:
                     return True
-                visible, iconic = bool(gui.IsWindowVisible(hwnd)), bool(gui.IsIconic(hwnd))
-                owner = gui.GetAncestor(hwnd, 3)
-                state = {"hwnd": hwnd, "class_name": gui.GetClassName(hwnd), "visible": visible,
-                         "iconic": iconic, "root_owner": owner}
-                if not visible or iconic:
-                    if visible:
-                        self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "VISIBILITY"})
-                    return True
+                visible = gui.IsWindowVisible(hwnd) and not gui.IsIconic(hwnd)
+                owner, parent = gui.GetWindow(hwnd, 4), gui.GetParent(hwnd)
+                top, root_owner = gui.GetAncestor(hwnd, 2), gui.GetAncestor(hwnd, 3)
+                chain, valid = owner_chain(
+                    hwnd, lambda window: gui.GetWindow(window, 4) or gui.GetParent(window),
+                    lambda window: process.GetWindowThreadProcessId(window)[1] if gui.IsWindow(window) else None,
+                    pid)
+                if root_owner not in (hwnd, *chain):
+                    valid = False
+                class_name = gui.GetClassName(hwnd)
                 _, _, width, height = gui.GetClientRect(hwnd)
                 popup_origin = gui.ClientToScreen(hwnd, (0, 0))
                 x, y = popup_origin
                 same_client = (origin[0] <= x < x + width <= origin[0] + client_width
                                and origin[1] <= y < y + height <= origin[1] + client_height)
-                detached = owner == hwnd and not reached_root and same_client
-                if owner != root and not detached:
-                    self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "ROOT_OWNER_AND_GEOMETRY"})
-                    return True
+                visible_popup = root_owner == hwnd and not reached_root and same_client
                 cloaked = wintypes.DWORD()
                 dwm = ctypes.windll.dwmapi.DwmGetWindowAttribute
                 dwm.argtypes = (wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD)
                 result = dwm(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
-                if result != 0 or cloaked.value:
-                    self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "DWM", "dwm_result": result})
-                    return True
                 unit = health.last.dpi / 96
-                state.update(client=(width, height), dpi=health.last.dpi,
-                             relation="same_client_top_level" if detached else "owned")
-                if 80 * unit <= width <= 700 * unit and 55 * unit <= height <= 850 * unit:
-                    geometry = (popup_origin, width, height)
-                    found.append((hwnd, geometry))
-                    self.report("MENU", "POPUP_ENUMERATED", details={**state, "geometry": geometry})
-                else:
-                    self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "CLIENT_DIMENSIONS"})
+                reason = ("VISIBILITY" if not visible else "DWM" if result != 0 or cloaked.value else
+                          "CLIENT_DIMENSIONS" if not (80 * unit <= width <= 700 * unit
+                                                      and 55 * unit <= height <= 850 * unit) else "")
+                found[hwnd] = (PopupEvidence(hwnd, pid, thread, class_name, owner, parent, top, root_owner, chain,
+                                             (popup_origin, width, height), valid), visible_popup, reason)
             except OSError as exc:
                 self.report("MENU", "POPUP_PROBE_FAILED",
                             details={"hwnd": hwnd, "reason": type(exc).__name__})
@@ -349,7 +345,72 @@ class CollectionNavigation:
             gui.EnumWindows(inspect, None)
         except Exception as exc:
             raise NavigationPaused(f"核验资料界面时 EnumWindows 失败 · {type(exc).__name__}: {exc}") from exc
-        return tuple(found)
+        return found
+
+    def _owned_profile_windows(self, health, context=None):
+        from dataclasses import asdict
+        inventory = self._profile_inventory(health)
+        root = health.window.hwnd
+        accepted = {}
+        if isinstance(context, ProfileWindows) and context.menu:
+            current = inventory.get(context.menu.hwnd)
+            if current and current[0].identity != context.menu.identity:
+                context.retired.add(context.menu.hwnd)
+        for hwnd, (popup, detached, reason) in inventory.items():
+            if reason == "VISIBILITY":
+                continue
+            if isinstance(context, ProfileWindows):
+                relationship = context.relation(popup, detached=detached) if context.lifetime == health.identity else None
+                correlation = {"profile_session": context.id, "upstream_click": context.card_click or context.menu_click,
+                               "step": "CARD" if context.card_click else "MENU", "new": hwnd not in context.baseline,
+                               "validated": relationship in {"VERIFIED_MENU", "VERIFIED_CARD"}}
+            else:
+                relationship = "MAIN_DESCENDANT" if popup.root_owner == root else "DETACHED" if detached else None
+                correlation = {}
+            details = {**asdict(popup), **correlation, "visible": True, "dpi": health.last.dpi}
+            if not relationship or reason:
+                self.report("MENU", "POPUP_EXCLUDED",
+                            details={**details, "reason": reason or "PROFILE_RELATION_OR_STAGE"})
+                continue
+            accepted[hwnd] = popup
+            self.report("MENU", "POPUP_ENUMERATED", details={**details, "relation": relationship})
+            if isinstance(context, ProfileWindows) and context.card_click and relationship not in {"VERIFIED_MENU", "VERIFIED_CARD"}:
+                self.report("CARD", "CARD_WINDOW_ADMITTED", result="AUTO_PASS", details={**details, "relation": relationship})
+        if isinstance(context, ProfileWindows):
+            # Retire truly missing handles, not baseline or temporarily noncandidate windows.
+            context.observe(accepted, present=inventory)
+        return tuple((popup.hwnd, popup.geometry) for popup in accepted.values())
+
+    def confirm_profile_window(self, reference, surface, context, *, stage):
+        if not isinstance(context, ProfileWindows):
+            return
+        health = self._profile_health(reference)
+        if not context.valid or context.lifetime != health.identity:
+            raise NavigationPaused("身份核验的窗口上下文已失效")
+        if surface.embedded:
+            if stage == "MENU":
+                context.menu_embedded = surface.bounds
+                context.before_card = frozenset(hwnd for hwnd, entry in self._profile_inventory(health).items()
+                                               if entry[2] != "VISIBILITY")
+            else:
+                context.card_embedded = surface.bounds
+            self.report(stage, "PROFILE_VISUALLY_VERIFIED",
+                        details={"profile_session": context.id, "hwnd": surface.hwnd,
+                                 "embedded": True, "upstream_click": context.card_click or context.menu_click})
+            return
+        inventory = self._profile_inventory(health)
+        entry = inventory.get(surface.hwnd)
+        if (entry is None or entry[0].geometry != surface.geometry or entry[2]
+                or context.relation(entry[0], detached=entry[1]) is None):
+            raise NavigationPaused("资料窗口的句柄、关系或位置已变化")
+        if stage == "MENU":
+            context.menu = entry[0]
+            context.before_card = frozenset(hwnd for hwnd, entry in inventory.items() if entry[2] != "VISIBILITY")
+        else:
+            context.card = entry[0]
+        self.report(stage, "PROFILE_VISUALLY_VERIFIED",
+                    details={"profile_session": context.id, "hwnd": surface.hwnd,
+                             "upstream_click": context.card_click or context.menu_click})
 
     def _profile_health(self, reference):
         if not self._desktop():
@@ -362,22 +423,50 @@ class CollectionNavigation:
         return health
 
     def _profile_foreground(self, health, owned, known_windows):
-        foreground = health.last.foreground_hwnd
-        if foreground != health.window.hwnd and (foreground in known_windows or foreground not in dict(owned)):
-            raise NavigationPaused("账号核验等待企业微信或本次打开的资料窗口处于前台", health=health)
+        import win32gui as gui
+        import win32process as process
+        foreground = gui.GetForegroundWindow()
+        context = known_windows if isinstance(known_windows, ProfileWindows) else None
+        baseline = context.baseline if context else known_windows
+        facts = {"hwnd": foreground, "pid": None, "class_name": "", "owner": 0, "parent": 0,
+                 "root": 0, "root_owner": 0}
+        if foreground and gui.IsWindow(foreground):
+            try:
+                facts.update(pid=process.GetWindowThreadProcessId(foreground)[1], class_name=gui.GetClassName(foreground),
+                             owner=gui.GetWindow(foreground, 4), parent=gui.GetParent(foreground),
+                             root=gui.GetAncestor(foreground, 2), root_owner=gui.GetAncestor(foreground, 3))
+            except OSError:
+                pass
+        verified = {item.hwnd: label for item, label in
+                    ((context.menu, "VERIFIED_MENU"), (context.card, "VERIFIED_CARD"))
+                    if item and item.hwnd in dict(owned)} if context else {}
+        allowed = foreground == health.window.hwnd or (foreground not in baseline and foreground in dict(owned))
+        relationship = ("MAIN" if foreground == health.window.hwnd else verified.get(foreground, "PENDING_PROFILE")
+                        if allowed else "OTHER_APP" if facts["pid"] not in (None, health.window.pid) else
+                        "OTHER_WECOM" if facts["pid"] else "UNKNOWN")
+        self.report("WINDOW", "PROFILE_FOREGROUND",
+                    details={**facts, "relation": relationship, "allowed": allowed,
+                             "verified": list(verified), "candidates": [hwnd for hwnd, _ in owned if hwnd not in baseline],
+                             "profile_session": context.id if context else "",
+                             "phase": "CARD" if context and context.card_click else "MENU"})
+        if not allowed:
+            raise NavigationPaused(f"账号核验等待前台 · {relationship} · HWND {foreground}", health=health)
         return foreground
 
     def profile_surfaces(self, reference, known_windows=()):
         """Capture the main client and newly opened, owned WeCom windows only."""
+        import win32gui
+
         health = self._profile_health(reference)
-        owned = self._owned_profile_windows(health)
+        owned = self._owned_profile_windows(health, known_windows)
         self._profile_foreground(health, owned, known_windows)
         frame = self.capture()
         if _identity(frame) != _identity(reference):
             raise NavigationPaused("账号核验主窗口截图身份变化")
-        surfaces = [ProfileSurface(frame.capture.hwnd, frame.pixels, box, ())
+        surfaces = [ProfileSurface(frame.capture.hwnd, frame.pixels, box, (), "MAIN_DIFF")
                     for box in changed_regions(reference.pixels, frame.pixels, frame.state.dpi)]
-        new_windows = [(hwnd, geometry) for hwnd, geometry in owned if hwnd not in known_windows]
+        baseline = known_windows.baseline if isinstance(known_windows, ProfileWindows) else known_windows
+        new_windows = [(hwnd, geometry) for hwnd, geometry in owned if hwnd not in baseline]
         if len(new_windows) > 4:
             raise NavigationPaused("本次出现多个资料窗口候选，等待人工复核")
         for hwnd, geometry in new_windows:
@@ -394,14 +483,19 @@ class CollectionNavigation:
                                 details={"hwnd": hwnd, "flags": flags, "reason": safe_reason(exc)})
                     continue
                 image = candidate
-                self.report("MENU", "POPUP_CAPTURED", details={"hwnd": hwnd, "flags": flags, "shape": image.shape})
+                card = (isinstance(known_windows, ProfileWindows) and known_windows.card_click
+                        and (known_windows.menu is None or hwnd != known_windows.menu.hwnd))
+                self.report("CARD" if card else "MENU", "CARD_POPUP_CAPTURED" if card else "POPUP_CAPTURED",
+                            result="AUTO_PASS", details={"hwnd": hwnd, "flags": flags, "shape": image.shape,
+                            "client": (width, height), "dpi": frame.state.dpi, "complete": True})
                 break
             if image is None:
                 continue
-            if (hwnd, geometry) not in self._owned_profile_windows(self._profile_health(reference)):
+            if (hwnd, geometry) not in self._owned_profile_windows(self._profile_health(reference), known_windows):
                 raise NavigationPaused("读取期间资料窗口已移动或关闭")
             rows, cols = image.shape[:2]
-            surfaces.append(ProfileSurface(hwnd, image, Box(0, 0, cols, rows), geometry))
+            surfaces.append(ProfileSurface(hwnd, image, Box(0, 0, cols, rows), geometry,
+                                           f"PRINTWINDOW_{flags}", win32gui.GetClassName(hwnd)))
         return frame, tuple(surfaces), tuple(hwnd for hwnd, _ in owned)
 
     @staticmethod
@@ -418,11 +512,39 @@ class CollectionNavigation:
         x, y = action.point
         return origin[0] + int((x + .5) * width / cols), origin[1] + int((y + .5) * height / rows)
 
+    @classmethod
+    def profile_extent(cls, frame, surface):
+        return (*cls.profile_physical(frame, ProfileAction("CROP_CORNER", surface,
+                    Box(surface.bounds.left, surface.bounds.top, surface.bounds.left+1, surface.bounds.top+1))),
+                *cls.profile_physical(frame, ProfileAction("CROP_CORNER", surface,
+                    Box(surface.bounds.right-1, surface.bounds.bottom-1, surface.bounds.right, surface.bounds.bottom))))
+
+    def verify_normal_message(self, raw):
+        """Inspect message-area hit targets and reject visible profile-like popups."""
+        map_point, _ = self.verify_view(raw)
+        health = self._profile_health(raw.frame)
+        for hwnd, (popup, detached, reason) in self._profile_inventory(health).items():
+            if reason:
+                continue
+            if (popup.class_name == "UserInfoWindow" or popup.root_owner == health.window.hwnd
+                    or detached and popup.class_name == "WXworkWindow"):
+                raise NavigationPaused(f"需要先手动关闭资料层 · HWND {hwnd}")
+        for part in ("B1", "B2", "C1", "C2"):
+            box = raw.layout.get(part)
+            if box is None:
+                raise NavigationPaused("正常消息页面区域未能确认")
+            map_point(box.center)
+
     def profile_start(self, observation):
         frame = observation.frame
         self.verify_view(observation, need_idle=True)
         health = self._profile_health(frame)
-        return tuple(hwnd for hwnd, _ in self._owned_profile_windows(health))
+        for hwnd, (popup, detached, reason) in self._profile_inventory(health).items():
+            if not reason and (popup.class_name == "UserInfoWindow" or
+                               detached and popup.class_name == "WXworkWindow"):
+                raise NavigationPaused(f"请手动关闭先前的资料层再继续 · HWND {hwnd}")
+        return ProfileWindows(health.identity, frozenset(
+            hwnd for hwnd, entry in self._profile_inventory(health).items() if entry[2] != "VISIBILITY"))
 
     def profile_click(self, observation, action: ProfileAction, *, known_windows=(), menu=None):
         self._act(observation, action.point, action.control, scroll=False, profile=action,
@@ -435,6 +557,24 @@ class CollectionNavigation:
         frame = observation.frame
         if action.stage not in ("A1_OPEN", "MENU_AVATAR", "CARD_CLOSE", "A1_CLOSE"):
             raise NavigationPaused("未定义的账号核验动作")
+        context = known_windows if isinstance(known_windows, ProfileWindows) else None
+        if context:
+            def confirmed(surface, window, embedded):
+                if surface.embedded:
+                    return surface.bounds == embedded
+                return bool(window and surface.hwnd == window.hwnd and window.hwnd not in context.retired)
+            if not context.valid:
+                raise NavigationPaused("本轮资料窗口操作上下文已失效")
+            if action.stage == "MENU_AVATAR" and (context.card_click or not confirmed(
+                    action.surface, context.menu, context.menu_embedded)):
+                raise NavigationPaused("菜单头像操作需要本轮已验证的菜单")
+            if action.stage == "CARD_CLOSE" and (not context.card_click or not confirmed(
+                    action.surface, context.card, context.card_embedded)):
+                raise NavigationPaused("资料卡关闭需要本轮已验证的资料卡")
+            if action.stage == "A1_CLOSE" and (not menu or not confirmed(
+                    menu.surface, context.menu, context.menu_embedded)):
+                raise NavigationPaused("菜单关闭需要核对本轮已验证的菜单")
+
         if not action.surface.bounds.contains(action.point):
             raise NavigationPaused("账号核验目标超出资料区域")
         if action.stage in ("A1_OPEN", "A1_CLOSE"):
@@ -460,12 +600,12 @@ class CollectionNavigation:
             raise NavigationPaused("资料菜单或卡片画面已变化，取消鼠标操作")
 
         health = self._profile_health(frame)
-        owned = self._owned_profile_windows(health)
+        owned = self._owned_profile_windows(health, known_windows)
         foreground = self._profile_foreground(health, owned, known_windows)
         hwnd = action.surface.hwnd
         if action.surface.embedded:
             width, height = health.last.client_size
-        elif (hwnd, action.surface.geometry) in owned and hwnd not in known_windows:
+        elif (hwnd, action.surface.geometry) in owned:
             _, width, height = action.surface.geometry
         else:
             raise NavigationPaused("资料窗口不再属于本次核验")
@@ -536,7 +676,7 @@ class CollectionNavigation:
                 health = self._profile_health(frame)
                 if health.last.foreground_hwnd != foreground:
                     raise NavigationPaused("资料操作前前台已变化")
-                if expected_hwnd != frame.capture.hwnd and (expected_hwnd, profile.surface.geometry) not in self._owned_profile_windows(health):
+                if expected_hwnd != frame.capture.hwnd and (expected_hwnd, profile.surface.geometry) not in self._owned_profile_windows(health, known_windows):
                     raise NavigationPaused("资料操作前窗口坐标已变化")
                 if not win32gui.IsWindowEnabled(expected_hwnd):
                     raise NavigationPaused("资料操作前窗口已禁用")
@@ -563,5 +703,6 @@ class CollectionNavigation:
             except OSError:
                 self._own_input = None
 
+            self.report("WINDOW", "INPUT_EXECUTED", details={"point": point, "action": profile.stage if profile else "B2"})
+
         self.permit.perform(send, scroll=scroll)
-        self.report("WINDOW", "INPUT_EXECUTED", details={"point": point, "action": profile.stage if profile else "B2"})

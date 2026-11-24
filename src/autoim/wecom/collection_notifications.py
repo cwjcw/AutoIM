@@ -10,6 +10,7 @@ from autoim.wecom.collection_events import EventTime, SaveNotice
 
 class CollectionNotifier(QObject):
     reported = Signal(object, str, object)
+    submitting = Signal(object)
 
     def __init__(self, parent=None, *, tray_factory=QSystemTrayIcon):
         super().__init__(parent)
@@ -55,7 +56,15 @@ class CollectionNotifier(QObject):
         notices, self._pending = self._pending, []
         if not notices:
             return
+        groups = (tuple(notice for notice in notices if not notice.test_run),
+                  tuple(notice for notice in notices if notice.test_run))
+        for group in groups:
+            if group:
+                self._deliver(group)
+
+    def _deliver(self, notices):
         count = sum(notice.count for notice in notices)
+        test = bool(notices[0].test_run)
         result = "系统桌面通知不可用"
         try:
             tray = self._system_tray()
@@ -65,7 +74,8 @@ class CollectionNotifier(QObject):
                 total = durations.get("unread_to_commit_ms")
                 title = latest.title[:60] if len(notices) == 1 else f"{len(notices)} 批采集"
                 duration = f" · 耗时 {total / 1000:.1f} 秒" if total is not None and len(notices) == 1 else ""
-                tray.showMessage("AutoIM 采集成功", f"{title or '当前会话'} · 新增 {count} 条消息 · 已保存{duration}",
+                self.submitting.emit(tuple(notices))
+                tray.showMessage("TEST · AutoIM 隔离测试" if test else "AutoIM 采集成功", f"{title or '当前会话'} · 新增 {count} 条消息 · 已保存{duration}",
                                        QSystemTrayIcon.MessageIcon.Information)
                 result = "已提交给系统通知"
         except Exception:

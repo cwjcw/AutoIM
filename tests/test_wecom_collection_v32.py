@@ -66,7 +66,7 @@ class ScopeAndNavigationTests(unittest.TestCase):
         first, second, third = view(unread={0: (2, False), 1: (1, False), 2: (1, True)}).contacts
         raw = replace(self.raw, contacts=(replace(first, kind="UNKNOWN_ENTRY"), replace(second, is_muted=None), third))
         results = unread_targets(raw, CollectionScope())
-        self.assertTrue(results[0].skip_reason)
+        self.assertEqual(results[0].scope_decision, "WAITING_REVALIDATION")
         self.assertIn("静音状态", results[1].blockers[0])
         self.assertTrue(results[2].skip_reason)
         self.assertFalse(unread_targets(raw, CollectionScope(muted=True))[2].skip_reason)

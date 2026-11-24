@@ -83,7 +83,10 @@ def _scan_lines(state: ScanStatus) -> list[str]:
         f"选中行 {state.selection_name or '—'} · 姓名 {'可靠' if state.selection_name_reliable else '未确认'}"
         f" · {state.selection_method} · {state.selection_confidence}"
         f" · {state.selection_evidence or '—'}",
-        f"策略跳过 {state.skipped_unread} · {'；'.join(state.skipped_reasons) or '—'}",
+        f"策略排除 {state.policy_skipped_unread} · 特殊入口 {state.unsupported_unread} · "
+        f"类型待核 {state.unknown_type_unread} · 静音待核 {state.unknown_muted_unread} · "
+        f"其他待核 {state.other_unreliable_unread} · 合格但暂不可导航 {state.navigation_blocked_unread}",
+        f"策略及入口合计 {state.skipped_unread} · {'；'.join(state.skipped_reasons) or '—'}",
         f"输入复核 {state.input_diagnostic or '—'}",
         f"不可靠原因 {'；'.join(state.unreliable_reasons) or '—'} · 等待导航 {state.awaiting_navigation}"
         f" · 进入导航 {('通过预检' if state.navigation_allowed else '未通过或无任务') if state.navigation_allowed is not None else '待核对'}"
@@ -253,6 +256,7 @@ class VisualCollectionPanel(QWidget):
         self._history_dialog = None
         self._notifier = CollectionNotifier(self)
         self._notifier.reported.connect(self._notification_reported)
+        self._notifier.submitting.connect(self._notification_submitting)
         self._notifications = deque(maxlen=20)
         self._notice_runs = {}
 
@@ -327,6 +331,24 @@ class VisualCollectionPanel(QWidget):
         self.assistance_button.clicked.connect(self._show_exception)
         self.assistance_button.hide()
         layout.addWidget(self.assistance_button, 0, Qt.AlignmentFlag.AlignLeft)
+        test_controls = QHBoxLayout()
+        self.isolated_button = QPushButton("授权指定测试会话")
+        self.isolated_button.clicked.connect(self._authorize_isolated)
+        self.isolated_button.hide()
+        self.test_history_button = QPushButton("查看隔离测试记录")
+        self.test_history_button.clicked.connect(self._show_isolated_history)
+        self.test_history_button.hide()
+        self.test_notice_confirm = QPushButton("确认已看到 TEST 通知")
+        self.test_notice_confirm.clicked.connect(self._confirm_test_notice)
+        self.test_notice_confirm.hide()
+        self.test_db_button = QPushButton("隔离库事务自检")
+        self.test_db_button.clicked.connect(self._run_test_database_probe)
+        self.test_db_button.hide()
+        self._last_test_notice = None
+        for button in (self.isolated_button, self.test_history_button, self.test_db_button, self.test_notice_confirm):
+            test_controls.addWidget(button)
+        test_controls.addStretch()
+        layout.addLayout(test_controls)
         history = QHBoxLayout()
         for i, title in enumerate(("查看已保存聊天记录", "查看自动巡检任务", "查看采集异常")):
             button = QPushButton(title)
@@ -366,6 +388,43 @@ class VisualCollectionPanel(QWidget):
             self.settings.setValue("collection/mode", self.mode_select.currentData())
         if self.runtime and self._service is not None and not self.busy:
             self._service.configure_runtime(self.runtime, self.mode_select.currentData())
+
+    def _authorize_isolated(self):
+        if not self._service or not self._service.active or self._in_flight:
+            return
+        choices = self._status.isolated_choices
+        if not choices:
+            return
+        self._timer.stop()
+        labels = {f"{item.target.row.display_name} · 可见第 {item.target.row.sequence} 行": item for item in choices}
+        try:
+            label, ok = QInputDialog.getItem(
+                self, "授权隔离导航测试",
+                "只操作你选定且拥有读取权限的测试会话。打开会话可能改变未读状态。"
+                "记录进入独立测试库。请选择并确认本轮授权。", list(labels), 0, False)
+            if ok and label in labels and self._service.active and not self._in_flight:
+                self._render(self._service.authorize_isolated(labels[label]))
+        finally:
+            if self._service.active:
+                self._timer.start(1000)
+
+    def _show_isolated_history(self):
+        service = self._get_service()
+        self._show_history(0, store=service.test_store, isolated=True)
+
+    def _run_test_database_probe(self):
+        if self._service and self._service.active and not self._in_flight and self.mode_select.currentData() == "test":
+            self._timer.stop()
+            self._submit(self._service.test_database_probe)
+
+    def _confirm_test_notice(self):
+        if not self._last_test_notice or not self.runtime:
+            return
+        run, test_run = self._last_test_notice
+        self._last_test_notice = None
+        self.test_notice_confirm.hide()
+        self.runtime.emit("test", run, "TEST_NOTIFY", "TEST_NOTIFICATION_SEEN", "MANUAL_ASSISTED",
+                          details={"test_run": test_run, "evidence_scope": "ISOLATED_DATABASE_TEST"})
 
     def _profile_assist(self, action):
         if not self._service or not self._service.active:
@@ -581,6 +640,10 @@ class VisualCollectionPanel(QWidget):
         for button in self.diagnostic_buttons:
             button.setEnabled(self.runtime is not None)
         self.assistance_button.setEnabled(not self._in_flight)
+        self.isolated_button.setEnabled(not self._in_flight and bool(self._service and self._service.active))
+        self.test_history_button.setVisible(bool(self.runtime and self.mode_select.currentData() == "test"))
+        self.test_db_button.setVisible(self.test_history_button.isVisibleTo(self))
+        self.test_db_button.setEnabled(not self._in_flight and bool(self._service and self._service.active))
         self.save_button.setEnabled(enabled)
         self.identify_button.setEnabled(enabled)
         self.confirm_button.setVisible(self._status.account_state == "CONFIRMATION_REQUIRED")
@@ -649,6 +712,9 @@ class VisualCollectionPanel(QWidget):
         if self._service:
             was_active = self._service.active
             if self.runtime:
+                if was_active:
+                    self.runtime.emit(self.mode_select.currentData(), self._last_detection, "STOP_CONTROL",
+                                      "STOP_SCHEDULING", "AUTO_PASS")
                 self._service.stop(source=self._stop_source)
                 self._notifier.flush()
             else:
@@ -702,6 +768,8 @@ class VisualCollectionPanel(QWidget):
 
     def _submit(self, action):
         self._in_flight = True
+        if self.runtime and self._service:
+            self._service.begin_worker()
         self._refresh()
         self._pulse.start()
 
@@ -725,6 +793,8 @@ class VisualCollectionPanel(QWidget):
 
     def _finished(self, data):
         self._in_flight = False
+        if self.runtime and self._service:
+            self._service.end_worker()
         result, jobs = data
         if jobs is not None:
             self._jobs = jobs
@@ -751,6 +821,8 @@ class VisualCollectionPanel(QWidget):
 
     def _failed(self, _message):
         self._in_flight = False
+        if self.runtime and self._service:
+            self._service.end_worker()
         reason = "窗口、OCR 或 SQLite 操作失败，请查看已保存的任务证据"
         if self.runtime and self._service:
             if self._service.snapshot().failure_code != "BACKGROUND_WORKER_EXCEPTION":
@@ -761,13 +833,31 @@ class VisualCollectionPanel(QWidget):
         self._render(result)
         self._handle_failure(result)
 
+    def _notification_submitting(self, notices):
+        if not self.runtime:
+            return
+        for notice in notices:
+            if notice.test_run:
+                mode, run = self._notice_runs.get(notice.id, (self.mode_select.currentData(), self._last_detection))
+                self.runtime.emit(mode, run, "TEST_NOTIFY", "TEST_NOTIFICATION_API_CALL", "PARTIAL",
+                                  details={"test_run": notice.test_run, "evidence_scope": "ISOLATED_DATABASE_TEST"})
+
     def _notification_reported(self, notices, outcome, at):
         for notice in notices:
             if self.runtime:
                 mode, run = self._notice_runs.pop(notice.id, (self.mode_select.currentData(), self._last_detection))
-                self.runtime.emit(mode, run, "NOTIFY", "WINDOWS_NOTIFICATION",
-                                  "AUTO_PASS" if outcome == "已提交给系统通知" else "FAILED",
-                                  task=notice.job_id or "", details={"count": notice.count, "reason": outcome})
+                if notice.test_run:
+                    self.runtime.emit(mode, run, "TEST_NOTIFY", "TEST_WINDOWS_NOTIFICATION",
+                                      "AUTO_PASS" if outcome == "已提交给系统通知" else "FAILED",
+                                      details={"count": notice.count, "reason": outcome, "test_run": notice.test_run,
+                                               "evidence_scope": "ISOLATED_DATABASE_TEST", "user_seen": False})
+                    if outcome == "已提交给系统通知":
+                        self._last_test_notice = run, notice.test_run
+                        self.test_notice_confirm.show()
+                else:
+                    self.runtime.emit(mode, run, "NOTIFY", "WINDOWS_NOTIFICATION",
+                                      "AUTO_PASS" if outcome == "已提交给系统通知" else "FAILED",
+                                      task=notice.job_id or "", details={"count": notice.count, "reason": outcome})
             self._notifications.append(f"{at.iso()} · {notice.job_id or '手工保存'} · {notice.count} 条 · {outcome}")
         self._render(self._status)
         jobs = tuple(notice for notice in notices if notice.job_id)
@@ -781,6 +871,7 @@ class VisualCollectionPanel(QWidget):
     def _render(self, result):
         self._status = result
         self.assistance_button.setVisible(bool(result.assist or result.failure_at))
+        self.isolated_button.setVisible(bool(self.runtime and result.isolated_choices))
         self.account_label.setText(
             f"当前账号 {result.account_name or '—'} · 邮箱 {result.account_email or '—'} · "
             f"{result.account_reason or '等待识别'}")
@@ -802,17 +893,20 @@ class VisualCollectionPanel(QWidget):
             + f"\n桌面通知 {self._notifications[-1] if self._notifications else '—'}\n"
             + "\n".join(_window_lines(result)))
 
-    def _show_history(self, tab):
+    def _show_history(self, tab, *, store=None, isolated=False):
+        store = store or self.store
         def failed(_):
             self.summary.setText("本地数据库读取失败。")
 
         def load(profile):
             def show(data):
-                dialog = CollectionHistory(self.run_worker, self.store, profile, data, tab, self)
+                dialog = CollectionHistory(self.run_worker, store, profile, data, tab, self)
+                if isolated:
+                    dialog.setWindowTitle("TEST · 隔离测试聊天记录")
                 self._history_dialog = dialog
                 dialog.finished.connect(self._forget_history)
                 dialog.show()
-            self.run_worker(self.store.browse, profile, on_result=show, on_error=failed)
+            self.run_worker(store.browse, profile, on_result=show, on_error=failed)
 
         def choose(accounts):
             choices = {f"{row.label} · 本地 ID {row.id}": row.id for row in accounts}
@@ -827,7 +921,7 @@ class VisualCollectionPanel(QWidget):
             if accepted and label in choices:
                 load(choices[label])
 
-        self.run_worker(self.store.accounts, on_result=choose, on_error=failed)
+        self.run_worker(store.accounts, on_result=choose, on_error=failed)
 
     def _forget_history(self):
         self._history_dialog = None
@@ -835,7 +929,7 @@ class VisualCollectionPanel(QWidget):
     def _report(self, full):
         state = self._status
         candidates = str(state.candidates) if state.b2_scan_completed_at else "—"
-        lines = [f"AutoIM {__version__} · PC-V3.3 · WINDOW_VISUAL_OCR",
+        lines = [f"AutoIM {__version__} · PC-V3.4 · WINDOW_VISUAL_OCR",
                  f"状态 {state.status} · 匹配 {state.match} · {state.reason}",
                  f"候选 {candidates} · 等待 {state.queued} · 完成 {state.completed} · 异常 {state.errors}",
                  f"已保存 {state.saved} · 新增 {state.added} · 重复观察 {state.repeated} · 未确认 {state.uncertain}"]

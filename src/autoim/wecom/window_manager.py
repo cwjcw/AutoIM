@@ -220,9 +220,16 @@ class WeComWindowManager:
         logger.error(error)
         raise WindowResolutionError(error)
 
-    def prepare_collection_window(self, probe, perform, check, wait):
+    def prepare_collection_window(self, probe, perform, check, wait, *, report=lambda *args, **kwargs: None):
         """Prepare one fixed WeCom lifecycle on an explicit collection start."""
         first = probe()
+        def facts(health):
+            return {"status": health.status, "hwnd": health.window.hwnd if health.window else None,
+                    "dpi": health.last.dpi if health.last else None,
+                    "iconic": health.last.iconic if health.last else None,
+                    "zoomed": health.last.zoomed if health.last else None, "foreground": health.foreground,
+                    "geometry": health.geometry}
+        report("WINDOW_LOCATED", "AUTO_PASS" if first.identity else "FAILED", details=facts(first))
         if first.status not in {"WINDOW_VALID", "WINDOW_NOT_FOREGROUND", "WINDOW_MINIMIZED"} or not first.identity:
             return first
         original = first.identity
@@ -245,20 +252,33 @@ class WeComWindowManager:
             wait()
             return checked()
 
-        current = first
-        if current.status == "WINDOW_MINIMIZED":
-            current = change(lambda hwnd: gui.ShowWindow(hwnd, 9))
+        def execute(code, previous, applicable, action, verified):
+            if not applicable:
+                report(code, "SKIPPED", details={"before": facts(previous), "executed": False})
+                return previous
+            try:
+                observed = change(action)
+            except gui.error as exc:
+                report(code, "FAILED", details={"before": facts(previous), "executed": True,
+                                               "reason": f"Win32 {type(exc).__name__} {getattr(exc, 'winerror', '')}"})
+                raise
+            report(code, "AUTO_PASS" if verified(observed) else "FAILED",
+                   details={"before": facts(previous), "after": facts(observed), "executed": True})
+            return observed
+
+        current = execute("WINDOW_RESTORE", first, first.status == "WINDOW_MINIMIZED",
+                          lambda hwnd: gui.ShowWindow(hwnd, 9), lambda state: state.status != "WINDOW_MINIMIZED")
         if current.status == "WINDOW_MINIMIZED":
             return current
-        if not current.last.zoomed:
-            current = change(lambda hwnd: gui.ShowWindow(hwnd, 3))
-        if current.status == "WINDOW_NOT_FOREGROUND" and current.last.zoomed:
-            try:
-                current = change(gui.SetForegroundWindow)
-            except gui.error:
-                current = checked()
-                if not current.foreground:
-                    raise WindowResolutionError("Windows 拒绝前台激活，请手动切回企业微信") from None
+        current = execute("WINDOW_MAXIMIZE", current, not current.last.zoomed,
+                          lambda hwnd: gui.ShowWindow(hwnd, 3), lambda state: state.last.zoomed)
+        try:
+            current = execute("WINDOW_ACTIVATE", current, current.status == "WINDOW_NOT_FOREGROUND" and current.last.zoomed,
+                              gui.SetForegroundWindow, lambda state: state.foreground)
+        except gui.error:
+            current = checked()
+            if not current.foreground:
+                raise WindowResolutionError("Windows 拒绝前台激活，请手动切回企业微信") from None
         return current
 
     def get_rect(self) -> tuple[int, int, int, int]:

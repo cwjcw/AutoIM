@@ -48,3 +48,4 @@ class SaveNotice:
     count: int
     trace: CollectionTrace
     job_id: str | None = None
+    test_run: str = ""
