@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from autoim.calibration import CalibrationStore
-from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, bounds,
+from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
 from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, row_target
@@ -300,14 +300,14 @@ def page_transition(before: tuple[str, ...], after: tuple[str, ...]) -> str:
     return "SCROLLED" if len(overlaps) == 1 else "SCROLL_UNCERTAIN"
 
 
-def _matches_target(observation: VisualObservation, target: _Target) -> bool:
+def _matches_target(observation: VisualObservation, target: _Target, *, avatar_corroborated=False) -> bool:
     rows = [row for row in observation.contacts if name_key(row.display_name) == target.name]
     conv = observation.conversation
     return (len(rows) == 1 and (rows[0].is_selected is True or observation.verified_target == rows[0])
             and rows[0].name_reliable
             and rows[0].status == "CANDIDATE" and conv.match_status == "VISUAL_MATCH"
             and conv.title_name_reliable and conv.selected_name_reliable and name_key(conv.title) == target.name
-            and (not target.avatar or avatar_key(observation, rows[0]) == target.avatar)
+            and (avatar_corroborated or not target.avatar or avatar_key(observation, rows[0]) == target.avatar)
             and rows[0].peer_type == target.row.peer_type
             and rows[0].identity_labels == target.row.identity_labels
             and (target.row.kind != "GROUP_CANDIDATE" or conv.conversation_type == "GROUP")
@@ -341,6 +341,27 @@ def _verify_transition(before: VisualObservation, after: VisualObservation, targ
                                         comparison_evidence="已点击；C1 标题切换、唯一 B2 头像一致且未读标记消失",
                                         selection_method="VERIFIED_NAVIGATION_TRANSITION",
                                         selection_confidence="CORROBORATED"))
+
+
+def _core_selection_evidence(before, after, target, refreshed):
+    if _matches_target(after, target):
+        return "EXACT_VISUAL_IDENTITY", None
+    rows = [row for row in after.contacts if name_key(row.display_name) == target.name]
+    if (len(rows) != 1 or not refreshed or not before.conversation.title_name_reliable
+            or name_key(before.conversation.title) == target.name
+            or not target.row.has_unread_indicator or target.row.badge is None
+            or rows[0].is_selected is not True or rows[0].has_unread_indicator or rows[0].badge is not None):
+        return "TRANSITION_EVIDENCE_MISSING", None
+    row = rows[0]
+    if row.peer_type == target.row.peer_type == "PERSONAL_WECHAT":
+        # Both labels have already been parsed as the same known peer type.
+        target = replace(target, row=replace(target.row, identity_labels=row.identity_labels))
+    if not _matches_target(after, target, avatar_corroborated=True):
+        return "NAME_ROW_OR_PEER_EVIDENCE_CONFLICT", None
+    distance = avatar_distance(before, target.row, after, row)
+    if distance is None or distance > 22:
+        return "AVATAR_EVIDENCE_NOT_CORROBORATED", distance
+    return "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR", distance
 
 
 @dataclass(frozen=True, slots=True)
@@ -1958,7 +1979,10 @@ class CollectionService:
                 task.changed = True
                 self._core_event("CONVERSATION_CHANGED", task, c2_changed=True,
                                  title_changed=name_key(header.conversation.title) != name_key(task.before.conversation.title))
-            if not _matches_target(candidate, task.target):
+            evidence, distance = _core_selection_evidence(task.before, candidate, task.target, refreshed)
+            task.match_evidence = evidence
+            task.match_distance = round(distance, 2) if distance is not None else None
+            if evidence not in ("EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR"):
                 task.previous = None
                 return False
             phase = "WAITING_C2_REFRESH" if not refreshed else "WAITING_C2_STABILITY"
@@ -1977,7 +2001,9 @@ class CollectionService:
                 run.clock.begin(6, "定位最新消息并读取 C2")
                 self._core_state(verified=run.view.verified + 1, title_match=True)
                 self._core_event("CONVERSATION_VERIFIED", task, "AUTO_PASS", badge_cleared=cleared,
-                                 selection=candidate.conversation.selection_method, c2_changed=refreshed)
+                                 selection=candidate.conversation.selection_method, c2_changed=refreshed,
+                                 match_evidence=evidence, avatar_distance=task.match_distance,
+                                 after_avatar_contour=bool(row.avatar))
             if not refreshed:
                 task.previous = None
                 return False
@@ -2040,7 +2066,10 @@ class CollectionService:
                          title_exact=name_key(raw.conversation.title) == task.target.name,
                          matching_rows=len(matching_rows), c2_changed=task.changed,
                          badge_after=matching_rows[0].has_unread_indicator if len(matching_rows) == 1 else None,
-                         selection=raw.conversation.selection_method, ready_for_body=bool(ready))
+                         selection=raw.conversation.selection_method, match_evidence=task.match_evidence,
+                         avatar_distance=task.match_distance,
+                         after_avatar_contour=bool(len(matching_rows) == 1 and matching_rows[0].avatar),
+                         ready_for_body=bool(ready))
         if ready:
             verified, cleared = ready
             if cleared:

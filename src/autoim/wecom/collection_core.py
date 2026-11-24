@@ -10,6 +10,7 @@ from hashlib import blake2s
 from pathlib import Path
 from uuid import uuid4
 
+import cv2
 import numpy as np
 
 from autoim.wecom.visual_layout import Box
@@ -43,6 +44,45 @@ def history_sample(raw) -> np.ndarray | None:
 
 def history_changed(first, second):
     return first is not None and second is not None and _different(first, second, localized=True)
+
+
+def avatar_distance(before, previous, after, current):
+    """Compare interior avatar pixels without relying on an identical crop hash."""
+    if not previous.avatar:
+        return None
+
+    def tile(frame, box):
+        # The upper-right unread badge can change the detected avatar bounds.
+        interior = Box(box.left + box.width // 5, box.top + box.height * 2 // 5,
+                       box.right - box.width // 4, box.bottom - box.height // 8)
+        crop = interior.crop(frame.pixels)
+        if min(crop.shape[:2]) < 8:
+            return None
+        sample = cv2.resize(crop, (28, 28), interpolation=cv2.INTER_AREA)
+        return sample.astype(np.float32) if np.max(sample.std(axis=(0, 1))) >= 9 else None
+
+    first = tile(before.frame, previous.avatar)
+    if first is None:
+        return None
+    interior = first[4:-4, 4:-4]
+    boxes = [current.avatar] if current.avatar else []
+    # A selected row may lose its avatar contour. Translate the before-click
+    # crop within the newly identified row, only at the same viewport scale.
+    if (previous.box.width == current.box.width and before.frame.state.dpi == after.frame.state.dpi
+            and abs(current.box.height - previous.box.height) <= previous.box.height * .12):
+        projected = previous.avatar.offset(current.box.left - previous.box.left,
+                                           current.box.center[1] - previous.box.center[1])
+        if (current.box.contains((projected.left, projected.top))
+                and current.box.contains((projected.right - 1, projected.bottom - 1)) and projected not in boxes):
+            boxes.append(projected)
+    distances = []
+    for box in boxes:
+        second = tile(after.frame, box)
+        if second is not None:
+            # Allow a few pixels of registration error while comparing RGB texture.
+            scores = cv2.matchTemplate(second, interior, cv2.TM_SQDIFF)
+            distances.append(float(np.sqrt(max(0., scores.min()) / interior.size)))
+    return min(distances, default=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +242,8 @@ class CoreTask:
     changed: bool = False
     cursor_moved: bool = False
     applied_point: tuple[int, int] | None = None
+    match_evidence: str = ""
+    match_distance: float | None = None
 
 
 @dataclass(slots=True)

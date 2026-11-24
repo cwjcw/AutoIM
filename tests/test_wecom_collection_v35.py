@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import numpy as np
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from autoim.wecom.collection_core import MAX_READ_POLLS, CoreView, analyze_read
@@ -50,6 +51,17 @@ def bubble(raw, body, *, y=330, kind="TEXT", status="CANDIDATE", score=.99, dire
     box = Box(490, y, 680, y + 35)
     return replace(raw.messages[0], sequence=y, box=box, text=body, kind=kind, status=status, direction=direction,
                    time_evidence="", ocr_spans=(replace(span(body, 503, y + 5, 620, y + 25), score=score),))
+
+
+def with_avatar_texture(raw, index, *, different=False):
+    box = raw.contacts[index].avatar
+    pixels = raw.frame.pixels.copy()
+    y, x = np.indices((box.height, box.width))
+    texture = np.stack((x * 3 + 20, y * 3 + 30, (x + y) * 2 + 40), axis=-1)
+    if different:
+        texture = 245 - texture
+    box.crop(pixels)[:] = texture
+    return replace(raw, frame=replace(raw.frame, capture=replace(raw.frame.capture, image=pixels)))
 
 
 class CoreFlowTests(unittest.TestCase):
@@ -242,6 +254,39 @@ class CoreFlowTests(unittest.TestCase):
         self.poll(sample(0, tone=100))
         self.assertFalse(self.poll(sample(1, tone=100)).core.messages)
         self.assertEqual(self.poll().core.messages[0].text, BODY)
+
+    def test_changed_avatar_hash_can_be_corroborated_after_the_actual_click(self):
+        self.start()
+        before = with_avatar_texture(sample(unread={1: (1, False)}), 1)
+        self.poll(before)
+        after = with_avatar_texture(sample(1, tone=120), 1)
+        with patch("autoim.wecom.collection_service.avatar_key", return_value="different-hash"):
+            result = self.poll(after, count=2)
+        self.assertEqual((result.core.clicks, result.core.verified), (1, 1))
+        self.assertEqual(result.core.messages[0].text, BODY)
+        self.assertEqual(result.core.messages[0].unread, "CONFIRMED_UNREAD")
+        self.assertTrue(any(event["details"].get("match_evidence") == "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR"
+                            for event in self.events()))
+
+    def test_matching_title_cannot_override_a_conflicting_avatar_after_click(self):
+        self.start()
+        self.poll(with_avatar_texture(sample(unread={1: (1, False)}), 1))
+        after = with_avatar_texture(sample(1, tone=120), 1, different=True)
+        with patch("autoim.wecom.collection_service.avatar_key", return_value="different-hash"):
+            result = self.poll(after, count=MAX_READ_POLLS)
+        self.assertEqual((result.core.verified, result.core.read_unfinished, result.core.messages), (0, 1, ()))
+        self.assertEqual(self.poll().core.messages[0].unread, "INDEPENDENT_OCR")
+
+    def test_selected_row_with_missing_avatar_contour_uses_before_click_crop(self):
+        self.start()
+        self.poll(with_avatar_texture(sample(unread={1: (1, False)}), 1))
+        after = with_avatar_texture(sample(1, tone=120), 1)
+        rows = tuple(replace(row, avatar=None) if row.is_selected else row for row in after.contacts)
+        with patch("autoim.wecom.collection_service.avatar_key",
+                   side_effect=lambda _, row: row.display_name if row.avatar else ""):
+            result = self.poll(replace(after, contacts=rows), count=2)
+        self.assertEqual(result.core.verified, 1)
+        self.assertEqual(result.core.messages[0].unread, "CONFIRMED_UNREAD")
 
     def test_core_retries_ocr_without_reclick_and_preserves_reliable_body_on_incomplete_page(self):
         self.start()
