@@ -41,6 +41,7 @@ STAGES = {
     "TEST_CONVERSATION": "独立核实授权测试会话",
     "TEST_SAVE": "隔离数据库提交与去重",
     "TEST_NOTIFY": "提交 TEST 通知及人工可见确认",
+    "CORE": "按授权范围发现、导航、读取并展示测试消息",
 }
 SUBSTEPS = {
     "WINDOW_LOCATED": ("WINDOW_LOCATE", "定位主窗口"),
@@ -79,6 +80,14 @@ SUBSTEPS = {
     "SQLITE_COMMIT": ("SQLITE_COMMIT", "事务提交与去重"),
     "WINDOWS_NOTIFICATION": ("NOTICE_SUBMIT", "系统通知 API 结果"),
     "POLL_RESUMED": ("POLL_CONTINUE", "持续巡检"),
+    "TARGET_AUTHORIZED": ("CORE_AUTHORIZATION", "复核测试范围"),
+    "NAVIGATION_PRECHECK": ("CORE_PRECHECK", "导航前安全校验"),
+    "CONTACT_CLICKED": ("CORE_CLICK", "实际点击授权目标"),
+    "LATEST_POSITION_CHECKED": ("CORE_LATEST", "核查 C2 最新位置"),
+    "MESSAGE_OCR_COMPLETED": ("CORE_OCR", "C2 逐条 OCR"),
+    "UNREAD_RANGE_CHECKED": ("CORE_UNREAD_RANGE", "核查未读范围"),
+    "RESULT_DISPLAYED": ("CORE_DISPLAY", "结果进入 GUI"),
+    "NEXT_TARGET": ("CORE_CONTINUE", "处理后续授权目标"),
     "STOP_REQUESTED": ("STOP_REQUEST", "收到停止指令"),
     "STOP_PERMISSION_REVOKED": ("STOP_PERMIT", "撤销许可"),
     "STOP_SCHEDULING": ("STOP_SCHEDULE", "停止调度"),
@@ -210,7 +219,7 @@ class CollectionRuntime:
             if "reason" in details:
                 details["reason"] = safe_reason(details["reason"])
             event = {"id": uuid4().hex, "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                     "app_version": __version__, "pc_version": "PC-V3.4", "git": self.revision,
+                     "app_version": __version__, "pc_version": "PC-V3.5", "git": self.revision,
                      "session": self.session, "detection": detection, "task": task, "mode": mode,
                      "stage": stage, "code": code, "result": result, "level": level, "elapsed_ms": elapsed_ms,
                      "details": details}
@@ -233,7 +242,7 @@ class CollectionRuntime:
                     audit["requested"] = True
                 elif code == "WORKER_DRAINED":
                     audit["drained"] = True
-                elif code == "INPUT_EXECUTED" and audit["requested"]:
+                elif code in ("INPUT_EXECUTED", "CURSOR_MOVED") and audit["requested"]:
                     audit["late_input"] += 1
             record = logging.LogRecord("autoim.collection", getattr(logging, level), "", 0, code, (), None)
             record.event = event
@@ -311,7 +320,13 @@ class CollectionRuntime:
             elif audit.get("requested") and not audit.get("drained"):
                 stop.update(status="PARTIAL", final_status="PARTIAL", completed=False, waiting=True,
                             reason="已撤销许可，等待 Worker 退出")
-            return {"version": "PC-V3.4", "git": self.revision, "session": self.session,
+            elif audit.get("requested") and audit.get("drained"):
+                stop_steps = ("STOP_REQUEST", "STOP_PERMIT", "STOP_SCHEDULE", "STOP_WORKER", "STOP_INPUT")
+                passed = all(substeps[name]["status"] == "AUTO_PASS" for name in stop_steps)
+                outcome = "AUTO_PASS" if passed else "PARTIAL"
+                stop.update(status=outcome, final_status=outcome, completed=passed, waiting=False,
+                            reason="" if passed else "停止审计缺少必要子步骤证据")
+            return {"version": "PC-V3.5", "git": self.revision, "session": self.session,
                     "detection": detection, "evidence_scopes": sorted(self.scopes.get(detection, ())),
                     "stop_audit": dict(audit), "stages": stages, "substeps": substeps}
 
@@ -373,7 +388,7 @@ class CollectionRuntime:
                                 copyfileobj(stream, entry)
                         archive.writestr("environment.json", json.dumps({"platform": platform.system(),
                                           "release": platform.release(), "python": platform.python_version(),
-                                          "app_version": __version__, "pc_version": "PC-V3.4", "git": self.revision}))
+                                          "app_version": __version__, "pc_version": "PC-V3.5", "git": self.revision}))
                         archive.writestr("diagnostic.json", json.dumps(snapshot, ensure_ascii=False, indent=2))
                         archive.writestr("flow-report.json", json.dumps(self.report(detection), ensure_ascii=False, indent=2))
         except BaseException:

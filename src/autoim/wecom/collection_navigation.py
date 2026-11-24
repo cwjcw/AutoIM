@@ -684,6 +684,8 @@ class CollectionNavigation:
                 raise NavigationPaused("复核期间检测到新的用户操作")
             self.permit.ensure_current()
             win32api.SetCursorPos(xy)
+            if not profile:
+                self.report("WINDOW", "CURSOR_MOVED", details={"point": point, "screen_point": xy, "action": "B2"})
             if win32gui.GetCursorPos() != xy or win32gui.GetForegroundWindow() != foreground:
                 raise NavigationPaused("发送鼠标动作前，指针或前台窗口已变化")
             if profile:
@@ -703,6 +705,7 @@ class CollectionNavigation:
             except OSError:
                 self._own_input = None
 
-            self.report("WINDOW", "INPUT_EXECUTED", details={"point": point, "action": profile.stage if profile else "B2"})
+            self.report("WINDOW", "INPUT_EXECUTED", details={"point": point, "screen_point": xy,
+                        "action": profile.stage if profile else "B2", "operation": "SCROLL" if scroll else "CLICK"})
 
         self.permit.perform(send, scroll=scroll)

@@ -13,18 +13,21 @@ from threading import Event, Lock
 from time import perf_counter
 from uuid import uuid4
 
+import cv2
 import numpy as np
 
 from autoim.calibration import CalibrationStore
+from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, bounds,
+                                         failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
-from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity
+from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
 from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.visual_account import LoginEvidence, read_login
 from autoim.wecom.visual_capture import CaptureError, capture_visible_window
 from autoim.wecom.visual_contacts import ContactObservation
-from autoim.wecom.visual_layout import VisualThresholds, detect_layout
+from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_monitor import _different, probe_frame, summarize
 from autoim.wecom.visual_observation import VisualObservation, observe_frame
 from autoim.wecom.visual_ocr import LocalTextRecognizer, OcrUnavailable
@@ -79,6 +82,13 @@ class CollectionReader:
         login = (read_login(frame.pixels, raw.layout.get("A"), self._ocr, frame.state.dpi) if self._ocr else
                  LoginEvidence(reason="本地 OCR 不可用"))
         return replace(raw, login=login, recognition_ms=(perf_counter() - started) * 1000)
+
+    def read_core(self, frame, message_gate):
+        started = perf_counter()
+        own = self.identify(frame).login
+        raw = observe_frame(frame, self._settings[0], self._ocr, self._settings[1],
+                            message_gate=lambda header: message_gate(replace(header, login=own)))
+        return replace(raw, login=own, recognition_ms=(perf_counter() - started) * 1000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +170,7 @@ class ScanStatus:
     selection_evidence: str = ""
     navigation_allowed: bool | None = None
     input_diagnostic: str = ""
+    core: CoreView | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +241,12 @@ def _new_unread(previous: tuple, current: tuple) -> bool:
 def _merge_unread(previous: tuple, current: tuple) -> tuple:
     count, preview = current
     return count if count is not None else previous[0], preview or previous[1]
+
+
+def _core_read_rank(analysis):
+    return (sum(item.unread == "CONFIRMED_UNREAD" for item in analysis.messages),
+            sum(item.quality == "RELIABLE" for item in analysis.messages),
+            analysis.latest != "UNKNOWN", len(analysis.messages))
 
 
 def unread_targets(observation: VisualObservation, scope: CollectionScope | None = None) -> tuple[_Target, ...]:
@@ -413,6 +430,8 @@ class CollectionService:
         self._worker_in_flight = False
         self._last_window_notice = None
         self._window_gate = ""
+        self._core: CoreRun | None = None
+        self._email_test_only = False
 
     def _verify_isolated_database(self):
         if isinstance(self.store, VisualStore) and isinstance(self.test_store, VisualStore):
@@ -434,7 +453,14 @@ class CollectionService:
             self.runtime.emit(self.mode, self._run_id, group, code, result,
                               details={**details, "evidence_scope": "AUTOMATED_REAL_FLOW"})
         else:
-            self._record(stage, code, level="DEBUG", details=details)
+            level = "INFO" if code in ("INPUT_EXECUTED", "CURSOR_MOVED") else "DEBUG"
+            self._record(stage, code, level=level, details=details)
+        if self._core and self._core.task and details.get("action") == "B2":
+            if code == "CURSOR_MOVED":
+                self._core.task.cursor_moved = True
+            elif code == "INPUT_EXECUTED":
+                self._core.task.clicked_at = EventTime.now().wall
+                self._core.task.applied_point = details.get("screen_point")
         if ((self._window_gate == "foreground" and code == "PROFILE_FOREGROUND" and details.get("allowed"))
                 or (self._window_gate == "input" and code == "INPUT_IDLE_SAMPLE"
                     and details.get("idle_ms", 0) >= 1800 and not details.get("held"))):
@@ -445,12 +471,13 @@ class CollectionService:
     def detection_id(self):
         return self._run_id
 
-    def _record(self, stage, code, result="", *, level="INFO", details=None, elapsed_ms=None, exception=None):
+    def _record(self, stage, code, result="", *, level="INFO", details=None, elapsed_ms=None, exception=None, task_id=None):
         if self.runtime:
             evidence = ("MANUAL_ASSISTED_FLOW" if result == "MANUAL_ASSISTED" else
                         "AUTOMATED_REAL_FLOW" if isinstance(self.navigator, CollectionNavigation) else "SIMULATED_TEST")
             return self.runtime.emit(self.mode, self._run_id, stage, code, result, level=level,
-                                     task=self._status.trace_job, details={"evidence_scope": evidence, **(details or {})},
+                                     task=self._status.trace_job if task_id is None else task_id,
+                                     details={"evidence_scope": evidence, **(details or {})},
                                      elapsed_ms=elapsed_ms,
                                      exception=exception)
         return ""
@@ -459,9 +486,23 @@ class CollectionService:
         self._record(stage, code, result, level=level, details={"reason": safe_reason(reason)}, exception=exception)
         self._set(last_failure=reason, failure_stage=stage, failure_code=code, failure_at=EventTime.now().iso(), failure_level=level)
 
-    def start(self, *, scroll: bool = False) -> None:
+    def start(self, *, scroll: bool = False, core_scope=None, failure_crops=False, email_test_only=False) -> None:
         if not self._cancel.is_set() or self._lock.locked() or self._worker_in_flight:
             raise NavigationPaused("自动采集已经启动或上轮仍在清理")
+        core = None
+        if core_scope is not None:
+            account, contacts = core_scope
+            names = tuple(dict.fromkeys(name_key(name) for name in contacts if name_key(name)))
+            if self.mode != "test" or not name_key(account) or not names or len(names) > 20:
+                raise NavigationPaused("核心测试需要明确的测试账号及 1–20 个获授权会话")
+            core = CoreRun(name_key(account), names, failure_crops)
+            if self.scope is None:
+                self.scope = CollectionScope()
+            scroll = False
+        self._core, self._email_test_only = core, email_test_only
+        if email_test_only:
+            self._force_email = True
+            self._pending_email = None
         self.permit.grant(scroll=scroll)
         self._run_id = uuid4().hex
         self._detection_finished = False
@@ -489,24 +530,38 @@ class CollectionService:
         self._status = ScanStatus("RUNNING", "正在准备企业微信窗口",
                                   account_state=previous.account_state, account_name=previous.account_name, account_email=previous.account_email,
                                   account_at=previous.account_at, account_id=previous.account_id,
-                                  account_choices=previous.account_choices, account_reason=previous.account_reason)
+                                  account_choices=previous.account_choices, account_reason=previous.account_reason,
+                                  core=core.view if core else None)
         self._cancel.clear()
         if isinstance(self.navigator, CollectionNavigation):
             self.navigator.mark_started()
-        self._record("RUN", "DETECTION_STARTED", details={"scope": repr(self.scope)})
+        self._record("RUN", "DETECTION_STARTED", details={"scope": repr(self.scope),
+                     "flow": "CORE_READ_ONLY_RESULTS" if core else "EMAIL_DIAGNOSTIC" if email_test_only else "FORMAL_OR_LEGACY",
+                     "authorized_test_names": len(core.names) if core else 0})
 
     def stop(self, *, source="control") -> None:
         was_active = self.active
         self._cancel.set()
         self.permit.revoke()
         self._isolated_run = None
+        if self._core:
+            run = self._core
+            run.invalidated = True
+            missing_read = bool(was_active and run.task and run.task.clicked_at)
+            if missing_read:
+                self._core_event("TARGET_PARTIAL", run.task, "PARTIAL", reason="STOPPED_AFTER_CLICK", read_risk=True)
+            self._core_state(phase="STOPPED", waiting=0,
+                             risk="BEFORE_UNREAD_NOT_READ" if missing_read else run.view.risk,
+                             partial=run.view.partial + missing_read,
+                             read_unfinished=run.view.read_unfinished + missing_read)
         if self._profile_check and isinstance(self._profile_check.known_windows, ProfileWindows):
             self._profile_check.known_windows.valid = False
         self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False,
                   stop_reason=source, assist="", isolated_choices=())
         if was_active:
-            self._record("STOP", "STOP_REQUESTED", "PARTIAL", details={"source": source})
-            self._record("STOP", "STOP_PERMISSION_REVOKED", details={"source": source})
+            self._record("STOP", "STOP_REQUESTED", "AUTO_PASS", details={"source": source})
+            self._record("STOP", "STOP_PERMISSION_REVOKED", "AUTO_PASS", details={"source": source})
+            self._record("STOP_CONTROL", "STOP_SCHEDULING", "AUTO_PASS", details={"source": source})
         if not self._lock.locked():
             self.finish_run()
 
@@ -521,7 +576,7 @@ class CollectionService:
         if not self.runtime or self.active or self._lock.locked() or self._worker_in_flight or self._detection_finished:
             return
         self._detection_finished = True
-        self._record("STOP", "WORKER_DRAINED", "AUTO_PASS" if self._status.stop_reason == "hotkey" else "PARTIAL",
+        self._record("STOP", "WORKER_DRAINED", "AUTO_PASS",
                      details={"source": self._status.stop_reason})
         self._record("RUN", "DETECTION_FINISHED", details={"report": self.runtime.report(self._run_id)})
 
@@ -1099,11 +1154,15 @@ class CollectionService:
         self._window_plan_invalidated = True
 
     def _wait_for_window(self, reason: str, *, invalidate: bool = False) -> ScanStatus:
+        if self._core and self._core.lifetime and reason.startswith("WINDOW_CLOSED"):
+            return self._invalidate_core("BOUND_WINDOW_CLOSED")
         if self.runtime and self._status.last_failure != reason:
             if self._status.failure_stage != "WINDOW" or self._status.failure_level != "ERROR":
                 self._failure("WINDOW", "WINDOW_WAITING", reason, result="BLOCKED_BY_DEPENDENCY")
-        if invalidate:
+        if invalidate and not self._core:
             self._invalidate_window_plan("窗口或坐标系失去连续性，旧未执行任务保留供核对")
+        if self._core:
+            self._core_state(waiting=0)
         return self._set(status="PAUSED", reason=reason, waiting_for_window=True,
                          last_failure=self._status.last_failure if self.runtime else reason,
                          target="", queued=len(self._queued), match="UNKNOWN",
@@ -1185,6 +1244,9 @@ class CollectionService:
             decision = target.scope_decision if target else "NO_UNREAD"
             if decision == "ELIGIBLE" and blocked_reason:
                 decision = "NAVIGATION_BLOCKED"
+            authorized = bool(target and self._core and self._core.targets.get(target.name) == target.key)
+            if self._core and decision in ("ELIGIBLE", "NAVIGATION_BLOCKED") and not authorized:
+                decision = "OUTSIDE_TEST_AUTHORIZATION"
             identity = target.key if target else f"{name_key(row.display_name)}|{avatar_key(raw, row)}|{row.peer_type}|{'|'.join(map(name_key, row.identity_labels))}"
             alias = blake2s((self._run_id + identity).encode(), digest_size=8).hexdigest()
             evidence = ("RECOGNIZED_SPECIAL_LABEL" if decision == "UNSUPPORTED_ENTRY" else
@@ -1193,6 +1255,8 @@ class CollectionService:
                         "VISIBLE_NAME_AND_ROW" if row.kind == "CONTACT" and row.name_reliable else "UNCONFIRMED")
             mute = "UNKNOWN" if row.is_muted is None else "TRUE" if row.is_muted else "FALSE"
             reason = (target.skip_reason or "；".join(target.blockers) or blocked_reason) if target else ""
+            if decision == "OUTSIDE_TEST_AUTHORIZATION":
+                reason = "不在本轮已绑定测试范围"
             count = row.unread_count if row.unread_count_reliable else None
             self._record("SCOPE", "CONTACT_SCOPE_OBSERVED", details={
                 "observation_id": f"{self._status.scan_id}:{row.sequence}", "target_id": alias,
@@ -1207,6 +1271,7 @@ class CollectionService:
                 "position_reliable": row.status == "CANDIDATE", "selected_state": row.is_selected,
                 "scope_decision": decision, "exclusion_reason": safe_reason(reason),
                 "navigation_eligible": decision == "ELIGIBLE",
+                "test_authorized": authorized if self._core else None,
             })
 
     def _bind_frame(self, frame) -> None:
@@ -1270,13 +1335,23 @@ class CollectionService:
             except (sqlite3.Error, OSError):
                 self._set(last_failure="消息已保存，追加任务耗时证据失败")
 
-    def identify_account(self) -> ScanStatus:
+    def identify_account(self, *, visual_only=False) -> ScanStatus:
         if not self._auto_account:
             return self._status
         self._set(status="CAPTURING", reason="读取 A1 登录账号", account_state="IDENTIFYING",
                   account_choices=(), notice=None)
         identify = self.read.identify if isinstance(self.read, CollectionReader) else self.read
         try:
+            if visual_only:
+                frame = self.capture()
+                self._validate_read_frame(frame)
+                self._record_window(frame.diagnostics.window_health)
+                evidence = identify(frame).login
+                return self._set(status="READY" if evidence.name else "PAUSED", account_name=evidence.name,
+                                 account_state="TEST_A1_PREVIEW" if evidence.name else "TEST_A1_UNVERIFIED",
+                                 account_id=None, account_email="", account_at=EventTime.now(),
+                                 account_reason="A1 预览 · 启动核心测试后会重新验证" if evidence.name else evidence.reason,
+                                 reason="等待授权测试范围")
             for _ in range(2):
                 frame = self.capture()
                 self._record_window(frame.diagnostics.window_health)
@@ -1291,7 +1366,10 @@ class CollectionService:
             return self._set(status="PAUSED", reason=self._status.account_reason)
         except AccountPaused as exc:
             return self._set(status="PAUSED", reason=str(exc), last_failure=str(exc))
-        except CaptureError as exc:
+        except (CaptureError, NavigationPaused) as exc:
+            if visual_only:
+                return self._set(status="PAUSED", reason=str(exc), account_state="TEST_A1_UNVERIFIED",
+                                 account_reason="尚未取得有效 A1 截图")
             state = self._window_error(exc)
             self._pending_login = None
             self.profile = None
@@ -1344,6 +1422,8 @@ class CollectionService:
         try:
             health = self.navigator.prepare_window(self._cancel)
             self._record_window(health)
+            if self._core and health.identity and health.window:
+                self._core.lifetime = health.window.pid, health.window.hwnd, health.identity
             if health.capture_blocker or not health.foreground:
                 reason = f"{health.status} · {health.reason}"
                 self._failure("WINDOW", "WINDOW_PREPARATION_BLOCKED", reason,
@@ -1567,6 +1647,389 @@ class CollectionService:
                          details={**detail, "evidence_scope": "ISOLATED_DATABASE_TEST", "reason": type(exc).__name__})
             return self._set(reason="隔离测试数据库操作失败，正式账号数据未参与")
 
+    def _core_state(self, **changes):
+        run = self._core
+        run.view = replace(run.view, **changes)
+        return self._set(core=run.view)
+
+    def clear_core_results(self):
+        if self._core:
+            self._core.clear_results()
+            self._set(core=self._core.view)
+        return self._status
+
+    def confirm_core_displayed(self, messages):
+        run = self._core
+        if not run:
+            return
+        for task_id in dict.fromkeys(item.task for item in messages):
+            if task_id in run.displayed:
+                continue
+            run.displayed.add(task_id)
+            self._record("CORE_EVIDENCE", "RESULT_DISPLAYED", "AUTO_PASS", task_id=task_id,
+                         details={"core_task": task_id, "messages": sum(item.task == task_id for item in messages)})
+
+    def _core_event(self, code, task=None, result="", **details):
+        if task:
+            details["core_task"] = task.id
+            details["target_id"] = blake2s((self._run_id + task.target.key).encode(), digest_size=8).hexdigest()
+        stage = ("CORE" if code in ("TARGET_COMPLETED", "TARGET_PARTIAL", "TARGET_FAILED",
+                                    "TEST_AUTHORIZATION_INVALIDATED") else "CORE_EVIDENCE")
+        self._record(stage, code, result, details=details, task_id=task.id if task else "")
+
+    def _invalidate_core(self, reason):
+        run = self._core
+        if not run.invalidated:
+            if run.task and run.task.clicked_at:
+                self._core_event("TARGET_FAILED", run.task, "FAILED", reason=reason, clicked=True,
+                                 read_risk=True)
+                self._core_state(failures=run.view.failures + 1, read_unfinished=run.view.read_unfinished + 1,
+                                 risk="BEFORE_UNREAD_NOT_READ")
+            run.invalidated = True
+            run.task = None
+            self.permit.revoke()
+            self._core_event("TEST_AUTHORIZATION_INVALIDATED", result="FAILED", reason=reason)
+        self._core_state(phase="AUTHORIZATION_INVALID", waiting=0)
+        return self._set(status="PAUSED", reason="本轮授权已失效，请停止后重新确认测试范围",
+                         account_state="TEST_AUTHORIZATION_INVALID", account_reason=reason,
+                         navigation_allowed=False)
+
+    def _core_login_ok(self, frame, own):
+        run = self._core
+        return bool(self._lifetime(frame)[-1] is not None and name_key(own.name) == run.account and own.avatar and own.signature
+                    and (run.lifetime is None or run.lifetime == self._lifetime(frame))
+                    and (run.login is None or self._same_login(run.login, own)))
+
+    def _core_failure_crop(self, task, raw, analysis):
+        if not self._core.failure_crops:
+            return
+        # Save only a failed region, not an entire window or current history viewport.
+        related = analysis and name_key(raw.conversation.title) == task.target.name
+        gap_box = next((gap["box"] for gap in analysis.gaps if gap["box"]), None) if related else None
+        if gap_box:
+            area, frame, label = raw.layout.get("C2"), raw.frame, "c2"
+            box = Box(*gap_box)
+            if not area or not (area.contains((box.left, box.top)) and area.contains((box.right-1, box.bottom-1))):
+                return
+            if box.width * box.height >= area.width * area.height / 3:
+                return
+        elif task.clicked_at and raw is not task.before:
+            box, frame, label = raw.layout.get("C1"), raw.frame, "c1"
+            if box:
+                box = replace(box, right=box.left + round(box.width * .69))
+        else:
+            box, frame, label = task.target.row.box, task.before.frame, "b2"
+        if not box:
+            return
+        try:
+            folder = failure_crop_directory()
+            ok, image = cv2.imencode(".png", box.crop(frame.pixels))
+            if ok:
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"{self._run_id}-{task.id}-{label}.png").write_bytes(image.tobytes())
+                self._core_event("PRIVATE_FAILURE_CROP_SAVED", task, region=label, box=bounds(box))
+        except (OSError, cv2.error) as exc:
+            self._core_event("PRIVATE_FAILURE_CROP_FAILED", task, reason=type(exc).__name__)
+
+    def _finish_core_target(self, task, raw, code, *, reason="", analysis=None):
+        run = self._core
+        target = task.target
+        run.handled[target.key] = target.unread_signature
+        run.task = None
+        missing_read = bool(task.clicked_at and code != "TARGET_COMPLETED")
+        if analysis:
+            run.accept_messages(task, analysis)
+        if code != "TARGET_COMPLETED":
+            self._core_failure_crop(task, raw, analysis)
+        result = {"TARGET_COMPLETED": "AUTO_PASS", "TARGET_PARTIAL": "PARTIAL", "TARGET_FAILED": "FAILED"}[code]
+        self._core_event(code, task, result, reason=reason, read_risk=missing_read)
+        self._core_event("NEXT_TARGET", task, result="AUTO_PASS", fresh_b2_required=True)
+        self._core_state(phase=code, failures=run.view.failures + (code == "TARGET_FAILED"),
+                         partial=run.view.partial + (code == "TARGET_PARTIAL"),
+                         read_unfinished=run.view.read_unfinished + missing_read,
+                         risk=reason, ocr_complete=bool(analysis and analysis.messages),
+                         latest=analysis.latest if analysis else "UNKNOWN",
+                         completeness=analysis.completeness if analysis else "")
+        return self._set(status="RUNNING" if self.active else "STOPPED",
+                         reason=reason or "已读取目标消息，下一轮重新扫描 B2")
+
+    def _core_poll(self, frame):
+        run = self._core
+        if run.invalidated:
+            return self._status
+        if run.lifetime and self._lifetime(frame) != run.lifetime:
+            return self._invalidate_core("WINDOW_LIFETIME_CHANGED")
+        task = run.task
+        if task and perf_counter() >= task.deadline:
+            observation = replace(task.before, frame=frame) if _identity(task.before.frame) == _identity(frame) else task.before
+            return self._finish_core_target(task, observation, "TARGET_PARTIAL" if task.best else "TARGET_FAILED",
+                                            reason="C2_READ_DEADLINE", analysis=task.best)
+        attempted = EventTime.now()
+        self._set(screenshot_succeeded_at=frame.captured_at, b2_scan_attempt_at=attempted.wall,
+                  scan_disposition="B2_SCANNING", status="RUNNING", trace_job=task.id if task else "")
+        ready = None
+        phase = "WAITING_TARGET_TITLE"
+
+        def allow_c2(header):
+            nonlocal ready, phase
+            if (not task or not task.clicked_at or not self.active or perf_counter() >= task.deadline
+                    or not self._core_login_ok(header.frame, header.login)):
+                return False
+            if _identity(header.frame) != _identity(task.before.frame):
+                phase = "WINDOW_GEOMETRY_CHANGED_AFTER_CLICK"
+                return False
+            candidate = _verify_transition(task.before, header, task.target)
+            sample = history_sample(candidate)
+            refreshed = history_changed(task.before_sample, sample)
+            if refreshed and not task.changed:
+                task.changed = True
+                self._core_event("CONVERSATION_CHANGED", task, c2_changed=True,
+                                 title_changed=name_key(header.conversation.title) != name_key(task.before.conversation.title))
+            if not _matches_target(candidate, task.target):
+                task.previous = None
+                return False
+            phase = "WAITING_C2_REFRESH" if not refreshed else "WAITING_C2_STABILITY"
+            if not refreshed:
+                task.previous = None
+                return False
+            if isinstance(self.navigator, CollectionNavigation):
+                try:
+                    self.navigator.verify_normal_message(candidate)
+                except NavigationPaused:
+                    phase = "C2_WINDOW_OR_OVERLAY_UNVERIFIED"
+                    task.previous = None
+                    return False
+            row = next(row for row in candidate.contacts if name_key(row.display_name) == task.target.name)
+            cleared = not row.has_unread_indicator and row.badge is None
+            # Treat the first verified sample as the reference. Subsequent samples must
+            # independently repeat the title, account, geometry and refreshed C2 evidence.
+            area = candidate.layout.get("C2")
+            stable = task.previous is not None and area == task.previous_box and not history_changed(task.previous, sample)
+            task.previous = sample
+            task.previous_box = area
+            if task.verified and stable:
+                ready = candidate, cleared
+            elif not task.verified:
+                task.verified = True
+                self._core_state(verified=run.view.verified + 1, title_match=True)
+                self._core_event("CONVERSATION_VERIFIED", task, "AUTO_PASS", badge_cleared=cleared,
+                                 selection=candidate.conversation.selection_method, c2_changed=True)
+            return ready is not None
+
+        if isinstance(self.read, CollectionReader):
+            raw = self.read.read_core(frame, allow_c2)
+        else:
+            raw = self.read(frame)
+            allow_c2(raw)
+        ocr_at = EventTime.now()
+        self._set(scan_ocr_completed_at=ocr_at.wall, match=raw.conversation.match_status,
+                  account_name=raw.login.name, account_at=ocr_at)
+        if not self.active:
+            return self._status
+        self._validate_read_frame(raw.frame, frame)
+        if self._window_probe:
+            current = self._window_probe()
+            self._record_window(current)
+            captured = frame.diagnostics.window_health
+            if captured and current.identity != captured.identity and run.lifetime:
+                return self._invalidate_core("WINDOW_LIFETIME_CHANGED_DURING_OCR")
+            if current.capture_blocker or (captured and current.geometry != captured.geometry):
+                return self._wait_for_window(f"{current.status} · OCR 后窗口状态或坐标变化")
+        else:
+            current = frame.diagnostics.window_health
+        if not self._core_login_ok(raw.frame, raw.login):
+            login_readable = raw.login.key and raw.login.avatar and raw.login.signature
+            if run.login and login_readable:
+                return self._invalidate_core("A1_CHANGED_OR_UNVERIFIED")
+            if task:
+                return self._core_read_target(task, raw, None, "A1_EVIDENCE_UNAVAILABLE_AFTER_CLICK")
+            return self._set(status="PAUSED", account_state="TEST_A1_UNVERIFIED",
+                             reason="A1 姓名、头像或窗口进程身份未能核对到授权测试账号",
+                             account_reason="等待当前账号视觉证据")
+        if run.login is None:
+            run.lifetime, run.login = self._lifetime(raw.frame), raw.login
+        run.binding_frames += 1
+        if run.binding_frames < 2:
+            return self._set(account_state="TEST_A1_VALIDATING", reason="等待第二张独立截图，核对 A1 登录账号")
+        if run.binding_frames == 2:
+            self._record("A1", "TEST_LOGIN_BOUND", "AUTO_PASS", details={"visual_only": True})
+        self._set(account_state="TEST_A1_BOUND", account_email="", account_id=None, account_choices=(),
+                  account_reason="本轮 A1 视觉授权已核对 · 核心测试结果仅保留在内存",
+                  bound_pid=frame.capture.pid, bound_hwnd=frame.capture.hwnd, waiting_for_window=False)
+        if task:
+            return self._core_read_target(task, raw, ready, phase)
+        if (raw.page != "MESSAGES_CANDIDATE" or raw.layout.get("B2") is None or raw.layout.get("C2") is None
+                or any(step.status in ("FAILED", "SKIPPED") for step in raw.ocr_areas if step.region.startswith("B2"))):
+            return self._set(status="PAUSED", reason="消息页面或 B2 联系人 OCR 未确认",
+                             scan_disposition="B2_SCAN_FAILED", navigation_allowed=False)
+        return self._core_scan(raw, attempted, current)
+
+    def _core_read_target(self, task, raw, ready, phase):
+        run = self._core
+        task.polls += 1
+        matching_rows = [row for row in raw.contacts if name_key(row.display_name) == task.target.name]
+        self._core_event("CONVERSATION_SAMPLE", task, poll=task.polls, phase=phase,
+                         title_reliable=raw.conversation.title_name_reliable,
+                         title_exact=name_key(raw.conversation.title) == task.target.name,
+                         matching_rows=len(matching_rows), c2_changed=task.changed,
+                         badge_after=matching_rows[0].has_unread_indicator if len(matching_rows) == 1 else None,
+                         selection=raw.conversation.selection_method, ready_for_body=bool(ready))
+        if ready:
+            verified, cleared = ready
+            if cleared:
+                run.cleared.add(task.target.key)
+            row = task.target.row
+            analysis = analyze_read(raw, task.id, verified.conversation.title,
+                                    row.unread_count if row.unread_count_reliable else None,
+                                    row.preview if row.preview_reliable else "", verified=True,
+                                    badge_cleared=cleared, refreshed=True)
+            self._core_event("C2_CAPTURED", task, "AUTO_PASS", box=bounds(raw.layout.get("C2")),
+                             captured_at=raw.frame.captured_at.isoformat(), poll=task.polls)
+            self._core_event("LATEST_POSITION_CHECKED", task,
+                             "PARTIAL" if analysis.latest == "UNKNOWN" else "AUTO_PASS", method=analysis.latest)
+            self._core_event("MESSAGE_OCR_COMPLETED", task, "PARTIAL" if analysis.gaps or not analysis.messages else "AUTO_PASS",
+                             messages=[item.diagnostic() for item in analysis.messages],
+                             completeness=analysis.completeness, gaps=analysis.gaps,
+                             recognition_ms=round(raw.recognition_ms))
+            confirmed = sum(item.unread == "CONFIRMED_UNREAD" for item in analysis.messages)
+            self._core_event("UNREAD_RANGE_CHECKED", task, "AUTO_PASS" if confirmed else "PARTIAL", unread_confirmed=confirmed,
+                             badge_cleared=cleared, before_count=row.unread_count if row.unread_count_reliable else None)
+            read_signature = tuple((item.kind, item.text, item.time, item.direction, item.quality, item.unread)
+                                   for item in analysis.messages)
+            if read_signature == task.previous_read:
+                self._core_state(repeated=run.view.repeated + len(read_signature))
+            task.previous_read = read_signature
+            self._core_state(latest=analysis.latest, completeness=analysis.completeness,
+                             ocr_complete=any(area.region.startswith("C2") and area.status in ("TEXT_FOUND", "NO_TEXT")
+                                              for area in raw.ocr_areas) or bool(analysis.messages))
+            if analysis.messages and (task.best is None or _core_read_rank(analysis) >= _core_read_rank(task.best)):
+                task.best = analysis
+            if confirmed and confirmed == row.unread_count:
+                return self._finish_core_target(task, raw, "TARGET_COMPLETED", analysis=analysis)
+            phase = "UNREAD_RANGE_UNCERTAIN" if analysis.messages else "C2_OCR_NO_MESSAGES"
+        if task.polls >= MAX_READ_POLLS or perf_counter() >= task.deadline:
+            if task.best:
+                return self._finish_core_target(task, raw, "TARGET_PARTIAL", reason=phase, analysis=task.best)
+            return self._finish_core_target(task, raw, "TARGET_FAILED", reason=phase)
+        self._core_state(phase=phase, risk="CLICKED_AWAITING_READ")
+        return self._set(reason="已点击获授权目标，等待独立截图复核与读取")
+
+    def _core_scan(self, raw, attempted, current):
+        run = self._core
+        names = Counter(name_key(row.display_name) for row in raw.contacts if row.display_name)
+        avatars = Counter(avatar_key(raw, row) for row in raw.contacts if row.avatar)
+        present = {}
+        for row in raw.contacts:
+            name = name_key(row.display_name)
+            if name not in run.names or names[name] != 1 or not row.name_reliable or row.status != "CANDIDATE":
+                continue
+            target = _Target(row, name, avatar_key(raw, row), ())
+            if not target.avatar or avatars[target.avatar] != 1:
+                continue
+            if run.targets.setdefault(name, target.key) == target.key:
+                present[target.key] = row
+        for key, row in present.items():
+            if not row.has_unread_indicator:
+                run.cleared.add(key)
+                run.precheck_failures.pop(key, None)
+        foreground_block = "WINDOW_NOT_FOREGROUND" if current and not current.foreground else ""
+        targets = self._record_b2_result(raw, attempted, blocked_reason=foreground_block)
+        self._record("B2", "B2_SCANNED", "AUTO_PASS", elapsed_ms=raw.recognition_ms,
+                     details={"scan": self._status.scan_id, "contacts": len(raw.contacts),
+                              "unread": self._status.unread_marker_count})
+        eligible = []
+        for target in sorted(targets, key=lambda item: item.row.box.top):
+            key, signature = target.key, target.unread_signature
+            if key not in present or target.ambiguous:
+                continue
+            prior = run.signatures.get(key)
+            changed = key in run.cleared or (prior is not None and _new_unread(prior, signature))
+            if key not in run.seen or changed:
+                run.discovered_at[key] = raw.frame.captured_at
+                self._core_event("UNREAD_DETECTED", scan=self._status.scan_id, row=target.row.sequence,
+                                 target_id=blake2s((self._run_id + key).encode(), digest_size=8).hexdigest(),
+                                 unread_count=signature[0], preview_reliable=bool(signature[1]),
+                                 captured_at=raw.frame.captured_at.isoformat())
+            if changed:
+                run.handled.pop(key, None)
+                run.precheck_failures.pop(key, None)
+            run.cleared.discard(key)
+            run.seen.add(key)
+            run.signatures[key] = signature if changed or prior is None else _merge_unread(prior, signature)
+            if key not in run.handled:
+                eligible.append(target)
+        self._core_state(discovered=len(run.seen), waiting=len(eligible))
+        self._set(queued=len(eligible), awaiting_navigation=len(eligible), navigation_allowed=bool(eligible and not foreground_block),
+                  navigation_block_reason=foreground_block)
+        if foreground_block:
+            self._core_state(phase="WAITING_FOREGROUND")
+            return self._set(status="PAUSED", reason="已完成 B2 扫描，等待企业微信恢复前台")
+        if not eligible:
+            self._core_state(phase="WAITING_UNREAD")
+            reason = ("当前可见联系人没有未读，继续等待" if not self._status.unread_marker_count
+                      else "检测到未读，尚无符合授权和可靠性条件的新任务")
+            return self._set(reason=reason)
+        target = eligible[0]
+        task = CoreTask(target, raw, EventTime.now().wall, run.discovered_at[target.key],
+                        before_sample=history_sample(raw))
+        self._set(trace_job=task.id)
+        self._core_state(phase="NAVIGATION_PRECHECK", contact=target.row.display_name,
+                         before_count=target.unread_signature[0], clicked=False, title_match=False,
+                         latest="UNKNOWN", ocr_complete=False, completeness="", risk="")
+        self._core_event("TARGET_AUTHORIZED", task, "AUTO_PASS", scoped=True, a1_bound=True,
+                         pid=raw.frame.capture.pid, hwnd=raw.frame.capture.hwnd)
+        self._core_event("TARGET_SELECTED", task, "AUTO_PASS", row=target.row.sequence, row_box=bounds(target.row.box),
+                         unread_count=target.unread_signature[0], badge_box=bounds(target.row.badge),
+                         badge_kind="DIGIT" if target.row.unread_count_reliable else "DOT_OR_UNKNOWN_DIGIT",
+                         preview_reliable=target.row.preview_reliable, previous_title_reliable=raw.conversation.title_name_reliable,
+                         discovered_at=task.discovered_at.isoformat(), selected_at=task.created_at.isoformat(),
+                         foreground=current.foreground if current else None, window_box=raw.frame.capture.rect)
+        try:
+            point = row_target(raw, target.row)
+            if isinstance(self.navigator, CollectionNavigation):
+                self.navigator.verify_normal_message(raw)
+            self.navigator.verify_view(raw, need_idle=True)
+            self.permit.ensure_current()
+            if not self.active or run.invalidated:
+                return self._status
+            self._core_event("NAVIGATION_PRECHECK", task, "AUTO_PASS", point=point)
+            # _act independently checks a fresh B2/A1/C1 crop, window hit, idle and permit.
+            run.task = task
+            self.navigator.select(raw, target.row)
+        except (NavigationPaused, CaptureError, OSError) as exc:
+            if not task.clicked_at:
+                run.task = None
+            self._core_event("NAVIGATION_PRECHECK", task, "BLOCKED_BY_DEPENDENCY", reason=safe_reason(exc),
+                             cursor_moved=task.cursor_moved, actual_click=bool(task.clicked_at))
+            if not self.active:
+                return self._status
+            if task.clicked_at:
+                return self._set(reason="点击已经发生，等待重新截图核对会话")
+            if isinstance(exc, NavigationPaused) and (
+                    exc.health is not None or any(part in str(exc) for part in ("空闲", "输入桌面", "新的用户操作"))):
+                self._core_state(phase="WAITING_NAVIGATION_SAFETY", risk="NAVIGATION_SAFETY_GATE")
+                return self._set(status="PAUSED", reason=str(exc), navigation_allowed=False,
+                                 navigation_block_reason=str(exc))
+            run.precheck_failures[target.key] += 1
+            if run.precheck_failures[target.key] >= 2:
+                return self._finish_core_target(task, raw, "TARGET_FAILED", reason="NAVIGATION_RETRY_LIMIT")
+            return self._set(status="PAUSED", reason=str(exc), navigation_allowed=False,
+                             navigation_block_reason=str(exc))
+        task.clicked_at = task.clicked_at or EventTime.now().wall
+        if not self.active:
+            self._core_state(phase="STOPPED", clicked=True, waiting=0,
+                             risk="BEFORE_UNREAD_NOT_READ", clicks=run.view.clicks + 1)
+            self._core_event("CONTACT_CLICKED", task, "AUTO_PASS", point=point,
+                             screen_point=task.applied_point, cursor_moved=task.cursor_moved,
+                             clicked_at=task.clicked_at.isoformat(), possibly_marked_read=True)
+            return self._set(status="STOPPED", reason="许可已撤销；停止前点击已记录，读取未完成")
+        self._core_state(phase="CLICKED_AWAITING_READ", clicked=True, clicks=run.view.clicks + 1, waiting=len(eligible) - 1,
+                         risk="CLICKED_AWAITING_READ")
+        self._core_event("CONTACT_CLICKED", task, "AUTO_PASS", point=point, screen_point=task.applied_point,
+                         cursor_moved=task.cursor_moved, clicked_at=task.clicked_at.isoformat(),
+                         possibly_marked_read=True)
+        return self._set(reason="已点击，等待重新截图核对会话")
+
     def tick(self) -> ScanStatus:
         if not self._lock.acquire(blocking=False):
             return self._status
@@ -1574,6 +2037,8 @@ class CollectionService:
         try:
             if not self.active:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
+            if self._core and self._core.invalidated:
+                return self._status
             if self._prepare_pending:
                 self._prepare_pending = False
                 blocked = self._prepare_start()
@@ -1603,6 +2068,8 @@ class CollectionService:
                 if not self.active:
                     return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
                 if health.capture_blocker:
+                    if self._core and self._core.lifetime and health.status == "WINDOW_CLOSED":
+                        return self._invalidate_core("BOUND_WINDOW_CLOSED")
                     if self._last_window_notice != health.capture_blocker:
                         self._failure("WINDOW", health.capture_blocker, health.reason,
                                       result="BLOCKED_BY_DEPENDENCY")
@@ -1626,12 +2093,17 @@ class CollectionService:
                 self._validate_read_frame(frame)
             except NavigationPaused as exc:
                 return self._wait_for_window(str(exc), invalidate=True)
-            self._bind_frame(frame)
+            if not self._core:
+                self._bind_frame(frame)
             self._record("WINDOW", "FRAME_CAPTURED", level="DEBUG",
                          details={"scan": scan_id, "hwnd": frame.capture.hwnd,
                                   "height": frame.state.height, "width": frame.state.width, "dpi": frame.state.dpi})
             if self._round > 1:
                 self._record("CONTINUE", "POLL_RESUMED", "AUTO_PASS", details={"scan": scan_id})
+            if self._core:
+                return self._core_poll(frame)
+            if self._email_test_only and not self._profile_check and self.profile is not None and not self._force_email:
+                return self._set(status="PAUSED", reason="独立邮箱核验已完成，可停止测试")
             if self._identity_skipped or self._navigation_suspended:
                 return self._readonly_test(frame, skipped=True)
             if self._manual_hold:
@@ -1705,10 +2177,17 @@ class CollectionService:
             self._failure("BIND", "ACCOUNT_DEPENDENCY", str(exc), result="BLOCKED_BY_DEPENDENCY")
             self._set(scan_disposition="B2_SCAN_FAILED", navigation_allowed=False, navigation_block_reason=str(exc))
             return self._set(status="PAUSED" if self.active else "STOPPED", reason=str(exc), last_failure=str(exc))
-        except (CaptureError, NavigationPaused) as exc:
+        except (CaptureError, NavigationPaused, OcrUnavailable) as exc:
             if not self.active:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
-            state = self._window_error(exc)
+            if self._core and self._core.task and self._core.task.clicked_at:
+                task = self._core.task
+                task.polls += 1
+                if task.polls >= MAX_READ_POLLS or perf_counter() >= task.deadline:
+                    return self._finish_core_target(task, task.before,
+                                                    "TARGET_PARTIAL" if task.best else "TARGET_FAILED",
+                                                    reason="C2_READ_RETRY_LIMIT", analysis=task.best)
+            state = self._window_error(exc) if not isinstance(exc, OcrUnavailable) else self._set(status="PAUSED", reason="本地 OCR 不可用")
             disposition = "B2_SCAN_FAILED" if state.scan_disposition == "B2_SCANNING" else state.scan_disposition
             self._failure("B2" if disposition == "B2_SCAN_FAILED" else "WINDOW",
                           "POLL_BLOCKED", state.reason, exception=exc)
@@ -1721,7 +2200,7 @@ class CollectionService:
             return self._set(status="FAILED", reason=reason, last_failure=reason)
         finally:
             if scan_id:
-                self._scan_history = (*self._scan_history[-7:], self._status)
+                self._scan_history = (*self._scan_history[-7:], replace(self._status, core=None))
             self._lock.release()
             self.finish_run()
 

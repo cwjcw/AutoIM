@@ -340,7 +340,7 @@ def _corroborate_selection(title_spans, contacts, thresholds, mouse):
 def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                   reader: TextRecognizer | None = None,
                   thresholds: VisualThresholds = VisualThresholds(), *, on_conversation=None,
-                  contacts_only=False) -> VisualObservation:
+                  contacts_only=False, message_gate=None) -> VisualObservation:
     started = perf_counter()
     pixels = frame.pixels
     layout = detect_layout(pixels, calibration, thresholds)
@@ -391,9 +391,19 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
         on_conversation(VisualObservation(frame, layout, "VERIFYING_CONVERSATION",
                                            contacts=contacts, conversation=conversation))
     trace.region = "C3 输入区"
-    composer = _composer(pixels, c3, trace.read(pixels, c3), unit, thresholds) if c3 else None
+    composer = _composer(pixels, c3, () if message_gate is not None else trace.read(pixels, c3),
+                         unit, thresholds) if c3 else None
     corroborated = bool(conversation.title and ((composer and composer.send_button)
                        or (search and add and contacts) or unread.entry or conversation.selected_name))
+    if message_gate is not None:
+        header = VisualObservation(frame, layout, "HEADER_ONLY",
+                                   page="MESSAGES_CANDIDATE" if corroborated else "UNKNOWN",
+                                   contacts=contacts, conversation=conversation, composer=composer,
+                                   search_box=search, add_button=add, global_unread=unread,
+                                   ocr_areas=tuple(trace.observations), ocr_status=ocr_status,
+                                   recognition_ms=(perf_counter() - started) * 1000)
+        if not message_gate(header):
+            return header
     messages = context = candidates = ()
     anchors = (None, None)
     dispositions = ()
