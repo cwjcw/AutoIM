@@ -234,3 +234,19 @@ android-agent/.kotlin/
 android-agent/local.properties
 android-agent/**/build/
 android-agent/.wrapper-bootstrap/
+
+
+# Private AutoIM local data and diagnostic bundles
+/outputs/
+/logs/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.zip
+*.jsonl
+*.log.[0-9]*
+.env.*
+!.env.example

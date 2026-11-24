@@ -339,7 +339,8 @@ def _corroborate_selection(title_spans, contacts, thresholds, mouse):
 
 def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                   reader: TextRecognizer | None = None,
-                  thresholds: VisualThresholds = VisualThresholds(), *, on_conversation=None) -> VisualObservation:
+                  thresholds: VisualThresholds = VisualThresholds(), *, on_conversation=None,
+                  contacts_only=False) -> VisualObservation:
     started = perf_counter()
     pixels = frame.pixels
     layout = detect_layout(pixels, calibration, thresholds)
@@ -359,7 +360,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
             warnings.append(ocr_reason)
     trace = _ObservedReader(reader)
     title_spans = ()
-    if c1:
+    if c1 and not contacts_only:
         trace.region = "C1 标题"
         title_area = Box(c1.left, c1.top, c1.left + round(c1.width * .69), c1.bottom)
         title_spans = trace.read(pixels, title_area)
@@ -368,6 +369,12 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     trace.region = "B2 联系人"
     contact_diagnostics: list[ContactTextDiagnostic] = []
     contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics) if b2 else ()
+    if contacts_only:
+        page = "MESSAGES_CANDIDATE" if b2 and (unread.entry or (search and add and contacts)) else "UNKNOWN"
+        return VisualObservation(frame, layout, "CONTACTS_ONLY", page=page, contacts=contacts,
+                                 search_box=search, add_button=add, global_unread=unread,
+                                 ocr_areas=tuple(trace.observations), ocr_status=ocr_status,
+                                 recognition_ms=(perf_counter() - started) * 1000)
     contacts, selection_issue = _corroborate_selection(title_spans, contacts, thresholds, frame.mouse)
     conversation = compare_conversation(title_spans, contacts, thresholds)
     if selection_issue:

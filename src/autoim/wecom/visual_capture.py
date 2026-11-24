@@ -103,7 +103,7 @@ _UNPAINTED = (29, 251, 13)
 _MAX_CAPTURE_PIXELS = 20_000_000
 
 
-def _render_client(hwnd: int, width: int, height: int) -> np.ndarray:
+def _render_client(hwnd: int, width: int, height: int, *, flags=1) -> np.ndarray:
     gdi = ctypes.windll.gdi32
     create_dib = gdi.CreateDIBSection
     create_dib.argtypes = [wintypes.HDC, ctypes.POINTER(_BitmapHeader), wintypes.UINT,
@@ -134,7 +134,7 @@ def _render_client(hwnd: int, width: int, height: int) -> np.ndarray:
         buffer = np.ctypeslib.as_array((ctypes.c_uint32 * (width * height)).from_address(bits.value))
         b, g, r = _UNPAINTED
         buffer.fill(b | g << 8 | r << 16)
-        if not print_window(hwnd, hdc, 1):  # PW_CLIENTONLY
+        if not print_window(hwnd, hdc, flags):
             raise CaptureError("CAPTURE_FAILED", "企业微信未返回客户区图像。")
         gdi.GdiFlush()
         data = ctypes.string_at(bits, width * height * 4)

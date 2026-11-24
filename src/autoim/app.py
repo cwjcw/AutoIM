@@ -37,6 +37,7 @@ from autoim.calibration import CalibrationStore
 from autoim.clipboard_diagnostics import run_manual_copy_test, update_manual_copy_report
 from autoim.diagnostics import run_multi_backend_diagnostics
 from autoim.wecom.driver import WeComDriver
+from autoim.wecom.collection_runtime import CollectionRuntime
 from autoim.wecom.chat_parser import ParseResult, parse_wecom_clipboard
 from autoim.wecom.visual_panel import VisualCapturePanel
 from autoim.wecom.window_manager import WeComWindowInfo
@@ -66,14 +67,9 @@ class QtLogHandler(logging.Handler):
 
 
 def setup_logging(bus: LogBus) -> None:
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
-    file_handler = logging.FileHandler(log_dir / "autoim.log", encoding="utf-8")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)s  %(message)s"))
-    root_logger.addHandler(file_handler)
     root_logger.addHandler(QtLogHandler(bus))
     logging.info("AutoIM %s 启动", __version__)
 
@@ -322,7 +318,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _logs_page(self) -> QWidget:
-        page, layout = self._page_shell("日志", "应用日志同时保存到 logs/autoim.log")
+        page, layout = self._page_shell("日志", "采集流程日志和诊断导出位于「运行诊断」")
         self.log_output = QPlainTextEdit(); self.log_output.setReadOnly(True); self.log_output.setMaximumBlockCount(3000)
         layout.addWidget(self.log_output, 1)
         return page
@@ -967,9 +963,16 @@ def main() -> int:
     window = MainWindow(bus)
     window.show()
     collection = window.visual_capture_panel.collection_panel
+    runtime = CollectionRuntime()
+    collection.enable_runtime(runtime)
     collection.bind_hotkey(window)
     QTimer.singleShot(0, collection, collection.identify_account)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        collection._notifier.flush()
+        window.thread_pool.waitForDone(5000)
+        runtime.close()
 
 
 if __name__ == "__main__":

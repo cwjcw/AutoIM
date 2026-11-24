@@ -220,6 +220,47 @@ class WeComWindowManager:
         logger.error(error)
         raise WindowResolutionError(error)
 
+    def prepare_collection_window(self, probe, perform, check, wait):
+        """Prepare one fixed WeCom lifecycle on an explicit collection start."""
+        first = probe()
+        if first.status not in {"WINDOW_VALID", "WINDOW_NOT_FOREGROUND", "WINDOW_MINIMIZED"} or not first.identity:
+            return first
+        original = first.identity
+        gui, _ = self._windows_api()
+
+        def checked():
+            check()
+            current = probe()
+            if (current.identity != original or current.status not in
+                    {"WINDOW_VALID", "WINDOW_NOT_FOREGROUND", "WINDOW_MINIMIZED"}):
+                raise WindowResolutionError("窗口准备期间 HWND、PID、进程生命周期或状态已变化")
+            return current
+
+        def change(action):
+            def guarded():
+                current = checked()
+                check()
+                action(current.window.hwnd)
+            perform(guarded, scroll=False)
+            wait()
+            return checked()
+
+        current = first
+        if current.status == "WINDOW_MINIMIZED":
+            current = change(lambda hwnd: gui.ShowWindow(hwnd, 9))
+        if current.status == "WINDOW_MINIMIZED":
+            return current
+        if not current.last.zoomed:
+            current = change(lambda hwnd: gui.ShowWindow(hwnd, 3))
+        if current.status == "WINDOW_NOT_FOREGROUND" and current.last.zoomed:
+            try:
+                current = change(gui.SetForegroundWindow)
+            except gui.error:
+                current = checked()
+                if not current.foreground:
+                    raise WindowResolutionError("Windows 拒绝前台激活，请手动切回企业微信") from None
+        return current
+
     def get_rect(self) -> tuple[int, int, int, int]:
         """Return the rectangle from a freshly resolved and validated HWND."""
         info = self.resolve_window()

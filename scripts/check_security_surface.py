@@ -30,6 +30,11 @@ def inspect_collector_input(path: Path, source: str) -> list[str]:
     tree = ast.parse(source, filename=str(path))
     checks = []
     navigation = path.name == "collection_navigation.py"
+    prepare = next((node for node in tree.body if isinstance(node, ast.ClassDef)
+                    and node.name == "CollectionNavigation"), None)
+    prepare = next((node for node in prepare.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "prepare_window"), None) if prepare else None
+    window_guard = {id(node) for node in ast.walk(prepare)} if prepare else set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             imported = (*[alias.name for alias in node.names], getattr(node, "module", "") or "")
@@ -39,6 +44,8 @@ def inspect_collector_input(path: Path, source: str) -> list[str]:
         if not isinstance(node, ast.Call):
             continue
         function = getattr(node.func, "attr", getattr(node.func, "id", ""))
+        if function == "prepare_collection_window" and (not navigation or id(node) not in window_guard):
+            checks.append(f"{node.lineno}: 窗口准备必须经过启动许可网关")
         if function in _COLLECTOR_FORBIDDEN or (function in _COLLECTOR_INPUT and not navigation):
             checks.append(f"{node.lineno}: 采集器包含未授权调用 {function}")
         if navigation and function == "mouse_event":

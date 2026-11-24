@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import CancelledError
+from hashlib import blake2s
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -17,7 +19,8 @@ from autoim.calibration import CalibrationStore
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
 from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, card_close,
-                                              email_from_spans, is_profile_card, menu_action)
+                                              email_from_spans, is_profile_card, menu_action, unique_menu)
+from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.visual_account import LoginEvidence, read_login
 from autoim.wecom.visual_capture import CaptureError, capture_visible_window
 from autoim.wecom.visual_contacts import ContactObservation
@@ -26,7 +29,7 @@ from autoim.wecom.visual_monitor import _different, probe_frame, summarize
 from autoim.wecom.visual_observation import VisualObservation, observe_frame
 from autoim.wecom.visual_ocr import LocalTextRecognizer, OcrUnavailable
 from autoim.wecom.visual_store import LocalAccount, SaveResult, VisualStore, avatar_key, name_key
-from autoim.wecom.window_manager import WeComWindowManager
+from autoim.wecom.window_manager import WeComWindowManager, WindowResolutionError
 from autoim.wecom.window_state import WindowHealth, probe_window
 
 
@@ -58,6 +61,10 @@ class CollectionReader:
         login = (read_login(frame.pixels, layout.get("A"), self._ocr, frame.state.dpi) if self._ocr else
                  LoginEvidence(reason="本地 OCR 不可用"))
         return VisualObservation(frame, layout, "ACCOUNT_ONLY", login=login)
+
+    def read_b2(self, frame):
+        self._prepare()
+        return observe_frame(frame, self._settings[0], self._ocr, self._settings[1], contacts_only=True)
 
     def profile_text(self, surface):
         self._prepare()
@@ -114,6 +121,12 @@ class ScanStatus:
     ocr_result: str = ""
     sqlite_result: str = ""
     last_failure: str = ""
+    failure_stage: str = ""
+    failure_code: str = ""
+    failure_at: str = ""
+    failure_level: str = ""
+    stop_reason: str = ""
+    assist: str = ""
     notice: SaveNotice | None = None
     trace_job: str = ""
     screenshot_succeeded_at: datetime | None = None
@@ -333,12 +346,54 @@ class CollectionService:
         self._queued_signatures: dict[str, tuple] = {}
         self._round = 0
         self._operations = 0
+        self.runtime = None
+        self.mode = "test"
+        self._prepare_pending = False
+        self._identity_skipped = False
+        self._identity_retries = 0
+        self._opening_polls = 0
+        self._navigation_suspended = False
+        self._manual_hold = False
+        self._target_attempts = {}
+        self._detection_finished = True
+        self._last_window_notice = None
+
+    def configure_runtime(self, runtime, mode):
+        self.runtime = runtime
+        self.mode = mode
+        if isinstance(self.navigator, CollectionNavigation):
+            self.navigator.report = self._navigation_evidence
+
+    def _navigation_evidence(self, stage, code, *, details):
+        self._record(stage, code, level="DEBUG", details=details)
+
+    @property
+    def detection_id(self):
+        return self._run_id
+
+    def _record(self, stage, code, result="", *, level="INFO", details=None, elapsed_ms=None, exception=None):
+        if self.runtime:
+            return self.runtime.emit(self.mode, self._run_id, stage, code, result, level=level,
+                                     task=self._status.trace_job, details=details, elapsed_ms=elapsed_ms,
+                                     exception=exception)
+        return ""
+
+    def _failure(self, stage, code, reason, *, level="WARNING", result="FAILED", exception=None):
+        self._record(stage, code, result, level=level, details={"reason": safe_reason(reason)}, exception=exception)
+        self._set(last_failure=reason, failure_stage=stage, failure_code=code, failure_at=EventTime.now().iso(), failure_level=level)
 
     def start(self, *, scroll: bool = False) -> None:
-        if not self._cancel.is_set():
-            raise NavigationPaused("自动采集已经启动")
+        if not self._cancel.is_set() or self._lock.locked():
+            raise NavigationPaused("自动采集已经启动或上轮仍在清理")
         self.permit.grant(scroll=scroll)
         self._run_id = uuid4().hex
+        self._detection_finished = False
+        self._prepare_pending = isinstance(self.navigator, CollectionNavigation) and self.runtime is not None
+        self._identity_skipped = self._manual_hold = self._navigation_suspended = False
+        self._identity_retries = 0
+        self._opening_polls = 0
+        self._target_attempts.clear()
+        self._last_window_notice = None
         self._recover = True
         self._scroll = scroll
         self._window = None
@@ -352,18 +407,34 @@ class CollectionService:
         self._operations = 0
         previous = self._status
         self._scan_history = ()
-        self._status = ScanStatus("RUNNING", "请手动切回最大化的企业微信，等待空闲后巡检",
+        self._status = ScanStatus("RUNNING", "正在准备企业微信窗口",
                                   account_state=previous.account_state, account_name=previous.account_name, account_email=previous.account_email,
                                   account_at=previous.account_at, account_id=previous.account_id,
                                   account_choices=previous.account_choices, account_reason=previous.account_reason)
         self._cancel.clear()
         if isinstance(self.navigator, CollectionNavigation):
             self.navigator.mark_started()
+        self._record("RUN", "DETECTION_STARTED", details={"scope": repr(self.scope)})
 
-    def stop(self) -> None:
+    def stop(self, *, source="control") -> None:
+        was_active = self.active
         self._cancel.set()
         self.permit.revoke()
-        self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
+        self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False,
+                  stop_reason=source, assist="")
+        if was_active:
+            result = "AUTO_PASS" if source == "hotkey" else "PARTIAL" if source == "control" else "SKIPPED"
+            self._record("STOP", "STOP_REQUESTED", result, details={"source": source})
+        if not self._lock.locked():
+            self.finish_run()
+
+    def finish_run(self):
+        if not self.runtime or self.active or self._lock.locked() or self._detection_finished:
+            return
+        self._detection_finished = True
+        self._record("STOP", "WORKER_DRAINED", details={"source": self._status.stop_reason})
+        self._record("RUN", "DETECTION_FINISHED", details={"report": self.runtime.report(self._run_id)})
+
 
     @property
     def active(self) -> bool:
@@ -466,12 +537,58 @@ class CollectionService:
         identity = _identity(frame)
         return identity[0], identity[1], identity[-1]
 
+    def assist_identity(self, action):
+        """UI updates this only between workers. Any future action needs a fresh frame."""
+        if not self.active or self.mode != "test":
+            return
+        session = self._profile_check
+        if action == "skip":
+            self._identity_skipped = True
+            self._manual_hold = False
+            self._set(assist="", status="RUNNING", reason="已跳过邮箱模块，继续只读检查")
+            for stage in ("EMAIL", "BIND", "NAVIGATION", "CONVERSATION", "C2", "SAVE", "NOTIFY"):
+                self._record(stage, "IDENTITY_DEPENDENCY", "BLOCKED_BY_DEPENDENCY",
+                             details={"reason": "本轮跳过邮箱核验"})
+        elif action == "retry":
+            if (session.retries if session else self._identity_retries) >= 2:
+                self._set(reason="本阶段自动重试已达上限，可手动完成或跳过")
+                return
+            if session:
+                session.retries += 1
+                session.polls = 0
+            else:
+                self._identity_retries += 1
+            self._failed_profile_lifetime = None
+            self._opening_polls = 0
+            self._manual_hold = False
+            self._set(assist="", reason="将重新截图核对资料层")
+        elif action == "manual" and session:
+            self._manual_hold = False
+            session.polls = 0
+            if session.awaiting == "CLOSE":
+                session.manual_close = True
+                session.stage = "VERIFY_RESTORED"
+            else:
+                session.manual_card = True
+                session.stage = "READING_EMAIL"
+            self._set(assist="", reason="等待企业微信前台及人工步骤的新画面")
+        self._record("RUN", "IDENTITY_ASSIST_CHOICE", details={"action": action})
+
     def _profile_status(self, stage, reason):
         return self._set(status="PAUSED" if self.active else "STOPPED", reason=reason,
                          account_state=stage, account_reason=reason, account_id=None,
                          notice=None, waiting_for_window=False)
 
+    @staticmethod
+    def _profile_transient(exc):
+        if not isinstance(exc, NavigationPaused):
+            return False
+        reason = str(exc)
+        return ("空闲" in reason or "输入桌面" in reason or "前台" in reason or
+                bool(exc.health and exc.health.status in {"WINDOW_MINIMIZED", "WINDOW_NOT_FOREGROUND"}))
+
     def _profile_tick(self, frame):
+        profile_started = perf_counter()
         if not self.active:
             return self._status
         session = self._profile_check
@@ -481,12 +598,25 @@ class CollectionService:
         if session is None:
             if self._failed_profile_lifetime == self._lifetime(frame):
                 return self._profile_status("IDENTITY_VERIFICATION_FAILED", self._status.account_reason)
+            started = perf_counter()
             identify = self.read.identify(frame)
             evidence = identify.login
+            self._record("A1", "LOGIN_VISUAL_CHECK", "AUTO_PASS" if evidence.key and evidence.avatar else "FAILED",
+                         elapsed_ms=(perf_counter() - started) * 1000,
+                         details={"name_seen": bool(evidence.key), "avatar_seen": bool(evidence.avatar),
+                                  "avatar_box": (evidence.avatar_box.left, evidence.avatar_box.top,
+                                                 evidence.avatar_box.right, evidence.avatar_box.bottom)
+                                  if evidence.avatar_box else None})
             self._set(account_name=evidence.name, account_at=EventTime.now())
             if (not evidence.key or evidence.avatar_box is None or not evidence.avatar
                     or any(identify.layout.get(part) is None for part in ("A", "B1", "C1", "C2"))):
-                return self._profile_status("IDENTITY_VERIFICATION_FAILED", "无法可靠定位 A1 登录姓名与头像")
+                reason = "无法可靠定位 A1 登录姓名与头像"
+                if self.runtime:
+                    self._failed_profile_lifetime = self._lifetime(frame)
+                    self._manual_hold = True
+                    self._failure("A1", "A1_NOT_CONFIRMED", reason, level="ERROR")
+                    self._set(assist="IDENTITY" if self.mode == "test" else "")
+                return self._profile_status("IDENTITY_VERIFICATION_FAILED", reason)
             if not self.active:
                 return self._status
             try:
@@ -505,8 +635,20 @@ class CollectionService:
                 self.navigator.profile_click(identify, ProfileAction("A1_OPEN", surface, evidence.avatar_box),
                                              known_windows=known)
             except NavigationPaused as exc:
+                if not self.active:
+                    return self._status
+                if self.runtime and not self._profile_transient(exc):
+                    self._opening_polls += 1
+                    if self._opening_polls >= 4:
+                        self._manual_hold = True
+                        self._failure("MENU", "A1_OPEN_RETRIES_EXHAUSTED", str(exc), level="ERROR", exception=exc)
+                        self._set(assist="IDENTITY" if self.mode == "test" else "")
+                        return self._profile_status("IDENTITY_VERIFICATION_FAILED", str(exc))
+                self._failure("MENU", "A1_OPEN_WAITING", str(exc), result="BLOCKED_BY_DEPENDENCY")
                 return self._profile_status("IDENTITY_CHECK_REQUIRED", str(exc))
+            self._opening_polls = 0
             self._profile_check = ProfileCheck(identify, known)
+            self._record("MENU", "A1_CLICKED", details={"point": evidence.avatar_box.center})
             return self._profile_status("OPENING_PROFILE_MENU", "已打开头像入口，等待识别个人菜单")
 
         reference = session.reference
@@ -516,16 +658,36 @@ class CollectionService:
                 return self._status
             if session.stage == "VERIFY_RESTORED":
                 return self._finish_identity(session, current, owned, surfaces)
-            scanned = tuple((surface, self.read.profile_text(surface)) for surface in surfaces)
+            scanned = []
+            for surface in surfaces:
+                try:
+                    scanned.append((surface, self.read.profile_text(surface)))
+                except OcrUnavailable as exc:
+                    self._record("MENU", "SURFACE_OCR_FAILED", level="WARNING",
+                                 details={"hwnd": surface.hwnd, "embedded": surface.embedded}, exception=exc)
             dpi = current.state.dpi
-            menus = [action for surface, spans in scanned
-                     if (action := menu_action(surface, spans, reference.login.name, dpi))]
+            avatar_box = reference.login.avatar_box
+            avatar = avatar_box.crop(reference.frame.pixels) if avatar_box else None
+            menus = []
+            for surface, spans in scanned:
+                evidence = {"hwnd": surface.hwnd, "embedded": surface.embedded, "dpi": dpi}
+                action = menu_action(surface, spans, reference.login.name, dpi, avatar=avatar, evidence=evidence)
+                self._record("MENU", "MENU_CANDIDATE", level="DEBUG", details=evidence)
+                if action:
+                    menus.append(action)
+            total = len(menus)
+            if isinstance(self.navigator, CollectionNavigation):
+                menus = unique_menu(menus, lambda action: self.navigator.profile_physical(current, action), dpi)
+            self._record("MENU", "MENU_CANDIDATE_COUNTS", level="DEBUG",
+                         details={"surfaces": len(surfaces), "before_dedup": total, "after_dedup": len(menus)})
             if session.stage == "OPENING_PROFILE_MENU":
                 if len(menus) != 1:
                     return self._wait_profile(session, "未取得唯一的个人菜单文字及头像证据")
+                self._record("MENU", "MENU_VERIFIED", "AUTO_PASS", elapsed_ms=(perf_counter() - profile_started) * 1000)
                 self._profile_status("OPENING_PROFILE_CARD", "正在复核个人菜单头像")
                 self.navigator.profile_click(reference, menus[0], known_windows=session.known_windows)
-                session.stage, session.polls = "READING_EMAIL", 0
+                session.stage, session.polls, session.retries = "READING_EMAIL", 0, 0
+                self._record("CARD", "MENU_AVATAR_CLICKED")
                 return self._profile_status(session.stage, "等待识别详细个人资料卡")
             cards = [(surface, spans) for surface, spans in scanned
                      if is_profile_card(spans, reference.login.name, surface)]
@@ -539,6 +701,9 @@ class CollectionService:
                 value = email_from_spans(surface, spans)
                 key = (surface.hwnd, surface.geometry, surface.bounds)
                 if session.stage == "READING_EMAIL":
+                    self._record("CARD", "PROFILE_CARD_VERIFIED", "MANUAL_ASSISTED" if session.manual_card else "AUTO_PASS",
+                                 elapsed_ms=(perf_counter() - profile_started) * 1000)
+                    self._record("EMAIL", "FIRST_EMAIL_READ", details={"valid": bool(value)})
                     session.email, session.email_surface, session.email_at = value, key, current.captured_at
                     session.stage, session.polls = "VERIFYING_EMAIL", 0
                     return self._profile_status(session.stage, "等待第二次独立截图核对邮箱")
@@ -547,10 +712,20 @@ class CollectionService:
                 if not value or value != session.email or key != session.email_surface:
                     session.failed = "两次资料截图的邮箱无效、不一致或资料窗口发生变化"
                     session.email = ""
+                self._record("EMAIL", "EMAIL_COMPARE", "FAILED" if session.failed else "AUTO_PASS",
+                             elapsed_ms=(perf_counter() - profile_started) * 1000,
+                             details={"reason": session.failed, "consistent": bool(session.email)})
                 action = card_close(surface, dpi)
                 if action is None:
-                    session.failed = "未取得资料关闭按钮证据，需手动关闭后重新核验"
-                    return self._profile_status("CLOSING_PROFILE", session.failed)
+                    reason = "未识别到可靠的资料卡关闭控件，请手动关闭资料卡及个人菜单"
+                    if not self.runtime:
+                        session.failed = reason
+                        return self._profile_status("CLOSING_PROFILE", reason)
+                    session.awaiting = "CLOSE"
+                    self._manual_hold = True
+                    self._failure("RESTORE", "CLOSE_CONTROL_UNCONFIRMED", reason, level="ERROR")
+                    self._set(assist="CLOSE" if self.mode == "test" else "")
+                    return self._profile_status("IDENTITY_VERIFICATION_FAILED", reason)
                 self._profile_status("CLOSING_PROFILE", "邮箱核对完成，正在复核本次打开的资料卡关闭位置")
                 self.navigator.profile_click(reference, action, known_windows=session.known_windows)
                 session.close_issued = True
@@ -569,12 +744,28 @@ class CollectionService:
                 return self._profile_status("CLOSING_PROFILE", "验证个人菜单已关闭")
             return self._finish_identity(session, current, owned, surfaces)
         except (NavigationPaused, OcrUnavailable, OSError) as exc:
+            if not self.active:
+                return self._status
+            if self._profile_transient(exc):
+                self._failure("WINDOW", "PROFILE_WAITING_FOR_WINDOW_OR_INPUT", str(exc),
+                              result="BLOCKED_BY_DEPENDENCY")
+                return self._profile_status(session.stage, str(exc))
             return self._wait_profile(session, str(exc) if isinstance(exc, NavigationPaused) else
                                       f"账号核验读取失败（{type(exc).__name__}）")
 
     def _wait_profile(self, session, reason):
         session.polls += 1
         state = session.stage if session.polls < 4 else "IDENTITY_VERIFICATION_FAILED"
+        stage = ("MENU" if session.stage == "OPENING_PROFILE_MENU" else
+                 "CARD" if session.stage == "READING_EMAIL" else
+                 "EMAIL" if session.stage == "VERIFYING_EMAIL" else "RESTORE")
+        if self.runtime:
+            self._record(stage, "PROFILE_POLL", level="DEBUG", details={"attempt": session.polls, "reason": safe_reason(reason)})
+            if session.polls >= 4:
+                session.awaiting = "CLOSE" if stage == "RESTORE" else "CARD"
+                self._manual_hold = True
+                self._failure(stage, "PROFILE_RETRIES_EXHAUSTED", reason, level="ERROR")
+                self._set(assist=session.awaiting if self.mode == "test" else "")
         return self._profile_status(state, reason)
 
     def _finish_identity(self, session, frame, owned, surfaces):
@@ -586,10 +777,16 @@ class CollectionService:
                 or not all(np.array_equal(box.crop(original.frame.pixels), box.crop(frame.pixels)) for box in (b1, c1))):
             return self._wait_profile(session, "仍有资料层、窗口或消息页变化，等待恢复")
         self._profile_check = None
-        if session.failed or not session.email or not session.close_issued:
+        self._record("RESTORE", "CHAT_VIEW_RESTORED", "MANUAL_ASSISTED" if session.manual_close else "AUTO_PASS")
+        if session.failed or not session.email or not (session.close_issued or session.manual_close):
             self._force_email = True
             self._failed_profile_lifetime = self._lifetime(frame)
-            return self._profile_status("IDENTITY_VERIFICATION_FAILED", session.failed or "未取得有效邮箱")
+            reason = session.failed or "未取得有效邮箱"
+            if self.runtime:
+                self._manual_hold = True
+                self._failure("EMAIL", "EMAIL_NOT_VERIFIED", reason, level="ERROR")
+                self._set(assist="IDENTITY" if self.mode == "test" else "")
+            return self._profile_status("IDENTITY_VERIFICATION_FAILED", reason)
         if not self.active:
             return self._status
         self._profile_status("BINDING_ACCOUNT", "正在核对本地邮箱绑定")
@@ -602,7 +799,7 @@ class CollectionService:
         self._accept_login(account, login, lifetime, email=session.email)
         return self._set(status="RUNNING", reason="邮箱已核验，下一轮重新识别消息主页面")
 
-    def _accept_login(self, account, evidence, lifetime, *, email=""):
+    def _accept_login(self, account, evidence, lifetime, *, email="", assisted=False):
         if self._bound_login and self._bound_login[0] != account:
             for waiting in self._waiting_unread.values():
                 self.store.job(waiting.job, "PAUSED", reason="账号已切换，等待重新核对")
@@ -614,6 +811,8 @@ class CollectionService:
                       trace_job="", last_success=None, last_collected_at=None, target="", navigation_result="", ocr_result="",
                       sqlite_result="", notice=None, match="UNKNOWN", last_b2_summary="")
         self.profile = account
+        self._record("BIND", "ACCOUNT_BOUND", "MANUAL_ASSISTED" if assisted else "AUTO_PASS" if email else "PARTIAL",
+                     details={"account_id": account})
         self._verified_email = email
         self._failed_profile_lifetime = None
         self._force_email = False
@@ -639,7 +838,7 @@ class CollectionService:
                     return self._profile_status("IDENTITY_CHECK_REQUIRED", "确认时 A1 或窗口变化，需重新核验")
                 account, _ = self.store.bind_email(evidence, email, lifetime, confirmed=True, account_id=account_id)
                 self.store.break_continuity()
-                self._accept_login(account, evidence, lifetime, email=email)
+                self._accept_login(account, evidence, lifetime, email=email, assisted=True)
                 return self._set(status="RUNNING" if self.active else "READY", reason="邮箱账号绑定已确认",
                                  saved=self.store.browse(account)["message_count"])
             except CaptureError as exc:
@@ -684,6 +883,13 @@ class CollectionService:
     def _record_window(self, health: WindowHealth | None) -> None:
         if health is None:
             return
+        sample, window = health.last, health.window
+        self._record("WINDOW", "WINDOW_PROBE", level="DEBUG", elapsed_ms=health.elapsed_ms,
+                     details={"status": health.status, "pid": window.pid if window else None,
+                              "hwnd": window.hwnd if window else None, "class_name": sample.class_name if sample else None,
+                              "rect": sample.rect if sample else None, "dpi": sample.dpi if sample else None,
+                              "client": sample.client_size if sample else None, "iconic": sample.iconic if sample else None,
+                              "zoomed": sample.zoomed if sample else None, "foreground": health.foreground})
         previous = self._status.window_health
         changes = {"window_health": health}
         if previous is None or self._health_key(previous) != self._health_key(health):
@@ -705,10 +911,14 @@ class CollectionService:
         self._window_plan_invalidated = True
 
     def _wait_for_window(self, reason: str, *, invalidate: bool = False) -> ScanStatus:
+        if self.runtime and self._status.last_failure != reason:
+            if self._status.failure_stage != "WINDOW" or self._status.failure_level != "ERROR":
+                self._failure("WINDOW", "WINDOW_WAITING", reason, result="BLOCKED_BY_DEPENDENCY")
         if invalidate:
             self._invalidate_window_plan("窗口或坐标系失去连续性，旧未执行任务保留供核对")
         return self._set(status="PAUSED", reason=reason, waiting_for_window=True,
-                         last_failure=reason, target="", queued=len(self._queued), match="UNKNOWN",
+                         last_failure=self._status.last_failure if self.runtime else reason,
+                         target="", queued=len(self._queued), match="UNKNOWN",
                          awaiting_navigation=len(self._queued), navigation_allowed=False, navigation_block_reason=reason,
                          scan_disposition="B2_NOT_SCANNED" if self._status.b2_scan_completed_at is None
                          else self._status.scan_disposition)
@@ -810,6 +1020,10 @@ class CollectionService:
                     sqlite_result=f"{result.outcome} · 保存 {result.inserted} · 新增 {result.new_candidates} · "
                                   f"重复 {result.repeated} · 未确认 {result.uncertain}")
         trace = self._status.trace
+        self._record("SAVE", "SQLITE_COMMIT", "AUTO_PASS" if result.conversation_id and not result.uncertain else "PARTIAL",
+                     elapsed_ms=trace.durations().get("ocr_to_commit_ms"),
+                     details={"saved": result.inserted, "new": result.new_candidates,
+                              "repeated": result.repeated, "uncertain": result.uncertain, "outcome": result.outcome})
         if result.conversation_id and not result.uncertain:
             self._set(last_collected_at=result.committed_at)
         if result.new_candidates > 0:
@@ -869,6 +1083,10 @@ class CollectionService:
             self._check_login(raw, allow_binding=False)
             if self._auto_account:
                 self._ensure_login_pixels(raw, self.capture())
+            if self.runtime and not summarize(raw).messages_reliable:
+                reason = "会话归属或 C2 完整性未核对，未写入聊天记录"
+                self._failure("SAVE", "MANUAL_SAVE_BLOCKED", reason, result="BLOCKED_BY_DEPENDENCY")
+                return self._set(status="PAUSED", reason=reason)
             result = self.store.save(self.profile, raw)
         except CaptureError as exc:
             if exc.diagnostics:
@@ -888,6 +1106,52 @@ class CollectionService:
         return self._numbers(result, status=result.outcome, reason=result.reason, target=raw.conversation.title,
                              match=raw.conversation.match_status, saved=total)
 
+    def _prepare_start(self):
+        started = perf_counter()
+        try:
+            health = self.navigator.prepare_window(self._cancel)
+            self._record_window(health)
+            if health.capture_blocker or not health.foreground:
+                reason = f"{health.status} · {health.reason}"
+                self._failure("WINDOW", "WINDOW_PREPARATION_BLOCKED", reason,
+                              level="ERROR" if health.status != "WINDOW_CLOSED" else "WARNING")
+                return self._wait_for_window(reason)
+        except CancelledError:
+            return self._status
+        except (OSError, WindowResolutionError, NavigationPaused) as exc:
+            if not self.active:
+                return self._status
+            self._failure("WINDOW", "WINDOW_PREPARATION_FAILED", str(exc), level="ERROR", exception=exc)
+            return self._wait_for_window(str(exc))
+        self._record("WINDOW", "WINDOW_PREPARED", "AUTO_PASS", elapsed_ms=(perf_counter() - started) * 1000)
+        return None
+
+    def _readonly_test(self, frame, *, skipped):
+        started = perf_counter()
+        raw = self.read.read_b2(frame) if isinstance(self.read, CollectionReader) else self.read(frame)
+        if not self.active:
+            return self._status
+        b2 = raw.layout.get("B2")
+        failed = any(step.status in ("FAILED", "SKIPPED") for step in raw.ocr_areas if step.region.startswith("B2"))
+        if not b2 or raw.page != "MESSAGES_CANDIDATE" or failed:
+            self._record("B2", "READONLY_B2_UNCONFIRMED", "PARTIAL",
+                         details={"reason": "画面或 B2 未核对"})
+            return self._status
+        self._record_b2_result(raw, EventTime.now())
+        self._record("B2", "ISOLATED_TEST_OBSERVATION" if self.mode == "test" else "READONLY_OBSERVATION",
+                     "AUTO_PASS", elapsed_ms=(perf_counter() - started) * 1000,
+                     details={"contacts": len(raw.contacts), "unread": self._status.unread_marker_count,
+                              "reliable": self._status.reliable_unread_count, "unreliable": self._status.unreliable_unread_count,
+                              "excluded": self._status.skipped_unread, "scan": self._status.scan_id,
+                              "scope": "test_metrics" if self.mode == "test" else "runtime_metrics"})
+        self._record("SCOPE", "READONLY_SCOPE_APPLIED", "AUTO_PASS",
+                     details={"excluded": self._status.skipped_unread})
+        if skipped:
+            reason = ("本轮导航已暂停，继续只读扫描" if self._navigation_suspended else
+                      "只读测试已完成，导航和写入等待邮箱核验")
+            self._set(status="RUNNING", reason=reason)
+        return self._status
+
     def tick(self) -> ScanStatus:
         if not self._lock.acquire(blocking=False):
             return self._status
@@ -895,6 +1159,11 @@ class CollectionService:
         try:
             if not self.active:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
+            if self._prepare_pending:
+                self._prepare_pending = False
+                blocked = self._prepare_start()
+                if blocked is not None:
+                    return blocked
             self._round += 1
             scan_id = uuid4().hex[:12]
             self._set(notice=None, scan_id=scan_id, scan_disposition="B2_NOT_SCANNED",
@@ -904,19 +1173,30 @@ class CollectionService:
                       foreground_changed_stage="", navigation_block_reason="", navigation_allowed=None,
                       selection_name="", selection_name_reliable=False, selection_method="UNKNOWN", selection_confidence="UNKNOWN",
                       selection_evidence="", skipped_unread=0, skipped_reasons=())
-            if self._operations >= 12:
-                self.stop()
-                return self._set(status="STOPPED", reason="连续 12 次导航未完成采集，已停止以避免反复操作")
+            if self._operations >= 12 and not self._navigation_suspended:
+                reason = "连续 12 次导航未完成，已暂停本轮导航"
+                if not self.runtime:
+                    self.stop()
+                    return self._set(status="STOPPED", reason=reason)
+                self._navigation_suspended = True
+                self._failure("NAVIGATION", "NAVIGATION_NO_PROGRESS", reason, level="ERROR")
             if self._window_probe is not None:
                 health = self._window_probe()
                 self._record_window(health)
                 if not self.active:
                     return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
                 if health.capture_blocker:
+                    if self._last_window_notice != health.capture_blocker:
+                        self._failure("WINDOW", health.capture_blocker, health.reason,
+                                      result="BLOCKED_BY_DEPENDENCY")
+                        self._last_window_notice = health.capture_blocker
                     message = "请手动最大化企业微信" if health.capture_blocker == "NOT_MAXIMIZED" else health.reason
                     return self._wait_for_window(f"{health.capture_blocker} · {message}", invalidate=True)
             else:
                 health = None
+            if self._last_window_notice:
+                self._record("WINDOW", "WINDOW_RECOVERED", "AUTO_PASS")
+                self._last_window_notice = None
             frame = self.capture()
             captured = frame.diagnostics.window_health
             self._record_window(captured)
@@ -930,6 +1210,21 @@ class CollectionService:
             except NavigationPaused as exc:
                 return self._wait_for_window(str(exc), invalidate=True)
             self._bind_frame(frame)
+            self._record("WINDOW", "FRAME_CAPTURED", level="DEBUG",
+                         details={"scan": scan_id, "hwnd": frame.capture.hwnd,
+                                  "height": frame.state.height, "width": frame.state.width, "dpi": frame.state.dpi})
+            if self._round > 1:
+                self._record("CONTINUE", "POLL_RESUMED", "AUTO_PASS", details={"scan": scan_id})
+            if self._identity_skipped or self._navigation_suspended:
+                return self._readonly_test(frame, skipped=True)
+            if self._manual_hold:
+                session = self._profile_check
+                if session and self._lifetime(frame) != self._lifetime(session.reference.frame):
+                    self._profile_check = None
+                    self._manual_hold = False
+                    self._set(assist="")
+                else:
+                    return self._readonly_test(frame, skipped=False) if self.mode == "test" else self._status
             if self._require_email and (self._profile_check is not None or self._force_email
                                         or self.profile is None or self._bound_login is None
                                         or self._bound_login[2] != self._lifetime(frame)):
@@ -942,6 +1237,7 @@ class CollectionService:
                 self._set(account_state="IDENTIFYING", account_reason="正在读取 A1")
             self._set(trace=CollectionTrace(), trace_job="")
             b2_attempt = EventTime.now()
+            self._record("B2", "B2_STARTED", level="DEBUG", details={"scan": scan_id})
             self._set(status="RUNNING", reason="正在识别本轮 B2 联系人",
                       b2_scan_attempt_at=b2_attempt.wall, scan_disposition="B2_SCANNING")
             raw = self.read(frame)
@@ -974,6 +1270,14 @@ class CollectionService:
                     self._set(foreground_changed_stage=self._status.foreground_changed_stage or stage)
                     navigation_window_reason = f"{current.status} · {current.reason}"
             targets = self._record_b2_result(raw, b2_attempt)
+            self._record("B2", "B2_SCANNED", "AUTO_PASS", elapsed_ms=raw.recognition_ms,
+                         details={"scan": scan_id, "contacts": len(raw.contacts),
+                                  "unread": self._status.unread_marker_count,
+                                  "reliable": self._status.reliable_unread_count,
+                                  "unreliable": self._status.unreliable_unread_count,
+                                  "reasons": [safe_reason(reason) for reason in self._status.unreliable_reasons]})
+            self._record("SCOPE", "SCOPE_APPLIED", "AUTO_PASS", details={"excluded": self._status.skipped_unread,
+                         "reasons": [safe_reason(reason) for reason in self._status.skipped_reasons]})
             if self._recover:
                 self.store.recover_jobs(self.profile, self._run_id)
                 self._recover = False
@@ -981,6 +1285,7 @@ class CollectionService:
                 self._set(waiting_for_window=False, resumed_at=datetime.now().astimezone())
             return self._scan(raw, targets, navigation_window_reason)
         except AccountPaused as exc:
+            self._failure("BIND", "ACCOUNT_DEPENDENCY", str(exc), result="BLOCKED_BY_DEPENDENCY")
             self._set(scan_disposition="B2_SCAN_FAILED", navigation_allowed=False, navigation_block_reason=str(exc))
             return self._set(status="PAUSED" if self.active else "STOPPED", reason=str(exc), last_failure=str(exc))
         except (CaptureError, NavigationPaused) as exc:
@@ -988,16 +1293,20 @@ class CollectionService:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
             state = self._window_error(exc)
             disposition = "B2_SCAN_FAILED" if state.scan_disposition == "B2_SCANNING" else state.scan_disposition
+            self._failure("B2" if disposition == "B2_SCAN_FAILED" else "WINDOW",
+                          "POLL_BLOCKED", state.reason, exception=exc)
             return self._set(last_failure=state.reason, scan_disposition=disposition, navigation_allowed=False,
                              navigation_block_reason=state.reason)
         except (sqlite3.Error, OSError, ValueError) as exc:
-            self.stop()
             reason = f"采集或存储失败（{type(exc).__name__}）"
+            self._failure("SAVE", "POLL_RUNTIME_FAILURE", reason, level="ERROR", exception=exc)
+            self.stop(source="failure")
             return self._set(status="FAILED", reason=reason, last_failure=reason)
         finally:
             if scan_id:
                 self._scan_history = (*self._scan_history[-7:], self._status)
             self._lock.release()
+            self.finish_run()
 
     def _scan(self, raw, current, navigation_window_reason):
         still_visible = {_Target(row, name_key(row.display_name), avatar_key(raw, row), ()).key for row in raw.contacts
@@ -1068,6 +1377,8 @@ class CollectionService:
         self._set(queued=len(self._queued), awaiting_navigation=len(self._queued),
                   saved=self.store.browse(self.profile)["message_count"])
         if navigation_window_reason and (self._queued or current):
+            self._failure("NAVIGATION", "NAVIGATION_WAITING_FOR_FOREGROUND", navigation_window_reason,
+                          result="BLOCKED_BY_DEPENDENCY")
             return self._set(status="PAUSED", waiting_for_window=True, reason=navigation_window_reason,
                              navigation_block_reason=navigation_window_reason, navigation_allowed=False,
                              scan_disposition="B2_SCANNED_WAITING_NAVIGATION" if self._queued else self._status.scan_disposition)
@@ -1094,8 +1405,11 @@ class CollectionService:
 
     def _collect(self, raw: VisualObservation, target: _Target, job: str) -> ScanStatus:
         trace = CollectionTrace(unread_detected_at=self._discovered.get(job))
+        target_alias = blake2s((self._run_id + target.key).encode(), digest_size=8).hexdigest()
         self._set(status="VERIFYING_CONVERSATION", target=target.row.display_name,
                   reason="复核 B2 目标和当前窗口", trace=trace, trace_job=job)
+        self._record("NAVIGATION", "TARGET_SCHEDULED", level="DEBUG",
+                     details={"target": target_alias, "scan": self._status.scan_id})
         captured = None
         attempted = False
         clicked = False
@@ -1140,6 +1454,7 @@ class CollectionService:
                 self._operations += 1
                 self.navigator.select(raw, target.row)
                 clicked = True
+                self._record("NAVIGATION", "TARGET_CLICKED", "AUTO_PASS", details={"target": target_alias})
                 self._set(status="VERIFYING_CONVERSATION", reason="重新截图核对标题、选中行和 C2",
                           navigation_result="点击已执行，等待视觉核对")
                 self.store.job(job, "VERIFYING_CONVERSATION", navigation="CLICK_ISSUED")
@@ -1164,7 +1479,15 @@ class CollectionService:
                 if not self.active:
                     raise NavigationPaused("已停止，未保存本次采集")
                 self._set(navigation_result=reason, last_failure=reason)
-                result = self.store.save(self.profile, captured, job_id=job, allow_link=False, failure_reason=reason)
+                self._failure("CONVERSATION", "CONVERSATION_NOT_CONFIRMED", reason)
+                if self.runtime:
+                    self.store.job(job, "UNCERTAIN", no_click=not clicked, reason=reason,
+                                   navigation="NAVIGATION_UNCERTAIN", persistence="BLOCKED_BY_DEPENDENCY")
+                    self._record("SAVE", "UNLINKED_OBSERVATION", "BLOCKED_BY_DEPENDENCY",
+                                 details={"message_count": len(captured.messages), "reason": safe_reason(reason)})
+                    result = SaveResult(None, 0, 0, 1, 0, "NAVIGATION_UNCERTAIN", reason)
+                else:
+                    result = self.store.save(self.profile, captured, job_id=job, allow_link=False, failure_reason=reason)
                 return self._finish_task(target, result, captured, "NAVIGATION_UNCERTAIN", reason, job)
             self.navigator.verify_view(captured)
             if not self.active:
@@ -1175,6 +1498,18 @@ class CollectionService:
             if clicked and self._status.trace.conversation_opened_at is None:
                 at = self._event("conversation_opened_at", navigation_result="已核对 B2 选中行及 C1 标题")
                 self.store.job_event(job, "CONVERSATION_OPENED", at, {"conversation_opened_at": at.iso()})
+            self._record("CONVERSATION", "CONVERSATION_VERIFIED", "AUTO_PASS", details={"target": target_alias})
+            full = summarize(captured).messages_reliable
+            self._record("C2", "C2_RECOGNIZED", "AUTO_PASS" if full else "PARTIAL",
+                         elapsed_ms=captured.recognition_ms, details={"message_count": len(captured.messages),
+                         "completeness": captured.message_completeness, "ocr_status": captured.ocr_status})
+            if self.runtime and not full:
+                reason = "C2 消息完整性未核对，仅保留运行观察和任务证据"
+                self._failure("SAVE", "INCOMPLETE_C2", reason, result="BLOCKED_BY_DEPENDENCY")
+                self.store.job(job, "UNCERTAIN", no_click=not clicked, reason=reason,
+                               navigation="VERIFIED", persistence="BLOCKED_BY_DEPENDENCY")
+                return self._finish_task(target, SaveResult(None, 0, 0, 1, 0, "UNCERTAIN", reason),
+                                         captured, "UNCERTAIN", reason, job)
             self._set(status="PERSISTING", reason="提交已核对会话和视觉观察")
             self.store.job(job, "CAPTURING", navigation="VERIFIED",
                            detail={"title_after": captured.conversation.title, "type": captured.conversation.conversation_type,
@@ -1186,6 +1521,7 @@ class CollectionService:
             if not self.active:
                 raise NavigationPaused("已停止，未保存本次采集")
             verified = True
+            self._record("SAVE", "SQLITE_TRANSACTION_STARTED")
             result = self.store.save(self.profile, captured, job_id=job)
             status = "COMPLETED" if result.conversation_id and not result.uncertain else "UNCERTAIN"
             reason = result.reason if status == "COMPLETED" else f"{result.reason}；如已点击，未读可能已清除"
@@ -1194,8 +1530,20 @@ class CollectionService:
             block_reason = str(exc).splitlines()[0]
             local = isinstance(exc, NavigationPaused) and exc.local and not clicked
             if local and self.active:
-                self._deferred[target.key] = self._round + 4
-                self.store.observe_waiting_job(job, target.row, block_reason, self._status.scan_id, no_click=True)
+                attempts = self._target_attempts.get(job, 0) + 1
+                self._target_attempts[job] = attempts
+                self._failure("NAVIGATION", "TARGET_DEFERRED", block_reason)
+                if self.runtime and attempts >= 3:
+                    self._remember(target)
+                    self._queued.pop(target.key, None)
+                    self._queued_signatures.pop(target.key, None)
+                    self._deferred.pop(target.key, None)
+                    self._discovered.pop(job, None)
+                    self._target_attempts.pop(job, None)
+                    self.store.job(job, "FAILED", reason=block_reason, no_click=True, navigation="LOCAL_RETRY_LIMIT")
+                else:
+                    self._deferred[target.key] = self._round + 4
+                    self.store.observe_waiting_job(job, target.row, block_reason, self._status.scan_id, no_click=True)
             else:
                 self.store.job(job, "UNCERTAIN" if clicked else "PAUSED", no_click=not clicked,
                                navigation="NAVIGATION_UNCERTAIN" if clicked else "BLOCKED",
@@ -1215,6 +1563,9 @@ class CollectionService:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False,
                                  queued=len(self._queued), errors=self._status.errors + int(clicked))
             reason = str(exc).splitlines()[0] + ("；未读可能已清除" if clicked else "")
+            if not local:
+                self._failure("CONVERSATION" if clicked else "NAVIGATION",
+                              "AFTER_CLICK_UNCONFIRMED" if clicked else "NAVIGATION_PAUSED", reason, exception=exc)
             waiting = not clicked and target.key in self._queued
             foreground_stage = self._status.foreground_changed_stage
             if "WINDOW_NOT_FOREGROUND" in reason and not foreground_stage:
@@ -1228,8 +1579,15 @@ class CollectionService:
                              awaiting_navigation=len(self._queued), waiting_for_window=waiting and not local,
                              errors=self._status.errors + int(clicked))
         except Exception as exc:
-            self.stop()
             reason = f"采集或数据库写入失败（{type(exc).__name__}）"
+            if self.runtime and not isinstance(exc, (sqlite3.Error, OSError)) and not verified:
+                self._failure("C2", "LOCAL_CAPTURE_EXCEPTION", reason, exception=exc)
+                self.store.job(job, "UNCERTAIN", no_click=not clicked, reason=reason, navigation="LOCAL_FAILURE")
+                return self._finish_task(target, SaveResult(None, 0, 0, 1, 0, "UNCERTAIN", reason),
+                                         captured or raw, "UNCERTAIN", reason, job)
+            self._failure("SAVE", "SQLITE_TRANSACTION_FAILED" if verified else "DATABASE_OR_RUNTIME_FAILURE",
+                          reason, level="ERROR", exception=exc)
+            self.stop(source="failure")
             try:
                 self.store.job(job, "FAILED", navigation="VERIFIED" if verified else "NAVIGATION_UNCERTAIN",
                                reason=reason)
@@ -1264,6 +1622,7 @@ class CollectionService:
         self._discovered.pop(job, None)
         self._remember(target)
         self._deferred.pop(target.key, None)
+        self._target_attempts.pop(job, None)
         if status == "COMPLETED":
             self._operations = 0
         self._committed(result, raw.conversation.title, job)

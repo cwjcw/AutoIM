@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from concurrent.futures import CancelledError
 import os
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -12,8 +13,9 @@ from threading import Event, Lock
 
 import numpy as np
 
+from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.collection_profile import ProfileAction, ProfileSurface, changed_regions
-from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_complete_client, capture_visible_window)
+from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client, _render_complete_client, capture_visible_window)
 from autoim.wecom.visual_contacts import ContactObservation
 from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_observation import VisualObservation
@@ -198,6 +200,22 @@ class CollectionNavigation:
         self._own_input = None
         self._started = float("-inf")
         self.input_diagnostic = ""
+        self.report = lambda *args, **kwargs: None
+
+    def prepare_window(self, cancel):
+        def check():
+            if cancel.is_set():
+                raise CancelledError()
+            self.permit.ensure_current()
+            if not self._desktop():
+                raise NavigationPaused("Windows 输入桌面不可操作")
+
+        def wait():
+            cancel.wait(.15)
+            check()
+
+        check()
+        return self.manager.prepare_collection_window(self._probe, self.permit.perform, check, wait)
 
     def mark_started(self):
         self._started = monotonic()
@@ -214,6 +232,9 @@ class CollectionNavigation:
                 f" · 阈值 {IDLE_THRESHOLD_MS} ms · 按住 {', '.join(sample.held) or '无'}"
                 f" · 可能来自 AutoIM {self._own_input == sample.last_tick}"
                 f" · 启动等待 {(now - self._started) * 1000 < IDLE_THRESHOLD_MS}")
+            self.report("WINDOW", "INPUT_IDLE_SAMPLE", details={"idle_ms": sample.milliseconds,
+                        "last_input_tick": sample.last_tick, "held": sample.held,
+                        "possible_own_input": self._own_input == sample.last_tick})
             if sample.held or sample.milliseconds < IDLE_THRESHOLD_MS:
                 raise NavigationPaused("等待用户空闲 · " + self.input_diagnostic)
         return sample.last_tick
@@ -274,21 +295,54 @@ class CollectionNavigation:
         found = []
         root, pid = health.window.hwnd, health.window.pid
 
+        origin = gui.ClientToScreen(root, (0, 0))
+        client_width, client_height = health.last.client_size
+        reached_root = False
+
         def inspect(hwnd, _):
-            if (hwnd == root or not gui.IsWindowVisible(hwnd) or gui.IsIconic(hwnd)
-                    or gui.GetAncestor(hwnd, 3) != root
-                    or process.GetWindowThreadProcessId(hwnd)[1] != pid):
+            nonlocal reached_root
+            if hwnd == root:
+                reached_root = True
                 return True
-            cloaked = wintypes.DWORD()
-            dwm = ctypes.windll.dwmapi.DwmGetWindowAttribute
-            dwm.argtypes = (wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD)
-            if dwm(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) != 0 or cloaked.value:
-                return True
-            _, _, width, height = gui.GetClientRect(hwnd)
-            unit = health.last.dpi / 96
-            if 110 * unit <= width <= 700 * unit and 95 * unit <= height <= 850 * unit:
-                geometry = (gui.ClientToScreen(hwnd, (0, 0)), width, height)
-                found.append((hwnd, geometry))
+            try:
+                if process.GetWindowThreadProcessId(hwnd)[1] != pid:
+                    return True
+                visible, iconic = bool(gui.IsWindowVisible(hwnd)), bool(gui.IsIconic(hwnd))
+                owner = gui.GetAncestor(hwnd, 3)
+                state = {"hwnd": hwnd, "class_name": gui.GetClassName(hwnd), "visible": visible,
+                         "iconic": iconic, "root_owner": owner}
+                if not visible or iconic:
+                    if visible:
+                        self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "VISIBILITY"})
+                    return True
+                _, _, width, height = gui.GetClientRect(hwnd)
+                popup_origin = gui.ClientToScreen(hwnd, (0, 0))
+                x, y = popup_origin
+                same_client = (origin[0] <= x < x + width <= origin[0] + client_width
+                               and origin[1] <= y < y + height <= origin[1] + client_height)
+                detached = owner == hwnd and not reached_root and same_client
+                if owner != root and not detached:
+                    self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "ROOT_OWNER_AND_GEOMETRY"})
+                    return True
+                cloaked = wintypes.DWORD()
+                dwm = ctypes.windll.dwmapi.DwmGetWindowAttribute
+                dwm.argtypes = (wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD)
+                result = dwm(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if result != 0 or cloaked.value:
+                    self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "DWM", "dwm_result": result})
+                    return True
+                unit = health.last.dpi / 96
+                state.update(client=(width, height), dpi=health.last.dpi,
+                             relation="same_client_top_level" if detached else "owned")
+                if 80 * unit <= width <= 700 * unit and 55 * unit <= height <= 850 * unit:
+                    geometry = (popup_origin, width, height)
+                    found.append((hwnd, geometry))
+                    self.report("MENU", "POPUP_ENUMERATED", details={**state, "geometry": geometry})
+                else:
+                    self.report("MENU", "POPUP_EXCLUDED", details={**state, "reason": "CLIENT_DIMENSIONS"})
+            except OSError as exc:
+                self.report("MENU", "POPUP_PROBE_FAILED",
+                            details={"hwnd": hwnd, "reason": type(exc).__name__})
             return True
 
         try:
@@ -328,17 +382,41 @@ class CollectionNavigation:
             raise NavigationPaused("本次出现多个资料窗口候选，等待人工复核")
         for hwnd, geometry in new_windows:
             _, width, height = geometry
-            try:
-                image = _render_complete_client(hwnd, width, height).pixels
-            except CaptureError:
-                continue
-            if _coverage(image)[0]:
+            image = None
+            for flags in (1, 3):
+                try:
+                    candidate = _render_complete_client(
+                        hwnd, width, height, render=lambda w, x, y: _render_client(w, x, y, flags=flags)).pixels
+                    if _coverage(candidate)[0]:
+                        raise CaptureError("CAPTURE_INCOMPLETE", "菜单截图候选不完整")
+                except CaptureError as exc:
+                    self.report("MENU", "POPUP_CAPTURE_REJECTED",
+                                details={"hwnd": hwnd, "flags": flags, "reason": safe_reason(exc)})
+                    continue
+                image = candidate
+                self.report("MENU", "POPUP_CAPTURED", details={"hwnd": hwnd, "flags": flags, "shape": image.shape})
+                break
+            if image is None:
                 continue
             if (hwnd, geometry) not in self._owned_profile_windows(self._profile_health(reference)):
                 raise NavigationPaused("读取期间资料窗口已移动或关闭")
             rows, cols = image.shape[:2]
             surfaces.append(ProfileSurface(hwnd, image, Box(0, 0, cols, rows), geometry))
         return frame, tuple(surfaces), tuple(hwnd for hwnd, _ in owned)
+
+    @staticmethod
+    def profile_physical(frame, action):
+        import win32gui as gui
+        surface = action.surface
+        if surface.embedded:
+            health = frame.diagnostics.window_health
+            width, height = health.last.client_size if health else (frame.state.width, frame.state.height)
+            origin = gui.ClientToScreen(surface.hwnd, (0, 0))
+        else:
+            origin, width, height = surface.geometry
+        rows, cols = surface.pixels.shape[:2]
+        x, y = action.point
+        return origin[0] + int((x + .5) * width / cols), origin[1] + int((y + .5) * height / rows)
 
     def profile_start(self, observation):
         frame = observation.frame
@@ -368,9 +446,11 @@ class CollectionNavigation:
         current, surfaces, _ = self.profile_surfaces(frame, known_windows)
 
         def unchanged(surface):
+            control = menu.control if menu and menu.surface is surface else action.control
             return any(candidate.hwnd == surface.hwnd and candidate.geometry == surface.geometry
-                       and candidate.bounds == surface.bounds
-                       and np.array_equal(surface.bounds.crop(candidate.pixels), surface.bounds.crop(surface.pixels))
+                       and candidate.pixels.shape == surface.pixels.shape
+                       and candidate.bounds.contains(control.center)
+                       and np.array_equal(control.crop(candidate.pixels), control.crop(surface.pixels))
                        for candidate in surfaces)
 
         if action.stage.startswith("A1_"):
@@ -397,6 +477,7 @@ class CollectionNavigation:
         hit = gui.WindowFromPoint(xy)
         if not hit or gui.GetAncestor(hit, 2) != hwnd:
             raise NavigationPaused("资料目标遮挡 · " + _occlusion_detail(hit, hwnd, xy, gui, process))
+        self.report("WINDOW", "TARGET_HIT", details={"hwnd": hit, "expected": hwnd, "point": xy})
         return xy, foreground, self._activity(True)
 
     def select(self, observation: VisualObservation, row: ContactObservation) -> None:
@@ -483,3 +564,4 @@ class CollectionNavigation:
                 self._own_input = None
 
         self.permit.perform(send, scroll=scroll)
+        self.report("WINDOW", "INPUT_EXECUTED", details={"point": point, "action": profile.stage if profile else "B2"})

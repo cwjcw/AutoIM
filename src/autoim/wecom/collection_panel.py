@@ -5,16 +5,21 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import deque
+from datetime import datetime
+from pathlib import Path
+from time import monotonic
 from dataclasses import replace
 
-from PySide6.QtCore import QSettings, QTimer, Qt, Signal
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QUrl, QSettings, QTimer, Qt, Signal
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPlainTextEdit,
                                QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from autoim import __version__
 from autoim.vision_widgets import fit_dialog_to_screen
 from autoim.wecom.collection_notifications import CollectionNotifier
 from autoim.wecom.collection_hotkey import CollectionHotkey
+from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.collection_service import CollectionScope, CollectionService, ScanStatus
 from autoim.wecom.visual_diagnostics import DiagnosticCopyControls
 from autoim.wecom.visual_store import VisualStore
@@ -222,6 +227,16 @@ class VisualCollectionPanel(QWidget):
         self._asking_permission = False
         self._hotkey = None
         self._shortcut = "F10"
+        self.runtime = None
+        self._last_detection = ""
+        self._stop_source = "control"
+        self._pending_assist = None
+        self._failure_key = None
+        self._failure_seen = ""
+        self._failure_count = 0
+        self._failure_started = 0.
+        self._exception_dialog = None
+        self._failure_notice = None
         self.store = VisualStore()
         self._service: CollectionService | None = None
         self._status = ScanStatus()
@@ -239,6 +254,7 @@ class VisualCollectionPanel(QWidget):
         self._notifier = CollectionNotifier(self)
         self._notifier.reported.connect(self._notification_reported)
         self._notifications = deque(maxlen=20)
+        self._notice_runs = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 0)
@@ -247,6 +263,14 @@ class VisualCollectionPanel(QWidget):
         self.account_label.setWordWrap(True)
         layout.addWidget(self.account_label)
         ranges = QHBoxLayout()
+        ranges.addWidget(QLabel("运行模式"))
+        self.mode_select = QComboBox()
+        self.mode_select.addItem("测试模式", "test")
+        self.mode_select.addItem("正式运行模式", "production")
+        if settings is not None and settings.value("collection/mode", "test", type=str) == "production":
+            self.mode_select.setCurrentIndex(1)
+        self.mode_select.currentIndexChanged.connect(self._save_mode)
+        ranges.addWidget(self.mode_select)
         ranges.addWidget(QLabel("采集范围"))
         self.scope_checks = {}
         for key, title, default in (("personal", "普通单聊", True), ("group", "普通群聊", True),
@@ -299,6 +323,10 @@ class VisualCollectionPanel(QWidget):
         layout.addWidget(self.confirm_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.hotkey_status)
         layout.addWidget(self.compact_status)
+        self.assistance_button = QPushButton("处理核验异常")
+        self.assistance_button.clicked.connect(self._show_exception)
+        self.assistance_button.hide()
+        layout.addWidget(self.assistance_button, 0, Qt.AlignmentFlag.AlignLeft)
         history = QHBoxLayout()
         for i, title in enumerate(("查看已保存聊天记录", "查看自动巡检任务", "查看采集异常")):
             button = QPushButton(title)
@@ -312,10 +340,185 @@ class VisualCollectionPanel(QWidget):
         details.addWidget(self.summary)
         self.copy_controls = DiagnosticCopyControls(self._report, self)
         details.addWidget(self.copy_controls)
+        actions = QHBoxLayout()
+        self.diagnostic_buttons = []
+        for label, callback in (("日志目录", self._open_logs), ("查看运行日志", self._view_log),
+                                ("流程测试报告", self._view_flow), ("导出诊断 ZIP", self._export_logs)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            actions.addWidget(button)
+            self.diagnostic_buttons.append(button)
+        actions.addStretch(1)
+        details.addLayout(actions)
         layout.addWidget(diagnostics)
         layout.addWidget(tools)
         self._render(self._status)
         self._controls()
+
+    def enable_runtime(self, runtime):
+        self.runtime = runtime
+        runtime.emit(self.mode_select.currentData(), "", "APP", "APPLICATION_STARTED")
+        for button in self.diagnostic_buttons:
+            button.setEnabled(True)
+
+    def _save_mode(self):
+        if self.settings is not None:
+            self.settings.setValue("collection/mode", self.mode_select.currentData())
+        if self.runtime and self._service is not None and not self.busy:
+            self._service.configure_runtime(self.runtime, self.mode_select.currentData())
+
+    def _profile_assist(self, action):
+        if not self._service or not self._service.active:
+            return
+        if self._in_flight:
+            self._pending_assist = action
+            if self._failure_notice:
+                self._failure_notice.appendPlainText("已收到选择，将在当前只读检查结束后处理。")
+            return
+        self._service.assist_identity(action)
+        self._render(self._service.snapshot())
+        if self._exception_dialog:
+            self._exception_dialog.close()
+        self._timer.start(0)
+
+    def _handle_failure(self, result):
+        if not self.runtime:
+            return
+        if not result.failure_at or result.failure_at == self._failure_seen:
+            if (self._failure_key and result.status in {"COMPLETED", "RUNNING"} and not result.assist
+                    and not result.navigation_block_reason and not result.unreliable_unread_count
+                    and result.failure_code != "NAVIGATION_NO_PROGRESS"):
+                self._notifier.announce("AutoIM 已恢复", "采集流程继续运行")
+                if self._exception_dialog:
+                    self._exception_dialog.close()
+                self._failure_key = None
+            return
+        self._failure_seen = result.failure_at
+        reason = safe_reason(result.last_failure)
+        key = result.failure_stage, result.failure_code, reason
+        if key == self._failure_key:
+            self._failure_count += 1
+            if self._failure_notice:
+                self._failure_notice.setPlainText(self._failure_text())
+            return
+        self._failure_key = key
+        self._failure_started = monotonic()
+        self._failure_count = 1
+        if self._exception_dialog:
+            self._exception_dialog.close()
+        if result.failure_level == "ERROR":
+            self._show_exception()
+        else:
+            self._notifier.announce("AutoIM 暂停或跳过一项操作", reason[:220])
+
+    def _failure_text(self):
+        state = self._status
+        elapsed = round(monotonic() - self._failure_started) if self._failure_started else 0
+        detail = (f"时间 {state.failure_at or '—'}\n模式 {self.mode_select.currentText()}\n"
+                  f"阶段 {state.failure_stage or '—'} · {state.failure_code or '—'}\n"
+                  f"{safe_reason(state.last_failure or state.reason)}\n"
+                  f"重复 {self._failure_count} 次 · 持续 {elapsed} 秒\n"
+                  f"已执行 点击任务 {state.trace_job or '—'} · 已完成 {state.completed} · 已保存 {state.saved}\n"
+                  f"运行状态 {state.status} · 停止来源 {state.stop_reason or '—'}\n"
+                  "受影响的操作已暂停，可查看流程报告或导出诊断。")
+        if state.assist == "CARD":
+            detail += "\n可手动打开登录账号的个人资料卡，再选择「我已手动完成」。"
+        elif state.assist == "CLOSE":
+            detail += "\n请手动关闭资料卡及个人菜单，再选择「我已手动完成」。"
+        return detail
+
+    def _show_exception(self):
+        if self._exception_dialog is not None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AutoIM 运行异常")
+        dialog.setWindowFlag(Qt.WindowType.Tool)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.resize(620, 320)
+        layout = QVBoxLayout(dialog)
+        notice = QPlainTextEdit(self._failure_text())
+        notice.setReadOnly(True)
+        layout.addWidget(notice)
+        self._exception_dialog, self._failure_notice = dialog, notice
+
+        def forget():
+            self._exception_dialog = self._failure_notice = None
+        dialog.finished.connect(forget)
+
+        actions = QHBoxLayout()
+        for name, callback in (("复制异常", lambda: QApplication.clipboard().setText(self._failure_text())),
+                               ("详细诊断", self._view_flow), ("导出日志", self._export_logs),
+                               ("关闭", dialog.close)):
+            button = QPushButton(name)
+            button.clicked.connect(callback)
+            actions.addWidget(button)
+        layout.addLayout(actions)
+        if self._status.assist:
+            choices = QHBoxLayout()
+            buttons = [("自动重试", lambda: self._profile_assist("retry")),
+                       ("跳过模块", lambda: self._profile_assist("skip")),
+                       ("停止全部测试", self.stop)]
+            if self._status.assist in {"CARD", "CLOSE"}:
+                buttons.insert(1, ("我已手动完成", lambda: self._profile_assist("manual")))
+            for name, callback in buttons:
+                button = QPushButton(name)
+                button.clicked.connect(callback)
+                choices.addWidget(button)
+            layout.addLayout(choices)
+        dialog.show()
+
+    def _open_logs(self):
+        if self.runtime:
+            self.runtime.root.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.runtime.root.resolve())))
+
+    def _show_text(self, title, value):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(750, 500)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        layout = QVBoxLayout(dialog)
+        output = QPlainTextEdit(value)
+        output.setReadOnly(True)
+        layout.addWidget(output)
+        dialog.show()
+
+    def _view_log(self):
+        if self.runtime:
+            def tail():
+                from autoim.wecom.collection_runtime import _human
+                return "\n".join(_human(event) for event in deque(self.runtime.events(), maxlen=500))
+            self.run_worker(tail, on_result=lambda value: self._show_text("本次运行日志", value),
+                            on_error=lambda _: self.hotkey_status.setText("无法读取运行日志"))
+
+    def _view_flow(self):
+        if self.runtime:
+            self._show_text("完整流程测试报告", json.dumps(
+                self.runtime.report(self._last_detection), ensure_ascii=False, indent=2))
+
+    def _export_logs(self):
+        if not self.runtime:
+            return
+        scopes = {"本次检测": "detection", "本次应用运行": "session", "今天": "today", "全部保留日志": "all"}
+        choice, accepted = QInputDialog.getItem(self, "导出诊断 ZIP", "日志范围", list(scopes), 0, False)
+        if not accepted:
+            return
+        filename, _ = QFileDialog.getSaveFileName(self, "导出诊断 ZIP",
+                                                 f"AutoIM-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip",
+                                                 "诊断 ZIP (*.zip)")
+        if not filename:
+            return
+        state, detection = self._status, self._last_detection
+        snapshot = {"status": state.status, "account_state": state.account_state, "scan": state.scan_id,
+                    "window_state": state.window_health.status if state.window_health else None,
+                    "failure": safe_reason(state.last_failure), "failure_stage": state.failure_stage,
+                    "failure_code": state.failure_code, "failure_time": state.failure_at,
+                    "stop_reason": state.stop_reason, "contacts": state.contact_count,
+                    "unread": state.unread_marker_count}
+        self.run_worker(lambda: self.runtime.export(Path(filename), scopes[choice], detection, snapshot),
+                        on_result=lambda _: self.hotkey_status.setText("诊断 ZIP 已导出"),
+                        on_error=lambda _: self.hotkey_status.setText("导出失败，请选择新的可写文件路径"))
 
     def _save_scope(self):
         if self.settings is not None:
@@ -352,8 +555,9 @@ class VisualCollectionPanel(QWidget):
 
     def toggle(self):
         if self._service and self._service.active:
+            self._stop_source = "hotkey"
             self.stop()
-        elif self._authorized:
+        elif self._authorized or self.runtime:
             self.start()
         else:
             self.hotkey_status.setText("首次使用请在 AutoIM 中点击「开始检测」并确认授权。")
@@ -373,6 +577,10 @@ class VisualCollectionPanel(QWidget):
     def _controls(self) -> None:
         enabled = self._available and not self.busy
         self.start_button.setEnabled(enabled)
+        self.mode_select.setEnabled(enabled)
+        for button in self.diagnostic_buttons:
+            button.setEnabled(self.runtime is not None)
+        self.assistance_button.setEnabled(not self._in_flight)
         self.save_button.setEnabled(enabled)
         self.identify_button.setEnabled(enabled)
         self.confirm_button.setVisible(self._status.account_state == "CONFIRMATION_REQUIRED")
@@ -389,6 +597,8 @@ class VisualCollectionPanel(QWidget):
     def _get_service(self):
         if self._service is None:
             self._service = self.make_service(None, self.store)
+            if self.runtime:
+                self._service.configure_runtime(self.runtime, self.mode_select.currentData())
         return self._service
 
     def start(self):
@@ -399,7 +609,7 @@ class VisualCollectionPanel(QWidget):
             try:
                 result = QMessageBox.question(
                     self, "授予企业微信自动采集权限",
-                    "自动采集会移动鼠标、核验账号、打开聊天会话，可能改变未读状态。"
+                    "本次检测会恢复、最大化或激活企业微信窗口，并在核验后移动鼠标打开会话，可能改变未读状态。"
                     f"采集结果会保存到本机 SQLite。本次运行中按 {self._shortcut} 可随时停止。",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No)
@@ -420,22 +630,34 @@ class VisualCollectionPanel(QWidget):
             self._render(ScanStatus("PAUSED", str(exc)))
             return
         self._render(service.snapshot())
+        if self.runtime:
+            self._last_detection = service.detection_id
+            self._failure_key = None
         self._stop_requested = False
         self._refresh()
         self._pulse.start()
-        self._notifier.announce("自动采集已启动", "等待企业微信处于前台并核验账号")
+        self._notifier.announce("自动采集已启动", "正在准备企业微信窗口并核验账号")
         self._timer.start(2500)
 
     def stop(self):
+        self._pending_assist = None
+        if self._exception_dialog:
+            self._exception_dialog.close()
         self._stop_requested = True
         self._timer.stop()
         self._pulse.stop()
         if self._service:
             was_active = self._service.active
-            self._service.stop()
+            if self.runtime:
+                self._service.stop(source=self._stop_source)
+                self._notifier.flush()
+            else:
+                self._service.stop()
             if was_active:
                 self._notifier.announce("自动采集已停止", "鼠标控制权已交还")
-        self._render(replace(self._status, status="STOPPED", reason="许可已撤销", waiting_for_window=False))
+        state = self._service.snapshot() if self.runtime and self._service else self._status
+        self._stop_source = "control"
+        self._render(replace(state, status="STOPPED", reason="许可已撤销", waiting_for_window=False, assist=""))
         self._refresh()
 
     def save_current(self):
@@ -484,7 +706,13 @@ class VisualCollectionPanel(QWidget):
         self._pulse.start()
 
         def run():
-            state = action()
+            try:
+                state = action()
+            except Exception as exc:
+                if self.runtime:
+                    self._service._failure("RUN", "BACKGROUND_WORKER_EXCEPTION", type(exc).__name__,
+                                           level="ERROR", exception=exc)
+                raise
             profile = state.account_id or self._service.profile
             if profile is None or (state.waiting_for_window and state.b2_scan_completed_at is None):
                 return state, None
@@ -502,24 +730,44 @@ class VisualCollectionPanel(QWidget):
             self._jobs = jobs
         elif result.account_state in ("CONFIRMATION_REQUIRED", "IDENTIFICATION_FAILED"):
             self._jobs = []
+        if self.runtime and result.notice:
+            self._notice_runs[result.notice.id] = (self.mode_select.currentData(), self._last_detection)
         self._notifier.enqueue(result.notice)
         if self._stop_requested:
             result = replace(result, status="STOPPED", reason="许可已撤销", waiting_for_window=False)
         self._render(result)
         self._refresh()
+        if not self._stop_requested:
+            self._handle_failure(result)
         if self._service and self._service.active:
+            if self._pending_assist and result.assist:
+                action, self._pending_assist = self._pending_assist, None
+                self._profile_assist(action)
+                return
+            self._pending_assist = None
             self._timer.start(PAUSE_RECHECK_MS if result.status == "PAUSED" else SCAN_DELAY_MS)
         else:
             self._pulse.stop()
 
     def _failed(self, _message):
         self._in_flight = False
+        reason = "窗口、OCR 或 SQLite 操作失败，请查看已保存的任务证据"
+        if self.runtime and self._service:
+            if self._service.snapshot().failure_code != "BACKGROUND_WORKER_EXCEPTION":
+                self._service._failure("RUN", "BACKGROUND_WORKER_FAILED", reason, level="ERROR")
+            self._stop_source = "failure"
         self.stop()
-        self._render(replace(self._status, status="FAILED", reason="窗口、OCR 或 SQLite 操作失败，已撤销自动采集许可。"
-                             "请在任务中查看已保存的证据。"))
+        result = replace(self._status, status="FAILED", reason=reason)
+        self._render(result)
+        self._handle_failure(result)
 
     def _notification_reported(self, notices, outcome, at):
         for notice in notices:
+            if self.runtime:
+                mode, run = self._notice_runs.pop(notice.id, (self.mode_select.currentData(), self._last_detection))
+                self.runtime.emit(mode, run, "NOTIFY", "WINDOWS_NOTIFICATION",
+                                  "AUTO_PASS" if outcome == "已提交给系统通知" else "FAILED",
+                                  task=notice.job_id or "", details={"count": notice.count, "reason": outcome})
             self._notifications.append(f"{at.iso()} · {notice.job_id or '手工保存'} · {notice.count} 条 · {outcome}")
         self._render(self._status)
         jobs = tuple(notice for notice in notices if notice.job_id)
@@ -532,6 +780,7 @@ class VisualCollectionPanel(QWidget):
 
     def _render(self, result):
         self._status = result
+        self.assistance_button.setVisible(bool(result.assist or result.failure_at))
         self.account_label.setText(
             f"当前账号 {result.account_name or '—'} · 邮箱 {result.account_email or '—'} · "
             f"{result.account_reason or '等待识别'}")
@@ -586,10 +835,17 @@ class VisualCollectionPanel(QWidget):
     def _report(self, full):
         state = self._status
         candidates = str(state.candidates) if state.b2_scan_completed_at else "—"
-        lines = [f"AutoIM {__version__} · PC-V3.2 · WINDOW_VISUAL_OCR",
+        lines = [f"AutoIM {__version__} · PC-V3.3 · WINDOW_VISUAL_OCR",
                  f"状态 {state.status} · 匹配 {state.match} · {state.reason}",
                  f"候选 {candidates} · 等待 {state.queued} · 完成 {state.completed} · 异常 {state.errors}",
                  f"已保存 {state.saved} · 新增 {state.added} · 重复观察 {state.repeated} · 未确认 {state.uncertain}"]
+        if self.runtime:
+            lines.append(f"模式 {self.mode_select.currentText()} · 核验 {state.account_state} · 停止来源 {state.stop_reason or '—'}")
+            lines.extend(_window_lines(state))
+            lines.extend(_scan_lines(replace(state, selection_name="")))
+            if state.failure_at:
+                lines.append(self._failure_text())
+            return "\n".join(safe_reason(line) for line in lines)
         lines.extend(_collection_lines(state))
         lines.extend(_window_lines(state))
         if state.trace_job:
