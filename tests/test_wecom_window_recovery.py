@@ -243,7 +243,7 @@ class RecoveryTests(unittest.TestCase):
             panel._render(paused)
             panel.copy_controls.summary_button.click()
             report = write.call_args.args[0]
-        for text in ("WINDOW_NOT_FOREGROUND", "PID 42", "HWND 0x51", "等待恢复 是",
+        for text in ("WINDOW_NOT_FOREGROUND", "PID 42", "HWND 0x51", "B2_SCANNED_NO_UNREAD",
                      "GetWindowPlacement", "GetWindowRect", "IsIconic False", "最近重新绑定", "最近窗口变化"):
             self.assertIn(text, report)
         app.processEvents()

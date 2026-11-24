@@ -52,6 +52,9 @@ class ConversationObservation:
     selected_identity_labels: tuple[str, ...] = ()
     title_peer_type: str = "UNKNOWN"
     title_identity_labels: tuple[str, ...] = ()
+    selection_method: str = "UNKNOWN"
+    selection_confidence: str = "UNKNOWN"
+    selection_evidence: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +304,36 @@ def compare_conversation(title_spans: tuple[TextSpan, ...], contacts: tuple[Cont
                                    selected_peer_type=row.peer_type if row else "UNKNOWN",
                                    selected_identity_labels=row.identity_labels if row else (),
                                    title_peer_type=title_identity.peer_type if title_reliable else "UNKNOWN",
-                                   title_identity_labels=title_identity.labels)
+                                   title_identity_labels=title_identity.labels,
+                                   selection_method=row.selection_method if row else "UNKNOWN",
+                                   selection_confidence=("CORROBORATED" if row.selection_method == "SUBTLE_FILL_AND_C1"
+                                                         else "HIGH") if row else "UNKNOWN",
+                                   selection_evidence=row.selection_evidence if row else "")
+
+
+def _corroborate_selection(title_spans, contacts, thresholds, mouse):
+    if any(row.is_selected is True for row in contacts):
+        return contacts, ""
+    if any(row.selection_method == "CONFLICTING_HIGHLIGHT" for row in contacts):
+        return contacts, "B2 行底与高亮带定位冲突，或存在多个蓝色候选"
+    raw, title, _, reliable, note = _title_identity(title_spans, thresholds)
+    if not reliable:
+        return contacts, "B2 无明确高亮，" + note
+    names = {_name_key(title.display_name), _name_key(raw)}
+    matches = [row for row in contacts if _name_key(row.display_name) in names]
+    if len(matches) != 1 or not matches[0].name_reliable or matches[0].status != "CANDIDATE":
+        return contacts, "C1 标题无法唯一核对到完整可靠的 B2 行"
+    row = matches[0]
+    if row.selection_method != "SUBTLE_ROW_FILL":
+        return contacts, "C1 有唯一 B2 名称匹配，缺少独立行底证据 · " + row.selection_evidence
+    if mouse and row.box.contains(mouse):
+        return contacts, "浅色行与鼠标位置重合，无法排除悬停"
+    reason = row.selection_evidence + " · C1 标题与唯一可靠 B2 行一致"
+    corroborated = tuple(replace(item, is_selected=item is row, selection_method="SUBTLE_FILL_AND_C1",
+                                 selection_evidence=reason) for item in contacts)
+    if compare_conversation(title_spans, corroborated, thresholds).match_status != "VISUAL_MATCH":
+        return contacts, "浅色行与 C1 身份核对冲突"
+    return corroborated, ""
 
 
 def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
@@ -335,7 +367,11 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     trace.region = "B2 联系人"
     contact_diagnostics: list[ContactTextDiagnostic] = []
     contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics) if b2 else ()
+    contacts, selection_issue = _corroborate_selection(title_spans, contacts, thresholds, frame.mouse)
     conversation = compare_conversation(title_spans, contacts, thresholds)
+    if selection_issue:
+        fills = [row.selection_evidence for row in contacts if row.selection_method == "SUBTLE_ROW_FILL"]
+        conversation = replace(conversation, selection_evidence=" · ".join((selection_issue, *fills)))
     selected = next((row for row in contacts if row.is_selected), None)
     board = layout.get("D")
     if board or conversation.conversation_type == "GROUP_CANDIDATE" or (selected and selected.kind == "GROUP_CANDIDATE"):

@@ -22,6 +22,7 @@ from scripts.check_security_surface import inspect_collector_input
 from test_wecom_visual_capture import FixtureReader, THRESHOLDS, fixture, span
 from test_wecom_visual_files import _frame_with_file
 from test_wecom_visual_partial import _history
+from autoim.wecom.visual_observation import OcrAreaObservation
 
 PROFILE = "合成测试账号"
 NAMES = ("会话甲", "会话乙", "测试群")
@@ -324,6 +325,185 @@ class ScanWorkflowTests(unittest.TestCase):
         self.assertEqual({row["display_name"] for row in data["conversations"]}, set(NAMES[1:]))
         self.assertEqual(self.navigator.select.call_count, 2)
         self.assertIn('"badge_after":false', data["jobs"][0]["transitions"])
+
+    def test_b2_scan_is_completed_before_navigation_front_guard(self):
+        from test_wecom_window_recovery import BASE, health
+        background = health(replace(BASE, foreground_hwnd=999))
+        self.service._window_probe = Mock(return_value=background)
+        self.navigator.verify_view.side_effect = NavigationPaused("WINDOW_NOT_FOREGROUND · 等待切回")
+        result = self.service.tick()
+        self.assertEqual((result.scan_disposition, result.candidates, result.unread_marker_count),
+                         ("B2_SCANNED_WAITING_NAVIGATION", 2, 2))
+        self.assertEqual(result.contact_count, 3)
+        self.assertIsNotNone(result.b2_scan_completed_at)
+        self.assertEqual(result.awaiting_navigation, 2)
+        self.assertEqual(result.foreground_changed_stage, "截图")
+        self.navigator.select.assert_not_called()
+
+    def test_returning_foreground_rechecks_fresh_contact_rows_before_navigation(self):
+        from test_wecom_window_recovery import BASE, health
+        background = health(replace(BASE, foreground_hwnd=999))
+        foreground = health()
+        self.service._window_probe = Mock(side_effect=(background, background, foreground, foreground))
+        self.navigator.verify_view.side_effect = NavigationPaused("WINDOW_NOT_FOREGROUND · 等待切回")
+        waiting = self.service.tick()
+        self.assertEqual((waiting.candidates, waiting.queued, waiting.awaiting_navigation), (2, 2, 2))
+        self.navigator.verify_view.side_effect = None
+        self.navigator.select.side_effect = self.switch
+        resumed = self.service.tick()
+        self.assertEqual(resumed.status, "COMPLETED")
+        self.assertEqual(self.navigator.select.call_count, 1)
+
+    def test_foreground_change_while_ocr_runs_does_not_skip_b2_scan(self):
+        from test_wecom_window_recovery import BASE, health
+        self.service.read = lambda _: self.raw
+        background = health(replace(BASE, foreground_hwnd=999))
+        self.service._window_probe = Mock(side_effect=(health(), background))
+        self.navigator.verify_view.side_effect = NavigationPaused("WINDOW_NOT_FOREGROUND")
+        result = self.service.tick()
+        self.assertEqual(result.foreground_changed_stage, "OCR")
+        self.assertIsNotNone(result.b2_scan_completed_at)
+        self.assertEqual(result.scan_disposition, "B2_SCANNED_WAITING_NAVIGATION")
+
+    def test_invalid_incomplete_frame_cannot_create_unread_tasks(self):
+        broken = replace(self.raw.frame, capture=replace(
+            self.raw.frame.capture, image=self.raw.frame.pixels[:-12]))
+        self.service.capture = Mock(return_value=broken)
+        result = self.service.tick()
+        self.assertEqual((result.scan_disposition, result.contact_count, result.queued),
+                         ("B2_NOT_SCANNED", 0, 0))
+        self.assertEqual(self.store.browse(PROFILE)["jobs"], [])
+
+    def test_completed_b2_scan_with_no_unread_is_distinct_from_skipped_scan(self):
+        self.raw = view()
+        self.service.read = lambda _: self.raw
+        result = self.service.tick()
+        self.assertEqual((result.scan_disposition, result.candidates, result.unread_marker_count),
+                         ("B2_SCANNED_NO_UNREAD", 0, 0))
+        self.assertEqual(result.contact_count, 3)
+        self.assertIsNotNone(result.b2_scan_attempt_at)
+
+    def test_b2_ocr_failure_is_reported_as_unscanned(self):
+        box = self.raw.layout.get("B2")
+        self.raw = replace(self.raw, ocr_areas=(OcrAreaObservation("B2 联系人", box, "FAILED", reason="test OCR"),))
+        self.service.read = lambda _: self.raw
+        result = self.service.tick()
+        self.assertEqual((result.scan_disposition, result.reliable_unread_count, result.queued),
+                         ("B2_SCAN_FAILED", 0, 0))
+
+    def test_red_badge_without_reliable_contact_identity_is_retained_as_unreliable(self):
+        self.raw = view(unread={1: (None, True)})
+        rows = list(self.raw.contacts)
+        rows[1] = replace(rows[1], name_reliable=False)
+        self.raw = replace(self.raw, contacts=tuple(rows))
+        self.service.read = lambda _: self.raw
+        result = self.service.tick()
+        self.assertEqual((result.unread_marker_count, result.reliable_unread_count, result.unreliable_unread_count),
+                         (1, 0, 1))
+        self.assertEqual(result.scan_disposition, "B2_SCANNED_UNRELIABLE")
+        self.assertTrue(result.unreliable_reasons)
+        self.assertEqual(result.queued, 0)
+
+    def set_unconfirmed_unread(self, *, activity="刚刚", preview="测试预览", count=1, move=0):
+        raw = view(unread={1: (count, False)})
+        rows = tuple(replace(row, is_selected=None, activity_text=activity, preview=preview,
+                             box=row.box.offset(0, move)) if i == 1 else replace(row, is_selected=None)
+                     for i, row in enumerate(raw.contacts))
+        self.raw = replace(raw, contacts=rows)
+
+    def test_persistent_unread_updates_one_waiting_job_despite_activity_time_and_position(self):
+        self.set_unconfirmed_unread()
+        self.service.tick()
+        self.set_unconfirmed_unread(activity="5分钟前", move=3)
+        self.service.tick()
+        self.set_unconfirmed_unread(activity="08:15")
+        state = self.service.tick()
+        job, = self.store.browse(PROFILE)["jobs"]
+        self.assertEqual((state.scan_disposition, state.errors), ("B2_SCANNED_UNRELIABLE", 0))
+        self.assertEqual((job["status"], job["navigation_status"], job["read_risk"]),
+                         ("WAITING_REVALIDATION", "NOT_STARTED", 0))
+        waiting = json.loads(job["transitions"])[-1]
+        self.assertEqual(waiting["detail"]["observations"], 3)
+        self.assertEqual(waiting["detail"]["scan_id"], state.scan_id)
+        self.navigator.select.assert_not_called()
+
+    def test_preview_change_and_count_increase_start_new_observations(self):
+        for preview, count in (("第一条", 1), ("第二条", 1), ("第二条", 2)):
+            self.set_unconfirmed_unread(preview=preview, count=count)
+            self.service.tick()
+        jobs = self.store.browse(PROFILE)["jobs"]
+        self.assertEqual(len(jobs), 3)
+        self.assertEqual(sum(job["status"] == "WAITING_REVALIDATION" for job in jobs), 1)
+        self.navigator.select.assert_not_called()
+
+    def test_unreliable_preview_and_badge_ocr_do_not_create_new_waiting_jobs(self):
+        self.set_unconfirmed_unread(count=2)
+        self.service.tick()
+        self.set_unconfirmed_unread(preview="单帧 OCR 抖动", count=None)
+        rows = list(self.raw.contacts)
+        rows[1] = replace(rows[1], preview_reliable=False)
+        self.raw = replace(self.raw, contacts=tuple(rows))
+        self.service.tick()
+        self.set_unconfirmed_unread(count=3)
+        self.service.tick()
+        self.assertEqual(len(self.store.browse(PROFILE)["jobs"]), 2)
+
+    def test_badge_reappearing_after_a_confirmed_absence_is_new(self):
+        self.set_unconfirmed_unread()
+        self.service.tick()
+        self.raw = view()
+        self.service.tick()
+        self.set_unconfirmed_unread()
+        self.service.tick()
+        jobs = self.store.browse(PROFILE)["jobs"]
+        self.assertEqual({job["status"] for job in jobs}, {"PAUSED", "WAITING_REVALIDATION"})
+        self.assertEqual(len(jobs), 2)
+
+    def test_waiting_job_is_promoted_on_foreground_while_old_uncertain_record_is_preserved(self):
+        from test_wecom_window_recovery import BASE, health
+
+        self.set_unconfirmed_unread()
+        target, = unread_targets(self.raw)
+        legacy = self.store.create_job(PROFILE, "legacy", "old-row-key", target.row)
+        self.store.job(legacy, "UNCERTAIN", reason="旧版无法核对选中行")
+        background = health(replace(BASE, foreground_hwnd=999))
+        self.service._window_probe = Mock(side_effect=(background, background, health(), health()))
+        waiting = self.service.tick()
+        self.assertEqual((waiting.reliable_unread_count, waiting.unreliable_unread_count), (0, 1))
+        self.assertEqual(waiting.queued, 0)
+        self.navigator.select.assert_not_called()
+        pending = next(job["id"] for job in self.store.browse(PROFILE)["jobs"] if job["id"] != legacy)
+        raw = view(unread={1: (1, False)})
+        rows = list(raw.contacts)
+        rows[1] = replace(rows[1], preview="测试预览")
+        self.raw = replace(raw, contacts=tuple(rows))
+        resumed = self.service.tick()
+        jobs = {job["id"]: job for job in self.store.browse(PROFILE)["jobs"]}
+        self.assertEqual(resumed.status, "COMPLETED")
+        self.assertEqual(set(jobs), {legacy, pending})
+        self.assertEqual(jobs[legacy]["status"], "UNCERTAIN")
+        self.assertEqual(jobs[pending]["status"], "COMPLETED")
+        self.navigator.select.assert_called_once()
+
+    def test_scanning_round_does_not_inherit_previous_completion_timestamp(self):
+        self.set_unconfirmed_unread()
+        first = self.service.tick()
+        captured = []
+
+        def read(_):
+            captured.append(self.service.snapshot())
+            return self.raw
+
+        self.service.read = read
+        second = self.service.tick()
+        scanning, = captured
+        self.assertEqual(scanning.scan_id, second.scan_id)
+        self.assertNotEqual(scanning.scan_id, first.scan_id)
+        self.assertEqual(scanning.scan_disposition, "B2_SCANNING")
+        self.assertIsNone(scanning.b2_scan_completed_at)
+        self.assertIsNone(scanning.scan_ocr_completed_at)
+        self.assertIn(first.scan_id, scanning.last_b2_summary)
+        self.assertEqual([item.scan_id for item in self.service.recent_scans()], [first.scan_id, second.scan_id])
 
     def test_already_selected_task_needs_no_click(self):
         self.raw = view(unread={0: (3, False)})

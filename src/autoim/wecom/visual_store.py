@@ -458,6 +458,24 @@ class VisualStore:
             changes.append({"at": at.iso(), "status": status, "detail": detail})
             db.execute("UPDATE scan_jobs SET transitions=? WHERE id=?", (_json(changes), job_id))
 
+    def observe_waiting_job(self, job_id: str, row: ContactObservation, reason: str, scan_id: str) -> None:
+        with self.transaction() as db:
+            job = db.execute("SELECT transitions FROM scan_jobs WHERE id=?", (job_id,)).fetchone()
+            changes = json.loads(job["transitions"])
+            at = _now()
+            detail = {"scan_id": scan_id, "last_observed_at": at, "observations": 1,
+                      "activity": row.activity_text, "bounds": asdict(row.box),
+                      "unread_count": row.unread_count if row.unread_count_reliable else None}
+            if changes[-1]["status"] == "WAITING_REVALIDATION":
+                previous = changes.pop()
+                detail["observations"] += previous["detail"]["observations"]
+                first = previous["at"]
+            else:
+                first = at
+            changes.append({"at": first, "status": "WAITING_REVALIDATION", "reason": reason, "detail": detail})
+            db.execute("""UPDATE scan_jobs SET status='WAITING_REVALIDATION', failure_reason=?, transitions=?
+                       WHERE id=?""", (reason, _json(changes), job_id))
+
     @staticmethod
     def _update_job(db, job_id, state, *, navigation="", risk=False, no_click=False,
                     capture="", persistence="", reason="", detail=None):

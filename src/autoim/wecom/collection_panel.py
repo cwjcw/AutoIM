@@ -38,13 +38,33 @@ def _collection_lines(state: ScanStatus) -> list[str]:
     return [
         f"登录账号 {state.account_name or '—'} · {account_states[state.account_state]} · {account}"
         f" · 最近识别 {at(state.account_at)} · {state.account_reason or '—'}",
-        f"联系人扫描 {state.last_scan.isoformat(timespec='milliseconds') if state.last_scan else '—'}"
-        f" · 最近未读发现 {at(recent.unread_detected_at)}",
+        f"最近未读发现 {at(recent.unread_detected_at)}",
         f"导航尝试 {at(recent.navigation_started_at)} · 打开 {at(recent.conversation_opened_at)}"
         f" · {state.navigation_result or '—'}",
         f"OCR 完成 {at(recent.ocr_completed_at)} · {state.ocr_result or '—'}",
         f"SQLite 最近成功提交 {at(recent.sqlite_committed_at)} · {state.sqlite_result or '—'}",
         f"最近新增保存耗时 {elapsed or '—'} · 最近失败 {state.last_failure or '—'}",
+    ] + _scan_lines(state)
+
+
+def _scan_lines(state: ScanStatus) -> list[str]:
+    def timestamp(value):
+        return value.isoformat(timespec="milliseconds") if value else "—"
+
+    return [
+        f"B2 轮次 {state.scan_id or '—'} · {state.scan_disposition} · 截图 {timestamp(state.screenshot_succeeded_at)}"
+        f" · OCR 完成 {timestamp(state.scan_ocr_completed_at)} · B2 开始 {timestamp(state.b2_scan_attempt_at)}"
+        f" · B2 完成 {timestamp(state.b2_scan_completed_at)}",
+        (f"联系人 {state.contact_count} · 原始未读标记 {state.unread_marker_count} · "
+         f"可靠未读 {state.reliable_unread_count} · 不可靠 {state.unreliable_unread_count}"
+         if state.b2_scan_completed_at else f"最近完成的 B2 轮次 {state.last_b2_summary or '—'}"),
+        f"选中行 {state.selection_name or '—'} · 姓名 {'可靠' if state.selection_name_reliable else '未确认'}"
+        f" · {state.selection_method} · {state.selection_confidence}"
+        f" · {state.selection_evidence or '—'}",
+        f"不可靠原因 {'；'.join(state.unreliable_reasons) or '—'} · 等待导航 {state.awaiting_navigation}"
+        f" · 进入导航 {('通过预检' if state.navigation_allowed else '未通过或无任务') if state.navigation_allowed is not None else '待核对'}"
+        f" · 导航阻断 "
+        f"{state.navigation_block_reason or '—'} · 前台变化阶段 {state.foreground_changed_stage or '—'}",
     ]
 
 
@@ -343,7 +363,7 @@ class VisualCollectionPanel(QWidget):
         def run():
             state = action()
             profile = state.account_id or self._service.profile
-            if state.waiting_for_window or profile is None:
+            if profile is None or (state.waiting_for_window and state.b2_scan_completed_at is None):
                 return state, None
             try:
                 return state, self.store.browse(profile)["jobs"]
@@ -389,10 +409,12 @@ class VisualCollectionPanel(QWidget):
 
     def _render(self, result):
         self._status = result
+        candidates = str(result.candidates) if result.b2_scan_completed_at else "—"
         self.summary.setText(
             f"{result.status} · {result.reason}\n"
             f"目标 {result.target or '—'} · 匹配 {result.match} · "
-            f"未读候选 {result.candidates} · 等待 {result.queued} · 完成 {result.completed} · 失败/异常 {result.errors} · B2 页 {result.pages}\n"
+            f"未读候选 {candidates} · 等待 {result.queued} · "
+            f"完成 {result.completed} · 失败/异常 {result.errors} · B2 页 {result.pages}\n"
             f"数据库已保存 {result.saved} · 新增 {result.added} · 重复观察 {result.repeated} · 未确认 {result.uncertain}\n"
             + "\n".join(_collection_lines(result))
             + f"\n桌面通知 {self._notifications[-1] if self._notifications else '—'}\n"
@@ -430,9 +452,10 @@ class VisualCollectionPanel(QWidget):
 
     def _report(self, full):
         state = self._status
+        candidates = str(state.candidates) if state.b2_scan_completed_at else "—"
         lines = [f"AutoIM {__version__} · PC-V3.1 · WINDOW_VISUAL_OCR",
                  f"状态 {state.status} · 匹配 {state.match} · {state.reason}",
-                 f"候选 {state.candidates} · 等待 {state.queued} · 完成 {state.completed} · 异常 {state.errors}",
+                 f"候选 {candidates} · 等待 {state.queued} · 完成 {state.completed} · 异常 {state.errors}",
                  f"已保存 {state.saved} · 新增 {state.added} · 重复观察 {state.repeated} · 未确认 {state.uncertain}"]
         lines.extend(_collection_lines(state))
         lines.extend(_window_lines(state))
@@ -441,6 +464,10 @@ class VisualCollectionPanel(QWidget):
         lines.extend(f"桌面通知 {item}" for item in self._notifications)
         if full:
             lines.append(f"目标 {state.target or '—'} · {state.reason}")
+            if self._service:
+                for scan in self._service.recent_scans():
+                    if scan.scan_id != state.scan_id:
+                        lines.extend(_scan_lines(scan))
         for job in self._jobs[:20]:
             transitions = json.loads(job["transitions"])
             after = next((item["detail"] for item in reversed(transitions)
@@ -450,13 +477,14 @@ class VisualCollectionPanel(QWidget):
                          f"未读标记 {unread['hasUnreadIndicator']} → {after.get('badge_after', '未知')} · "
                          f"{job['capture_result']} · {job['persistence_result']}")
             event_names = {"DISCOVERED", "NAVIGATING", "CONVERSATION_OPENED", "OCR_COMPLETED", "SQLITE_COMMITTED",
-                           "DESKTOP_NOTIFICATION"}
+                           "DESKTOP_NOTIFICATION", "WAITING_REVALIDATION"}
             events = [item for item in transitions if item["status"] in event_names]
             if events:
                 lines.append(f"任务 {job['id']}")
                 for item in events:
                     public = {key: value for key, value in (item.get("detail") or {}).items()
-                              if key.endswith(("_at", "_ms")) or key in ("summary", "saved", "new", "repeated", "uncertain")}
+                              if key.endswith(("_at", "_ms")) or key in ("summary", "saved", "new", "repeated",
+                                                                         "uncertain", "scan_id", "observations")}
                     lines.append(f"  {item['status']} · {item['at']} · {json.dumps(public, ensure_ascii=False)}")
             if full:
                 lines.extend((f"{job['display_name']} · {job['unread_evidence']} · {job['failure_reason']}",

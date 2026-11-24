@@ -95,6 +95,7 @@ def row_target(observation: VisualObservation, row: ContactObservation) -> tuple
     area = observation.layout.get("B2")
     if (observation.page != "MESSAGES_CANDIDATE" or area is None or row not in observation.contacts
             or row.status != "CANDIDATE" or not row.name_reliable or row.is_selected is not False
+            or sum(contact.is_selected is True for contact in observation.contacts) != 1
             or not row.has_unread_indicator or row.badge is None):
         raise NavigationPaused("B2 未读联系人行缺少可靠的可操作边界")
     box = row.box
@@ -214,6 +215,9 @@ class CollectionNavigation:
         fresh = self.capture()
         if _identity(frame) != _identity(fresh):
             raise NavigationPaused("操作前窗口或坐标系已变化")
+        health = fresh.diagnostics.window_health
+        if health and health.status != "WINDOW_VALID":
+            raise NavigationPaused(f"{health.status} · 操作前复查截图时窗口前台未确认", health=health)
         if observation.login.name and not observation.login.unchanged(fresh.pixels):
             raise NavigationPaused("操作前 A1 登录账号区域已变化")
         automatic_b2 = detect_layout(fresh.pixels, {}, VisualThresholds()).get("B2")

@@ -106,6 +106,27 @@ class ScanStatus:
     last_failure: str = ""
     notice: SaveNotice | None = None
     trace_job: str = ""
+    screenshot_succeeded_at: datetime | None = None
+    b2_scan_attempt_at: datetime | None = None
+    b2_scan_completed_at: datetime | None = None
+    contact_count: int = 0
+    unread_marker_count: int = 0
+    reliable_unread_count: int = 0
+    unreliable_unread_count: int = 0
+    unreliable_reasons: tuple[str, ...] = ()
+    awaiting_navigation: int = 0
+    navigation_block_reason: str = ""
+    foreground_changed_stage: str = ""
+    scan_disposition: str = "B2_NOT_SCANNED"
+    scan_id: str = ""
+    scan_ocr_completed_at: datetime | None = None
+    last_b2_summary: str = ""
+    selection_method: str = "UNKNOWN"
+    selection_name: str = ""
+    selection_name_reliable: bool = False
+    selection_confidence: str = "UNKNOWN"
+    selection_evidence: str = ""
+    navigation_allowed: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,16 +134,34 @@ class _Target:
     row: ContactObservation
     name: str
     avatar: str
-    ambiguous: bool
+    blockers: tuple[str, ...]
 
     @property
     def key(self) -> str:
-        return f"{self.name}|{self.avatar}|{self.row.box.top}" if self.ambiguous else f"{self.name}|{self.avatar}"
+        labels = "|".join(map(name_key, self.row.identity_labels))
+        return f"{self.name}|{self.avatar}|{self.row.peer_type}|{labels}"
+
+    @property
+    def ambiguous(self) -> bool:
+        return bool(self.blockers)
 
     @property
     def unread_signature(self) -> tuple:
         row = self.row
-        return (row.unread_count if row.unread_count_reliable else None, row.activity_text, row.preview)
+        return (row.unread_count if row.unread_count_reliable else None,
+                name_key(row.preview) if row.preview_reliable else "")
+
+
+def _new_unread(previous: tuple, current: tuple) -> bool:
+    old_count, old_preview = previous
+    count, preview = current
+    return bool((old_count is not None and count is not None and count > old_count)
+                or (old_preview and preview and preview != old_preview))
+
+
+def _merge_unread(previous: tuple, current: tuple) -> tuple:
+    count, preview = current
+    return count if count is not None else previous[0], preview or previous[1]
 
 
 def unread_targets(observation: VisualObservation) -> tuple[_Target, ...]:
@@ -130,10 +169,27 @@ def unread_targets(observation: VisualObservation) -> tuple[_Target, ...]:
     if observation.page != "MESSAGES_CANDIDATE" or observation.layout.get("B2") is None:
         return ()
     names = Counter(name_key(row.display_name) for row in observation.contacts if row.display_name)
-    return tuple(_Target(row, name_key(row.display_name), avatar_key(observation, row),
-                         names[name_key(row.display_name)] != 1 or not row.name_reliable
-                         or row.status != "CANDIDATE" or row.is_selected is None or row.badge is None)
-                 for row in observation.contacts if row.has_unread_indicator)
+    selected_count = sum(row.is_selected is True for row in observation.contacts)
+    targets = []
+    for row in observation.contacts:
+        if not row.has_unread_indicator:
+            continue
+        name = name_key(row.display_name)
+        checks = (
+            (names[name] != 1 or not row.name_reliable, "联系人身份重复或姓名不可靠"),
+            (row.status != "CANDIDATE", "联系人行部分可见或状态不可靠"),
+            (row.is_selected is None or selected_count != 1, "选中状态缺失"),
+            (row.badge is None, "未读标记边界缺失"),
+        )
+        blockers = tuple(reason for failed, reason in checks if failed)
+        targets.append(_Target(row, name, avatar_key(observation, row), blockers))
+    return tuple(targets)
+
+
+@dataclass(slots=True)
+class _WaitingUnread:
+    job: str
+    signature: tuple
 
 
 def _page_keys(observation: VisualObservation) -> tuple[str, ...]:
@@ -190,12 +246,14 @@ class CollectionService:
         self._cancel.set()
         self._run_id = ""
         self._status = ScanStatus()
+        self._scan_history: tuple[ScanStatus, ...] = ()
         self._window = None
         self._window_plan_invalidated = False
         self._scroll = False
         self._queued: dict[str, str] = {}
         self._discovered: dict[str, EventTime] = {}
         self._handled: dict[str, tuple] = {}
+        self._waiting_unread: dict[str, _WaitingUnread] = {}
         self._operations = 0
 
     def start(self, *, scroll: bool = False) -> None:
@@ -212,6 +270,7 @@ class CollectionService:
         self._handled.clear()
         self._operations = 0
         previous = self._status
+        self._scan_history = ()
         self._status = ScanStatus("RUNNING", "请手动切回最大化的企业微信，等待空闲后巡检",
                                   account_state=previous.account_state, account_name=previous.account_name,
                                   account_at=previous.account_at, account_id=previous.account_id,
@@ -229,6 +288,9 @@ class CollectionService:
 
     def snapshot(self) -> ScanStatus:
         return self._status
+
+    def recent_scans(self) -> tuple[ScanStatus, ...]:
+        return self._scan_history
 
     def _set(self, **fields) -> ScanStatus:
         self._status = replace(self._status, **fields)
@@ -286,10 +348,15 @@ class CollectionService:
 
     def _accept_login(self, account, evidence, lifetime):
         if self._bound_login and self._bound_login[0] != account:
+            for waiting in self._waiting_unread.values():
+                self.store.job(waiting.job, "PAUSED", reason="账号已切换，等待重新核对")
+                self._discovered.pop(waiting.job, None)
+            self._waiting_unread.clear()
+            self._scan_history = ()
             self._set(saved=0, added=0, repeated=0, uncertain=0, completed=0, errors=0, candidates=0,
                       pages=1, last_scan=None, recent=CollectionTrace(), trace=CollectionTrace(),
                       trace_job="", last_success=None, target="", navigation_result="", ocr_result="",
-                      sqlite_result="", notice=None, match="UNKNOWN")
+                      sqlite_result="", notice=None, match="UNKNOWN", last_b2_summary="")
         self.profile = account
         self._bound_login = (account, evidence, lifetime)
         self._requires_confirmation = False
@@ -358,7 +425,10 @@ class CollectionService:
         if invalidate:
             self._invalidate_window_plan("窗口或坐标系失去连续性，旧未执行任务保留供核对")
         return self._set(status="PAUSED", reason=reason, waiting_for_window=True,
-                         last_failure=reason, target="", candidates=0, queued=len(self._queued), match="UNKNOWN")
+                         last_failure=reason, target="", queued=len(self._queued), match="UNKNOWN",
+                         awaiting_navigation=len(self._queued), navigation_allowed=False, navigation_block_reason=reason,
+                         scan_disposition="B2_NOT_SCANNED" if self._status.b2_scan_completed_at is None
+                         else self._status.scan_disposition)
 
     def _window_error(self, exc: CaptureError | NavigationPaused) -> ScanStatus:
         if isinstance(exc, CaptureError):
@@ -370,6 +440,48 @@ class CollectionService:
             return self._wait_for_window(str(exc), invalidate=bool(exc.health.capture_blocker)
                                          or str(exc).startswith("WINDOW_CHANGED"))
         return self._set(status="PAUSED", reason=str(exc), waiting_for_window=True)
+
+    @staticmethod
+    def _validate_read_frame(frame, expected=None):
+        health = frame.diagnostics.window_health
+        state, capture = frame.state, frame.capture
+        pixels = frame.pixels
+        if (state.minimized or not state.maximized or state.dpi < 1
+                or pixels.dtype != np.uint8 or pixels.ndim != 3 or pixels.shape[2] != 3
+                or pixels.shape[:2] != (state.height, state.width)
+                or capture.width != state.width or capture.height != state.height
+                or capture.rect is None or capture.pid < 1 or capture.hwnd < 1):
+            raise NavigationPaused("截图尺寸、窗口状态或坐标证据无效")
+        if health is not None and (
+                health.status not in ("WINDOW_VALID", "WINDOW_NOT_FOREGROUND")
+                or health.capture_blocker is not None
+                or health.window is None or (health.window.pid, health.window.hwnd) != (capture.pid, capture.hwnd)
+                or health.geometry != (capture.rect, (state.width, state.height), state.dpi)):
+            raise NavigationPaused("截图窗口状态、PID、HWND 或坐标核对失败", health=health)
+        if expected is not None and _identity(frame) != _identity(expected):
+            raise NavigationPaused("预检与 OCR 截图窗口身份或坐标系不一致", health=health)
+
+    def _record_b2_result(self, raw, attempted_at):
+        targets = unread_targets(raw)
+        marker_count = len(targets)
+        unreliable = tuple(target for target in targets if target.ambiguous)
+        reliable_count = marker_count - len(unreliable)
+        reasons = tuple(dict.fromkeys(reason for target in unreliable for reason in target.blockers))
+        completed = EventTime.now().wall
+        conversation = raw.conversation
+        self._set(b2_scan_attempt_at=attempted_at.wall, b2_scan_completed_at=completed, last_scan=completed,
+                  contact_count=len(raw.contacts), unread_marker_count=marker_count,
+                  reliable_unread_count=reliable_count, unreliable_unread_count=len(unreliable),
+                  unreliable_reasons=reasons, candidates=reliable_count, navigation_block_reason="",
+                  scan_disposition="B2_SCANNED_UNREAD" if reliable_count else
+                  "B2_SCANNED_UNRELIABLE" if marker_count else "B2_SCANNED_NO_UNREAD",
+                  awaiting_navigation=len(self._queued), selection_method=conversation.selection_method,
+                  selection_name=conversation.selected_name, selection_name_reliable=conversation.selected_name_reliable,
+                  selection_confidence=conversation.selection_confidence,
+                  selection_evidence=conversation.selection_evidence,
+                  last_b2_summary=f"{self._status.scan_id} · {completed.isoformat(timespec='milliseconds')} · "
+                  f"联系人 {len(raw.contacts)} · 未读 {marker_count} · 可靠 {reliable_count} · 不可靠 {len(unreliable)}")
+        return targets
 
     def _bind_frame(self, frame) -> None:
         key = _identity(frame)
@@ -489,10 +601,18 @@ class CollectionService:
     def tick(self) -> ScanStatus:
         if not self._lock.acquire(blocking=False):
             return self._status
+        scan_id = ""
         try:
             if not self.active:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
-            self._set(notice=None)
+            scan_id = uuid4().hex[:12]
+            self._set(notice=None, scan_id=scan_id, scan_disposition="B2_NOT_SCANNED",
+                      screenshot_succeeded_at=None, b2_scan_attempt_at=None, b2_scan_completed_at=None,
+                      scan_ocr_completed_at=None, candidates=0, contact_count=0, unread_marker_count=0,
+                      reliable_unread_count=0, unreliable_unread_count=0, unreliable_reasons=(),
+                      foreground_changed_stage="", navigation_block_reason="", navigation_allowed=None,
+                      selection_name="", selection_name_reliable=False, selection_method="UNKNOWN", selection_confidence="UNKNOWN",
+                      selection_evidence="")
             if self._operations >= 48:
                 self.stop()
                 return self._set(status="STOPPED", reason="本轮已达到 48 次导航操作上限")
@@ -504,8 +624,6 @@ class CollectionService:
                 if health.capture_blocker:
                     message = "请手动最大化企业微信" if health.capture_blocker == "NOT_MAXIMIZED" else health.reason
                     return self._wait_for_window(f"{health.capture_blocker} · {message}", invalidate=True)
-                if health.status == "WINDOW_NOT_FOREGROUND":
-                    return self._wait_for_window(f"{health.status} · {health.reason}，等待用户切回企业微信")
             else:
                 health = None
             frame = self.capture()
@@ -516,79 +634,146 @@ class CollectionService:
             if health and ((frame.capture.pid, frame.capture.hwnd) != (health.window.pid, health.window.hwnd)
                            or (captured and (captured.identity != health.identity or captured.geometry != health.geometry))):
                 return self._wait_for_window("WINDOW_CHANGED · 预检与截图不一致，等待重新绑定", invalidate=True)
-            if captured and captured.status == "WINDOW_NOT_FOREGROUND":
-                return self._wait_for_window(f"{captured.status} · 截图期间失去前台，等待用户切回企业微信")
+            try:
+                self._validate_read_frame(frame)
+            except NavigationPaused as exc:
+                return self._wait_for_window(str(exc), invalidate=True)
             self._bind_frame(frame)
+            self._set(screenshot_succeeded_at=frame.captured_at,
+                      foreground_changed_stage="截图" if (
+                          (captured and captured.status == "WINDOW_NOT_FOREGROUND")
+                          or (health and health.status == "WINDOW_NOT_FOREGROUND")) else "")
             if self._auto_account and self._status.account_state == "UNIDENTIFIED":
                 self._set(account_state="IDENTIFYING", account_reason="正在读取 A1")
             self._set(trace=CollectionTrace(), trace_job="")
+            b2_attempt = EventTime.now()
+            self._set(status="RUNNING", reason="正在识别本轮 B2 联系人",
+                      b2_scan_attempt_at=b2_attempt.wall, scan_disposition="B2_SCANNING")
             raw = self.read(frame)
             ocr_at = self._ocr_completed(raw)
-            self._set(match=raw.conversation.match_status)
+            self._set(match=raw.conversation.match_status, scan_ocr_completed_at=ocr_at.wall)
             if not self.active:
                 return self._set(status="STOPPED", reason="已停止，未执行导航")
             self._check_login(raw)
-            self.navigator.verify_view(raw, need_idle=True)
+            self._validate_read_frame(raw.frame, frame)
             if raw.page != "MESSAGES_CANDIDATE":
                 raise NavigationPaused("未确认当前企业微信为消息页面")
-            if raw.layout.get("B2") is None or any(step.status == "FAILED" for step in raw.ocr_areas
+            if raw.layout.get("B2") is None or any(step.status in ("FAILED", "SKIPPED") for step in raw.ocr_areas
                                                     if step.region.startswith("B2")):
+                self._set(scan_disposition="B2_SCAN_FAILED", navigation_block_reason="B2 OCR 或区域识别失败")
                 raise NavigationPaused("B2 联系人扫描失败")
-            self._set(last_scan=ocr_at.wall)
+            navigation_window_reason = ""
+            if captured and captured.status == "WINDOW_NOT_FOREGROUND":
+                navigation_window_reason = "WINDOW_NOT_FOREGROUND · 需要前台新截图复核"
+            if self._window_probe is not None:
+                current = self._window_probe()
+                self._record_window(current)
+                if not self.active:
+                    return self._set(status="STOPPED", reason="已停止，未执行导航")
+                if current.capture_blocker:
+                    return self._wait_for_window(f"{current.capture_blocker} · {current.reason}", invalidate=True)
+                if health and (current.identity != health.identity or current.geometry != health.geometry):
+                    return self._wait_for_window("WINDOW_CHANGED · OCR 后企业微信窗口身份或坐标变化", invalidate=True)
+                elif current.status == "WINDOW_NOT_FOREGROUND":
+                    stage = "截图" if health and health.status == "WINDOW_NOT_FOREGROUND" else "OCR"
+                    self._set(foreground_changed_stage=self._status.foreground_changed_stage or stage)
+                    navigation_window_reason = f"{current.status} · {current.reason}"
+            targets = self._record_b2_result(raw, b2_attempt)
             if self._recover:
                 self.store.recover_jobs(self.profile, self._run_id)
                 self._recover = False
             if self._status.waiting_for_window:
                 self._set(waiting_for_window=False, resumed_at=datetime.now().astimezone())
-            return self._scan(raw)
+            return self._scan(raw, targets, navigation_window_reason)
         except AccountPaused as exc:
+            self._set(scan_disposition="B2_SCAN_FAILED", navigation_allowed=False, navigation_block_reason=str(exc))
             return self._set(status="PAUSED" if self.active else "STOPPED", reason=str(exc), last_failure=str(exc))
         except (CaptureError, NavigationPaused) as exc:
             if not self.active:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False)
             state = self._window_error(exc)
-            return self._set(last_failure=state.reason)
+            disposition = "B2_SCAN_FAILED" if state.scan_disposition == "B2_SCANNING" else state.scan_disposition
+            return self._set(last_failure=state.reason, scan_disposition=disposition, navigation_allowed=False,
+                             navigation_block_reason=state.reason)
         except (sqlite3.Error, OSError, ValueError) as exc:
             self.stop()
             reason = f"采集或存储失败（{type(exc).__name__}）"
             return self._set(status="FAILED", reason=reason, last_failure=reason)
         finally:
+            if scan_id:
+                self._scan_history = (*self._scan_history[-7:], self._status)
             self._lock.release()
 
-    def _scan(self, raw):
-        current = unread_targets(raw)
-        still_visible = {f"{name_key(row.display_name)}|{avatar_key(raw, row)}" for row in raw.contacts
-                         if row.name_reliable and not row.has_unread_indicator}
-        for key in still_visible:
+    def _scan(self, raw, current, navigation_window_reason):
+        still_visible = {_Target(row, name_key(row.display_name), avatar_key(raw, row), ()).key for row in raw.contacts
+                         if row.name_reliable and row.status == "CANDIDATE" and not row.has_unread_indicator}
+        unread_keys = {target.key for target in current}
+        for key in still_visible - unread_keys:
             self._handled.pop(key, None)
-        eligible = {target.key: target for target in current[:24]}
+            waiting = self._waiting_unread.pop(key, None)
+            if waiting:
+                self._discovered.pop(waiting.job, None)
+                self.store.job(waiting.job, "PAUSED", reason="复扫已不见未读标记，保留历史观察")
+        eligible = {target.key: target for target in current[:24] if not target.ambiguous}
+        visible = {target.key: target for target in current[:24]}
+        for key, job in tuple(self._queued.items()):
+            target = visible.get(key)
+            if target and target.ambiguous:
+                self._waiting_unread[key] = _WaitingUnread(job, target.unread_signature)
         for key in tuple(self._queued):
             if key not in eligible:
                 job = self._queued.pop(key)
-                self._discovered.pop(job, None)
-                self.store.job(job, "PAUSED", reason="联系人行或未读证据已变化，等待新观察")
-        for key, target in eligible.items():
-            if key in self._queued or self._handled.get(key) == target.unread_signature:
+                if key not in self._waiting_unread:
+                    self._discovered.pop(job, None)
+                    self.store.job(job, "PAUSED", reason="联系人行或未读证据已变化，等待新观察")
+        for key, target in visible.items():
+            if key in self._queued:
                 continue
             if not self.active:
                 return self._set(status="STOPPED", reason="已停止，未执行导航")
-            detected = self._event("unread_detected_at")
-            job = self.store.create_job(self.profile, self._run_id, key, target.row, detected=detected)
-            if target.ambiguous:
-                self.store.job(job, "UNCERTAIN", reason="同名或未读联系人行无法可靠验证")
-                self._remember(target)
-                self._set(errors=self._status.errors + 1)
-            else:
-                self._queued[key] = job
+            signature = target.unread_signature
+            handled = self._handled.get(key)
+            if handled is not None and not _new_unread(handled, signature):
+                self._handled[key] = _merge_unread(handled, signature)
+                continue
+            waiting = self._waiting_unread.get(key)
+            if waiting and _new_unread(waiting.signature, signature):
+                self.store.job(waiting.job, "PAUSED", reason="出现新的未读数量或消息预览，保留旧观察")
+                self._discovered.pop(waiting.job, None)
+                self._waiting_unread.pop(key)
+                waiting = None
+            if waiting is None:
+                detected = self._event("unread_detected_at")
+                job = self.store.create_job(self.profile, self._run_id, key, target.row, detected=detected)
                 self._discovered[job] = detected
-        self._set(candidates=len(current), queued=len(self._queued),
+                waiting = _WaitingUnread(job, signature)
+            if target.ambiguous:
+                waiting.signature = _merge_unread(waiting.signature, signature)
+                self._waiting_unread[key] = waiting
+                self.store.observe_waiting_job(waiting.job, target.row, "；".join(target.blockers),
+                                               self._status.scan_id)
+            else:
+                if self._waiting_unread.pop(key, None):
+                    self.store.job(waiting.job, "QUEUED", navigation="NOT_STARTED", reason="本轮已复核未读目标")
+                self._queued[key] = waiting.job
+        self._set(queued=len(self._queued), awaiting_navigation=len(self._queued),
                   saved=self.store.browse(self.profile)["message_count"])
+        if navigation_window_reason and (self._queued or current):
+            return self._set(status="PAUSED", waiting_for_window=True, reason=navigation_window_reason,
+                             navigation_block_reason=navigation_window_reason, navigation_allowed=False,
+                             scan_disposition="B2_SCANNED_WAITING_NAVIGATION" if self._queued else self._status.scan_disposition)
         if self._queued:
             key = next(iter(self._queued))
             return self._collect(raw, eligible[key], self._queued[key])
-        if self._scroll and self._status.pages < 4:
+        if self._status.unreliable_unread_count:
+            reason = "检测到未读，等待重新验证 · " + "；".join(self._status.unreliable_reasons)
+            return self._set(status="PAUSED", target="", reason=reason, navigation_allowed=False,
+                             navigation_block_reason=reason)
+        if (not navigation_window_reason and self._scroll and self._status.pages < 4
+                and sum(row.is_selected is True for row in raw.contacts) == 1):
             return self._scroll_once(raw)
-        return self._set(status="RUNNING", target="", reason="当前可见 B2 中没有等待的未读任务")
+        reason = "可见未读已记录，本轮没有新的导航任务" if current else "本轮 B2 扫描未发现未读"
+        return self._set(status="RUNNING", target="", reason=reason, navigation_allowed=False)
 
     def _collect(self, raw: VisualObservation, target: _Target, job: str) -> ScanStatus:
         trace = CollectionTrace(unread_detected_at=self._discovered.get(job))
@@ -620,6 +805,8 @@ class CollectionService:
             if not self.active:
                 raise NavigationPaused("已停止，未执行导航")
             if not target.row.is_selected:
+                self.navigator.verify_view(raw, need_idle=True)
+                self._set(navigation_allowed=True)
                 self._set(status="NAVIGATING", reason="提交未读证据并复核 B2 点击位置")
                 started = self._event("navigation_started_at", navigation_result="正在验证并尝试进入未读会话")
                 self.store.job(job, "NAVIGATING", risk=True, navigation="CLICK_INTENT",
@@ -680,8 +867,10 @@ class CollectionService:
             reason = result.reason if status == "COMPLETED" else f"{result.reason}；如已点击，未读可能已清除"
             return self._finish_task(target, result, captured, status, reason, job)
         except (NavigationPaused, CaptureError) as exc:
+            block_reason = str(exc).splitlines()[0]
             self.store.job(job, "UNCERTAIN" if clicked else "PAUSED", no_click=not clicked,
-                           navigation="NAVIGATION_UNCERTAIN" if clicked else "BLOCKED", reason=str(exc))
+                           navigation="NAVIGATION_UNCERTAIN" if clicked else "BLOCKED",
+                           reason=block_reason)
             if clicked or not self.active:
                 self._queued.pop(target.key, None)
                 self._discovered.pop(job, None)
@@ -693,8 +882,18 @@ class CollectionService:
                 return self._set(status="STOPPED", reason="自动采集许可已撤销", waiting_for_window=False,
                                  queued=len(self._queued), errors=self._status.errors + int(clicked))
             reason = str(exc).splitlines()[0] + ("；未读可能已清除" if clicked else "")
-            return self._set(status="PAUSED", reason=reason, navigation_result=reason, last_failure=reason,
-                             queued=len(self._queued), errors=self._status.errors + int(clicked))
+            waiting = not clicked and target.key in self._queued
+            foreground_stage = self._status.foreground_changed_stage
+            if "WINDOW_NOT_FOREGROUND" in reason and not foreground_stage:
+                foreground_stage = "点击前"
+            return self._set(status="PAUSED" if waiting else "UNCERTAIN",
+                             reason=reason, navigation_result=reason, navigation_block_reason=reason,
+                             navigation_allowed=False,
+                             foreground_changed_stage=foreground_stage,
+                             scan_disposition="B2_SCANNED_WAITING_NAVIGATION" if waiting else
+                             self._status.scan_disposition, queued=len(self._queued),
+                             awaiting_navigation=len(self._queued), waiting_for_window=waiting,
+                             errors=self._status.errors + int(clicked))
         except Exception as exc:
             self.stop()
             reason = f"采集或数据库写入失败（{type(exc).__name__}）"
@@ -713,7 +912,7 @@ class CollectionService:
         if not self.active:
             raise NavigationPaused("已停止，未保存本次采集")
         self._check_login(observed, allow_binding=False)
-        self.navigator.verify_view(observed)
+        self._validate_read_frame(observed.frame, raw.frame)
         if _identity(observed.frame) != _identity(raw.frame) or not _matches_target(observed, target):
             return "切换后 B2 选中行、C1 标题或会话类型与目标不符"
         summary = summarize(observed)
@@ -731,6 +930,7 @@ class CollectionService:
         self._committed(result, raw.conversation.title, job)
         return self._numbers(result, status=status, reason=reason, match=raw.conversation.match_status,
                              saved=self._status.saved + result.inserted, queued=len(self._queued),
+                             awaiting_navigation=len(self._queued),
                              completed=self._status.completed + int(status == "COMPLETED"),
                              errors=self._status.errors + int(status != "COMPLETED"))
 

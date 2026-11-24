@@ -228,7 +228,7 @@ class AccountCollectionTests(unittest.TestCase):
         self.navigator.select.side_effect = lambda *_: setattr(self, "raw", login_observation(_history()[1], OTHER))
         self.service.start()
         state = self.service.tick()
-        self.assertEqual((state.status, state.account_id, state.notice), ("PAUSED", None, None))
+        self.assertEqual((state.status, state.account_id, state.notice), ("UNCERTAIN", None, None))
         self.assertEqual(self.table_count("message_observations"), 0)
         job, = self.store.browse(account)["jobs"]
         self.assertEqual((job["status"], job["read_risk"]), ("UNCERTAIN", 1))
@@ -310,7 +310,7 @@ class AccountCollectionTests(unittest.TestCase):
         cold = health(replace(BASE, iconic=True, placement=(0, 2, *PLACEMENT[2:])))
         new = health(replace(BASE, owner=(5, 77), foreground_hwnd=303),
                      target=replace(INFO, pid=77, hwnd=303))
-        self.service._window_probe = Mock(side_effect=[health(), cold, new])
+        self.service._window_probe = Mock(side_effect=[health(), health(), cold, new, new])
         self.service.start()
         self.assertEqual(self.service.tick().account_id, bound.account_id)
         paused = self.service.tick()

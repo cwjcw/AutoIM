@@ -73,6 +73,9 @@ class ContactObservation:
     identity_labels: tuple[str, ...] = ()
     peer_type: str = "UNKNOWN"
     name_issue: str = ""
+    selection_method: str = "UNKNOWN"
+    selection_evidence: str = ""
+    preview_reliable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,26 +228,35 @@ def _muted(pixels: np.ndarray, row: Box, unit: float) -> bool | None:
     return None
 
 
-def _row_selection(pixels: np.ndarray, rows: list[Box]) -> list[bool | None]:
+def _row_selection(pixels: np.ndarray, rows: list[Box]) -> tuple[list[int], int | None, tuple[str, ...]]:
     fills = []
     coverages = []
     for row in rows:
         inset = max(5, round(row.width * .06))
         strip = pixels[row.top + 2:row.bottom - 2:2, row.left + inset:row.right - inset:2]
+        if not strip.size:
+            fills.append(np.zeros(3))
+            coverages.append(0.)
+            continue
         fill = np.median(strip, axis=(0, 1))
         fills.append(fill)
         coverages.append(float(np.mean(np.max(np.abs(strip - fill), axis=2) < 12)))
     blue = [i for i, (b, g, r) in enumerate(fills)
             if b - r >= 13 and b - g >= 4 and coverages[i] >= .60]
-    if len(blue) == 1:
-        return [i == blue[0] for i in range(len(rows))]
+    # A muted or neutral fill is only supporting evidence. Require a dominant
+    # background shared by other rows and corroborate the candidate with C1.
+    evidence = [f"行底 BGR {tuple(map(int, fill))} · 覆盖 {coverage:.0%}"
+                for fill, coverage in zip(fills, coverages)]
+    subtle = None
     if not blue and len(rows) >= 3:
         baseline = np.median(fills, axis=0)
-        distinct = [i for i, color in enumerate(fills)
-                    if np.max(np.abs(color - baseline)) >= 14 and coverages[i] >= .70]
-        if len(distinct) == 1:
-            return [i == distinct[0] for i in range(len(rows))]
-    return [None] * len(rows)
+        distances = np.max(np.abs(fills - baseline), axis=1)
+        if np.count_nonzero(distances <= 3) > len(rows) // 2:
+            distinct = [i for i, distance in enumerate(distances) if distance >= 5 and coverages[i] >= .70]
+            if len(distinct) == 1:
+                subtle = distinct[0]
+                evidence[subtle] = f"B2 唯一浅色或中性行底 · 色差 {distances[subtle]:.0f} · {evidence[subtle]}"
+    return blue, subtle, tuple(evidence)
 
 
 def _highlight_row(pixels: np.ndarray, region: Box, unit: float) -> Box | None:
@@ -351,11 +363,16 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
         if i + 1 < len(centers):
             bottom = min(bottom, (y + centers[i + 1] + 1) // 2)
         rows.append(Box(region.left, top, region.right, bottom))
-    selected = _row_selection(pixels, rows)
+    blue_rows, subtle, fills = _row_selection(pixels, rows)
+    selected = blue_rows[0] if len(blue_rows) == 1 else None
+    method = "CONFLICTING_HIGHLIGHT" if len(blue_rows) > 1 else "BLUE_ROW_FILL"
     if highlight:
         matched = [i for i, y in enumerate(centers) if highlight.top <= y < highlight.bottom]
         if len(matched) == 1:
-            selected = [i == matched[0] for i in range(len(rows))]
+            if not blue_rows or blue_rows == matched:
+                selected, method = matched[0], "BLUE_HIGHLIGHT_BAND"
+            else:
+                selected, method = None, "CONFLICTING_HIGHLIGHT"
     results = []
     used = set()
     for i, (row, (y, avatar, source)) in enumerate(zip(rows, positioned)):
@@ -405,17 +422,23 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
             evidence.append("头像右上紧凑红色徽标候选")
         if muted:
             evidence.append("右上图标轮廓含斜线")
-        if selected[i]:
+        if i == selected:
             evidence.append("与其他行可区分的背景高亮")
         results.append(ContactObservation(i + 1, row, avatar, parsed_name.display_name, "\n".join(text_lines(tuple(preview))),
                                           bool(badge), count, reliable, badge, muted,
                                           activity.text if activity else "",
                                           bool(activity and activity.score >= thresholds.text_score
-                                               and ACTIVITY_TIME.fullmatch(activity.text.strip())), selected[i],
+                                               and ACTIVITY_TIME.fullmatch(activity.text.strip())),
+                                          i == selected if selected is not None else None,
                                           status, tuple(evidence), reliable_name, _contact_kind(parsed_name.display_name),
                                           raw_name=raw_name, identity_labels=parsed_name.labels,
                                           peer_type=parsed_name.peer_type if reliable_name else "UNKNOWN",
-                                          name_issue=parsed_name.issue))
+                                          name_issue=parsed_name.issue,
+                                          selection_method=method if selected is not None or method == "CONFLICTING_HIGHLIGHT"
+                                          else "SUBTLE_ROW_FILL" if i == subtle else "UNKNOWN",
+                                          selection_evidence=fills[i],
+                                          preview_reliable=bool(preview) and
+                                          all(item.score >= thresholds.text_score for item in preview)))
     if diagnostics is not None:
         for span in spans:
             if span not in used:
