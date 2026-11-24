@@ -16,10 +16,11 @@ from tempfile import TemporaryFile
 from uuid import uuid4
 
 from autoim import __version__
+from autoim.wecom.collection_evidence import EvidenceArchive, EvidenceJob, write_evidence
 from autoim.wecom.collection_test import PHASES
 from autoim.wecom.visual_store import database_path
 
-PC_VERSION = "PC-V3.5.3"
+PC_VERSION = "PC-V3.5.3.1"
 
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",
@@ -185,6 +186,14 @@ class _EventFiles(logging.Handler):
 
 class _Listener(QueueListener):
     def handle(self, record):
+        if isinstance(record, EvidenceJob):
+            try:
+                record.callback(*record.args)
+            except Exception:
+                self.failure = "私有视觉证据写入失败"
+            finally:
+                record.slot.release()
+            return
         if isinstance(record, tuple):
             record[0].set()
             return
@@ -203,6 +212,7 @@ class CollectionRuntime:
         self.queue = SimpleQueue()
         self.handler = QueueHandler(self.queue)
         self.files = _EventFiles(self.root, max_bytes, backups, retention)
+        self.evidence = EvidenceArchive(self.root / "visual-evidence", retention)
         self.listener = _Listener(self.queue, self.files)
         self.listener.failure = ""
         self.listener.start()
@@ -212,6 +222,26 @@ class CollectionRuntime:
         self.steps = {}
         self.scopes = {}
         self.stop_audit = {}
+
+    def keep_visual(self, detection, task, scan, kind, raw, data, regions, *, source_event=""):
+        with self.lock:
+            if self.closed:
+                return ""
+            identifier = uuid4().hex
+            start = self.evidence.slots.acquire(blocking=False)
+            event = self.emit("test", detection, "VISUAL_DIAGNOSTIC", "VISUAL_EVIDENCE", task=task,
+                              details={"evidence_id": identifier, "kind": kind, "scan": scan,
+                                       "source_event": source_event,
+                                       "reason": "" if start else "LOCAL_EVIDENCE_QUEUE_FULL"})
+            if start:
+                frame = raw.frame
+                record = {"id": identifier, "event": event, "source_event": source_event,
+                          "detection": detection, "task": task, "scan": scan, "kind": kind,
+                          "captured_at": frame.captured_at.isoformat(), "dpi": frame.state.dpi,
+                          "size": [frame.capture.width, frame.capture.height],
+                          "coordinates": "original_window_pixels", "data": data}
+                self.queue.put(EvidenceJob(self.evidence.keep, (record, frame.pixels, regions), self.evidence.slots))
+            return identifier
 
     def emit(self, mode, detection, stage, code, result="", *, level="INFO", task="",
              elapsed_ms=None, details=None, exception=None):
@@ -233,26 +263,31 @@ class CollectionRuntime:
                                       "frames": [(Path(frame.filename).name, frame.lineno, frame.name)
                                                  for frame in extract_tb(exception.__traceback__)]}
             if detection:
-                scope = details.get("evidence_scope")
-                if scope:
-                    self.scopes.setdefault(detection, set()).add(scope)
-                if stage in STAGES and result in RESULTS:
-                    self._record_stage(self.reports, detection, stage, event, result)
-                if code in SUBSTEPS:
-                    name, _ = SUBSTEPS[code]
-                    assertion = result if result in RESULTS else "PARTIAL"
-                    self._record_stage(self.steps, detection, name, event, assertion)
-                audit = self.stop_audit.setdefault(detection, {"requested": False, "drained": False, "late_input": 0})
-                if code == "STOP_PERMISSION_REVOKED":
-                    audit["requested"] = True
-                elif code == "WORKER_DRAINED":
-                    audit["drained"] = True
-                elif code in ("INPUT_EXECUTED", "CURSOR_MOVED") and audit["requested"]:
-                    audit["late_input"] += 1
+                self._track(event, self.reports, self.steps, self.scopes, self.stop_audit)
             record = logging.LogRecord("autoim.collection", getattr(logging, level), "", 0, code, (), None)
             record.event = event
             self.handler.handle(record)
             return event["id"]
+
+    @classmethod
+    def _track(cls, event, reports, steps, scopes, stop_audit):
+        detection, stage, code, result = (event[key] for key in ("detection", "stage", "code", "result"))
+        scope = event["details"].get("evidence_scope")
+        if scope:
+            scopes.setdefault(detection, set()).add(scope)
+        if stage in STAGES and result in RESULTS:
+            cls._record_stage(reports, detection, stage, event, result)
+        if code in SUBSTEPS:
+            name, _ = SUBSTEPS[code]
+            assertion = result if result in RESULTS else "PARTIAL"
+            cls._record_stage(steps, detection, name, event, assertion)
+        audit = stop_audit.setdefault(detection, {"requested": False, "drained": False, "late_input": 0})
+        if code == "STOP_PERMISSION_REVOKED":
+            audit["requested"] = True
+        elif code == "WORKER_DRAINED":
+            audit["drained"] = True
+        elif code in ("INPUT_EXECUTED", "CURSOR_MOVED") and audit["requested"]:
+            audit["late_input"] += 1
 
     @staticmethod
     def _record_stage(index, detection, key, event, result):
@@ -260,7 +295,7 @@ class CollectionRuntime:
             "attempts": 0, "duration_ms": 0, "counts": {}, "events": [],
             "recovered_failures": 0, "unresolved_blockers": 0})
         stage["attempts"] += 1
-        stage["duration_ms"] += event["elapsed_ms"] or 0
+        stage["duration_ms"] += event.get("elapsed_ms") or 0
         counts = stage["counts"]
         counts[result] = counts.get(result, 0) + 1
         stage["events"] = (stage["events"] + [event["id"]])[-40:]
@@ -296,10 +331,12 @@ class CollectionRuntime:
                               "counts": dict(counts), "events": list(data.get("events", ()))}
         return formatted
 
-    def report(self, detection):
+    def report(self, detection, *, recorded=None):
         with self.lock:
-            stages = self._summaries(STAGES, self.reports.get(detection, {}))
-            substeps = self._summaries(dict(SUBSTEPS.values()), self.steps.get(detection, {}))
+            reports, steps, scopes, audits = recorded if recorded is not None else (
+                self.reports, self.steps, self.scopes, self.stop_audit)
+            stages = self._summaries(STAGES, reports.get(detection, {}))
+            substeps = self._summaries(dict(SUBSTEPS.values()), steps.get(detection, {}))
             blockers = {
                 "MENU": ("WINDOW", "A1"), "CARD": ("MENU", "A1"), "EMAIL": ("CARD",),
                 "RESTORE": ("CARD",), "BIND": ("EMAIL", "RESTORE"), "B2": ("WINDOW",),
@@ -312,7 +349,7 @@ class CollectionRuntime:
                 if upstream and stages[key]["status"] == "NOT_RUN":
                     stages[key].update(status="BLOCKED_BY_DEPENDENCY", final_status="BLOCKED_BY_DEPENDENCY",
                                        waiting=True, unresolved_blockers=1, reason=f"前置阶段 {upstream} 未通过")
-            audit = self.stop_audit.get(detection, {})
+            audit = audits.get(detection, {})
             stop = stages["STOP"]
             if audit.get("requested") and audit.get("drained"):
                 outcome = "FAILED" if audit["late_input"] else "AUTO_PASS"
@@ -332,7 +369,7 @@ class CollectionRuntime:
                 stop.update(status=outcome, final_status=outcome, completed=passed, waiting=False,
                             reason="" if passed else "停止审计缺少必要子步骤证据")
             return {"version": PC_VERSION, "git": self.revision, "session": self.session,
-                    "detection": detection, "evidence_scopes": sorted(self.scopes.get(detection, ())),
+                    "detection": detection, "evidence_scopes": sorted(scopes.get(detection, ())),
                     "stop_audit": dict(audit), "stages": stages, "substeps": substeps}
 
     def sync(self):
@@ -375,13 +412,16 @@ class CollectionRuntime:
                             continue
                         yield event
 
-    def export(self, path, scope, detection, snapshot):
+    def export(self, path, scope, detection, snapshot, *, full_visual=False):
         from shutil import copyfileobj
         path = Path(path)
         created = False
         try:
             with TemporaryFile() as readable, TemporaryFile() as structured:
+                selected = []
                 for event in self.events(scope, detection):
+                    if event["detection"]:
+                        selected.append(event)
                     readable.write((_human(event) + "\n").encode("utf-8"))
                     structured.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                 with path.open("xb") as destination:
@@ -395,7 +435,14 @@ class CollectionRuntime:
                                           "release": platform.release(), "python": platform.python_version(),
                                           "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision}))
                         archive.writestr("diagnostic.json", json.dumps(snapshot, ensure_ascii=False, indent=2))
-                        archive.writestr("flow-report.json", json.dumps(self.report(detection), ensure_ascii=False, indent=2))
+                        recorded = ({}, {}, {}, {})
+                        for event in selected:
+                            self._track(event, *recorded)
+                        report = self.report(detection, recorded=recorded)
+                        report["detections"] = {run: self.report(run, recorded=recorded)
+                                                for run in dict.fromkeys(event["detection"] for event in selected)}
+                        archive.writestr("flow-report.json", json.dumps(report, ensure_ascii=False, indent=2))
+                        write_evidence(archive, self.evidence, selected, report, full=full_visual)
         except BaseException:
             if created:
                 path.unlink(missing_ok=True)

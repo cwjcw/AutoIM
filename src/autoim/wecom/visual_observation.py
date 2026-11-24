@@ -17,7 +17,9 @@ from autoim.vision import NormalizedRect
 from autoim.wecom.visual_account import LoginEvidence
 from autoim.wecom.visual_capture import VisualFrame, capture_visible_window
 from autoim.wecom.visual_contacts import (ContactObservation, ContactTextDiagnostic, GlobalUnreadObservation,
-                                          VisualName, detect_contacts, detect_global_unread, parse_visual_name, recover_b2_start)
+                                          VisualName, detect_contacts, detect_global_unread, name_line, parse_visual_name,
+                                          recover_b2_start)
+from autoim.wecom.visual_contacts import name_key as _name_key
 from autoim.wecom.visual_layout import (Box, LayoutObservation, VisualThresholds, contours,
                                        detect_layout, detect_scroll_thumb, near_background)
 from autoim.wecom.visual_messages import (Container, OcrDisposition, VisibleMessageObservation,
@@ -55,6 +57,7 @@ class ConversationObservation:
     selection_method: str = "UNKNOWN"
     selection_confidence: str = "UNKNOWN"
     selection_evidence: str = ""
+    title_base_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,10 +223,6 @@ def _composer(pixels: np.ndarray, body: Box, spans: tuple[TextSpan, ...], unit: 
     return ComposerObservation(toolbar, button, appearance, has_draft)
 
 
-def _name_key(value: str) -> str:
-    return "".join(unicodedata.normalize("NFKC", value).split()).casefold()
-
-
 _PHONE_METADATA = re.compile(r"(?<![0-9])(?:(?:\+?86)[ \-]*)?1[3-9](?:[ \-]*[0-9]){9}(?![0-9])")
 _ORG_METADATA = re.compile(r"(?:有限公司|公司|集团|部门|中心|事业部|工作室|Corporation|Company|Inc\.?|Ltd\.?)$", re.I)
 
@@ -232,11 +231,7 @@ def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds, *
                     ) -> tuple[str, VisualName, tuple[str, ...], bool, str]:
     if not spans:
         return "", VisualName(""), (), False, "C1 无标题 OCR"
-    head = min(spans, key=lambda item: (item.box.center[1], item.box.left))
-    first_line = tuple(sorted((item for item in spans
-                               if abs(head.box.center[1] - item.box.center[1])
-                               <= max(head.box.height, item.box.height) * .42),
-                              key=lambda item: item.box.left))
+    first_line, _ = name_line(spans)
     raw = " ".join(item.text.strip() for item in first_line)
     text = unicodedata.normalize("NFKC", raw)
     other = text_lines(tuple(item for item in spans if item not in first_line and item.score >= thresholds.text_score))
@@ -258,7 +253,7 @@ def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds, *
         details.insert(0, metadata)
         later_labels += tuple(tag.strip() for tag in metadata.split("@")[1:])
         text = text[:index].strip().rstrip("·-—,，:：|").strip()
-    parsed = parse_visual_name(text, labels_from_title=later_labels, allow_short_organization=multi_feature)
+    parsed = parse_visual_name(text)
     inline_label = "@" in text
     if inline_label and not parsed.issue:
         details.insert(0, text[text.index("@"):])
@@ -266,13 +261,18 @@ def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds, *
             note = "按可识别的身份标签拆分标题"
     name = parsed.display_name
     truncated = "…" in raw or "..." in raw
-    ambiguous = ("|" in name or bool(re.search(r"[\u3400-\u9fff]\s+[\u3400-\u9fff]|\d{5,}", name))
-                 or (not cuts and not inline_label and len(first_line) > 1))
+    separated_label = bool(parsed.labels and later_labels and any(_name_key(label) not in map(_name_key, parsed.labels)
+                                               for label in later_labels))
+    ambiguous = separated_label or bool(re.search(r"\d{5,}", name)) and not cuts
+    ambiguous_words = not cuts and not inline_label and bool(re.search(r"[\u3400-\u9fff]\s+[\u3400-\u9fff]", name))
     reliable = (bool(name) and any(char.isalpha() for char in name)
-                and not truncated and not ambiguous and not parsed.issue
+                and not truncated and not ambiguous and not parsed.issue and not ambiguous_words
                 and min(item.score for item in first_line) >= thresholds.text_score)
     if not reliable:
-        note = parsed.issue or "C1 主标题有截断、字段混合或置信不足"
+        note = parsed.issue or ("C1 主标题与分离的身份标签冲突或后缀位置不明" if separated_label
+                                else "C1 名称与附加文字待核" if ambiguous_words and not ambiguous and not truncated
+                                and min(item.score for item in first_line) >= thresholds.text_score
+                                else "C1 主标题有截断、字段混合或置信不足")
     return raw, parsed, tuple(details), reliable, note
 
 
@@ -284,6 +284,9 @@ def compare_conversation(title_spans: tuple[TextSpan, ...], contacts: tuple[Cont
     row = selected[0] if len(selected) == 1 else None
     name = row.display_name if row else ""
     selected_reliable = bool(row and row.name_reliable)
+    if selected_reliable and note == "C1 名称与附加文字待核" and _name_key(title) == _name_key(name):
+        title_reliable = True
+        note = "C1 同行文字与选中行完整名称一致"
     if (selected_reliable and title_reliable and _name_key(name) == _name_key(raw)
             and note == "按组织名称后缀分离身份字段"):
         # A group title can legitimately end with an organization name.
@@ -297,6 +300,7 @@ def compare_conversation(title_spans: tuple[TextSpan, ...], contacts: tuple[Cont
                             (selected_type == "EXTERNAL_WECOM" and
                              tuple(map(_name_key, row.identity_labels)) != tuple(map(_name_key, title_identity.labels)))):
             note = "B2 与 C1 的明确身份标签冲突"
+            state = "CONVERSATION_MISMATCH"
         else:
             state = "VISUAL_MATCH" if _name_key(name) == _name_key(title) else "CONVERSATION_MISMATCH"
     elif not selected_reliable:
@@ -313,7 +317,8 @@ def compare_conversation(title_spans: tuple[TextSpan, ...], contacts: tuple[Cont
                                    selection_method=row.selection_method if row else "UNKNOWN",
                                    selection_confidence=("CORROBORATED" if row.selection_method == "SUBTLE_FILL_AND_C1"
                                                          else "HIGH") if row else "UNKNOWN",
-                                   selection_evidence=row.selection_evidence if row else "")
+                                   selection_evidence=row.selection_evidence if row else "",
+                                   title_base_name=title_identity.base_name)
 
 
 def _corroborate_selection(title_spans, contacts, thresholds, mouse, *, multi_feature=False):
@@ -324,7 +329,9 @@ def _corroborate_selection(title_spans, contacts, thresholds, mouse, *, multi_fe
     raw, title, _, reliable, note = _title_identity(title_spans, thresholds, multi_feature=multi_feature)
     if not reliable:
         return contacts, "B2 无明确高亮，" + note
-    names = {_name_key(title.display_name), _name_key(raw)}
+    names = {_name_key(title.display_name)}
+    if note == "按组织名称后缀分离身份字段":
+        names.add(_name_key(raw))
     matches = [row for row in contacts if _name_key(row.display_name) in names]
     if len(matches) != 1 or not matches[0].name_reliable or matches[0].status != "CANDIDATE":
         return contacts, "C1 标题无法唯一核对到完整可靠的 B2 行"

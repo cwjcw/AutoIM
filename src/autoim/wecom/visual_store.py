@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import sqlite3
-import unicodedata
 from collections import OrderedDict
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
@@ -21,7 +20,7 @@ import numpy as np
 from autoim.wecom.collection_profile import normalize_email
 from autoim.wecom.collection_events import EventTime
 from autoim.wecom.visual_account import LoginEvidence
-from autoim.wecom.visual_contacts import ContactObservation
+from autoim.wecom.visual_contacts import ContactObservation, name_key
 from autoim.wecom.visual_layout import Box
 from autoim.wecom.visual_monitor import (FrameProbe, MonitorObservation, _history_content_box, _tail_pixels_changed,
                                          compare_sequences, probe_frame, summarize)
@@ -94,10 +93,6 @@ def database_path() -> Path:
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
-
-
-def name_key(value: str) -> str:
-    return "".join(unicodedata.normalize("NFKC", value).split()).casefold()
 
 
 def _json(value) -> str:
@@ -569,6 +564,10 @@ class VisualStore:
                 return [dict(row) for row in db.execute(sql, params)]
             jobs = rows("SELECT * FROM scan_jobs WHERE account_id=? ORDER BY created_at DESC LIMIT 100", (account,))
             conversations = rows("SELECT * FROM conversations WHERE account_id=? ORDER BY last_seen DESC", (account,))
+            for conversation in conversations:
+                if (conversation["association_status"] == "CORE_NAME_CONFIRMED"
+                        and conversation["evidence"] == "VISUAL_MULTI_EVIDENCE"):
+                    conversation["last_status"] = "旧版基础姓名 · 待复核"
             messages = rows("""SELECT m.*,a.filename,a.extension,a.size_text FROM messages m
                             JOIN conversations c ON c.id=m.conversation_id LEFT JOIN attachments a ON a.message_id=m.id
                             WHERE c.account_id=? AND c.id=? AND (? IS NULL OR m.position<?)

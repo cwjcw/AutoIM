@@ -206,33 +206,34 @@ class ConversationLabelTests(MonitorFixture):
         return observe_frame(frame, {}, _named_reader(reader, left, title, **kwargs))
 
     def assert_personal_label_match(self, left, labels):
-        conv = self.observe(left, "崔玮杰").conversation
+        full = left.replace("＠", "@")
+        conv = self.observe(left, full).conversation
         self.assertEqual(conv.selected_raw_name, left)
-        self.assertEqual((conv.selected_name, conv.raw_title_line, conv.title), ("崔玮杰", "崔玮杰", "崔玮杰"))
+        self.assertEqual((conv.selected_name, conv.raw_title_line, conv.title), (full, full, full))
         self.assertEqual(conv.selected_identity_labels, labels)
         self.assertEqual((conv.selected_peer_type, conv.match_status), ("PERSONAL_WECHAT", "VISUAL_MATCH"))
         self.assertFalse(conv.identity_unique or conv.attribution_reliable)
 
-    def test_ascii_personal_label_matches_plain_title(self):
-        self.assert_personal_label_match("崔玮杰@微信", ("微信",))
+    def test_ascii_personal_label_matches_full_title(self):
+        self.assert_personal_label_match("样本员@微信", ("微信",))
 
-    def test_full_width_personal_label_matches_plain_title(self):
-        self.assert_personal_label_match("崔玮杰＠微信", ("微信",))
+    def test_full_width_personal_label_matches_full_title(self):
+        self.assert_personal_label_match("样本员＠微信", ("微信",))
 
-    def test_two_explicit_personal_labels_match_plain_title(self):
-        self.assert_personal_label_match("崔玮杰@微信@微信联系人", ("微信", "微信联系人"))
+    def test_two_explicit_personal_labels_match_full_title(self):
+        self.assert_personal_label_match("样本员@微信@微信联系人", ("微信", "微信联系人"))
 
     def test_separate_same_line_ocr_label_is_parsed(self):
-        outcome = self.observe("张三", "张三", left_tag=span("＠微信联系人", 222, 160, 88))
+        outcome = self.observe("张三", "张三@微信联系人", left_tag=span("＠微信联系人", 222, 160, 88))
         conv = outcome.conversation
         self.assertEqual(conv.selected_raw_name, "张三 ＠微信联系人")
         self.assertEqual((conv.selected_name, conv.selected_peer_type, conv.match_status),
-                         ("张三", "PERSONAL_WECHAT", "VISUAL_MATCH"))
+                         ("张三@微信联系人", "PERSONAL_WECHAT", "VISUAL_MATCH"))
 
-    def test_title_same_line_label_keeps_raw_ocr_and_matches_plain_selected_name(self):
+    def test_title_same_line_label_keeps_raw_ocr_and_differs_from_plain_selected_name(self):
         conv = self.observe("张三", "张三＠微信联系人").conversation
         self.assertEqual((conv.raw_title_line, conv.title, conv.title_peer_type, conv.match_status),
-                         ("张三＠微信联系人", "张三", "PERSONAL_WECHAT", "VISUAL_MATCH"))
+                         ("张三＠微信联系人", "张三@微信联系人", "PERSONAL_WECHAT", "CONVERSATION_MISMATCH"))
 
     def test_different_reliable_names_remain_mismatched(self):
         result = summarize(self.observe("张三", "李四"))
@@ -242,7 +243,6 @@ class ConversationLabelTests(MonitorFixture):
     def test_explicit_conflicting_tags_remain_unknown(self):
         for left, title, title_label, blocker in (
             ("张三@微信@示例公司", "张三", "", "SELECTED_NAME_UNCERTAIN"),
-            ("张三@微信", "张三@示例公司", "", "CONVERSATION_UNCERTAIN"),
             ("张三@微信", "张三@示例公司", "＠微信", "TITLE_UNCERTAIN"),
         ):
             with self.subTest(left=left, title=title, title_label=title_label):
@@ -250,17 +250,21 @@ class ConversationLabelTests(MonitorFixture):
                 self.assertEqual((result.match_status, result.blocker_code), ("UNKNOWN", blocker))
                 self.assertIn("冲突", result.blocker)
 
+    def test_different_complete_peer_labels_mismatch(self):
+        result = summarize(self.observe("张三@微信", "张三@示例公司"))
+        self.assertEqual((result.match_status, result.blocker_code), ("CONVERSATION_MISMATCH", "NAME_MISMATCH"))
+
     def test_external_organization_containing_wechat_is_not_personal(self):
-        conv = self.observe("张三@示例微信科技有限公司", "张三").conversation
+        conv = self.observe("张三@示例微信科技有限公司", "张三@示例微信科技有限公司").conversation
         self.assertEqual(conv.selected_raw_name, "张三@示例微信科技有限公司")
         self.assertEqual(conv.selected_identity_labels, ("示例微信科技有限公司",))
         self.assertEqual((conv.selected_name, conv.selected_peer_type, conv.match_status),
-                         ("张三", "EXTERNAL_WECOM", "VISUAL_MATCH"))
+                         ("张三@示例微信科技有限公司", "EXTERNAL_WECOM", "VISUAL_MATCH"))
 
     def test_unknown_suffix_is_never_silently_removed(self):
         for left, title, code in (
-            ("张三", "张三@未经确认", "TITLE_UNCERTAIN"),
-            ("张三@未经确认", "张三", "SELECTED_NAME_UNCERTAIN"),
+            ("张三", "张三@", "TITLE_UNCERTAIN"),
+            ("张三@", "张三", "SELECTED_NAME_UNCERTAIN"),
             ("张三…@微信", "张三", "SELECTED_NAME_UNCERTAIN"),
         ):
             with self.subTest(left=left, title=title):
@@ -324,7 +328,7 @@ class SchedulingTests(MonitorFixture):
 
     def test_personal_wechat_baseline_then_only_new_inbound_candidate(self):
         self.raw, reader = fixture(thumbs=False)
-        name_reader = _named_reader(reader, "崔玮杰@微信", "崔玮杰")
+        name_reader = _named_reader(reader, "样本员@微信", "样本员@微信")
         self.recognize.side_effect = lambda frame: observe_frame(frame, {}, name_reader)
         self.monitor.start()
         first = self.step()
@@ -558,12 +562,12 @@ class GuiMonitorTests(MonitorFixture):
         panel = VisualMonitorPanel(Mock(), Mock())
         self.addCleanup(panel.close)
         frame, reader = fixture(thumbs=False)
-        observed = summarize(observe_frame(frame, {}, _named_reader(reader, "张三＠微信", "张三")))
+        observed = summarize(observe_frame(frame, {}, _named_reader(reader, "张三＠微信", "张三@微信")))
         panel._render(MonitorSnapshot("BASELINE_CREATED", baseline_count=3, latest_observation=observed,
                                       stable_sample_count=1))
         text = panel.summary.text()
         for value in ("MESSAGES_CANDIDATE", "B2 选中行 CANDIDATE", "B2 原始名称 张三＠微信",
-                      "显示姓名 张三", "C1 原始标题 张三", "标题姓名 张三", "微信（PERSONAL_WECHAT）",
+                      "显示姓名 张三@微信", "C1 原始标题 张三@微信", "标题姓名 张三@微信", "微信（PERSONAL_WECHAT）",
                       "VISUAL_MATCH", "可靠可见消息 已取得", "唯一客户身份未验证", "基线 3 条"):
             self.assertIn(value, text)
         self.assertNotIn("基线未建立", text)

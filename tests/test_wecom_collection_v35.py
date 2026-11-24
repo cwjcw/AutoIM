@@ -194,12 +194,29 @@ class CoreFlowTests(unittest.TestCase):
         self.window_generation = 1
         self.assertEqual(self.poll().core.clicks, 1)
 
-    def test_same_named_rows_are_not_clicked(self):
+    def test_same_named_rows_without_reliable_geometry_are_not_clicked(self):
         self.start()
         original = self.before.contacts
         duplicate = replace(original[2], display_name=original[1].display_name)
         self.poll(replace(self.before, contacts=(*original[:2], duplicate)), count=2)
         self.navigator.select.assert_not_called()
+
+    def test_true_full_name_duplicate_reads_independent_row_and_keeps_database_unassigned(self):
+        self.service._core_account = CoreAccount("合成采集账号", "core@example.test")
+        original = sample(unread={1: (1, False)})
+        a, target, other = original.contacts
+        target = replace(target, geometry_reliable=True)
+        other = replace(other, display_name=target.display_name, raw_name=target.raw_name)
+        self.start()
+        first = self.poll(replace(original, contacts=(a, target, other)))
+        self.assertEqual(first.core.clicks, 1)
+        selected = sample(selected=1, tone=150)
+        picked = replace(selected.contacts[1], geometry_reliable=True)
+        state = self.poll(replace(selected, contacts=(selected.contacts[0], picked, other)), count=2)
+        self.assertEqual((state.core.verified, state.core.review_messages), (1, 1))
+        self.assertEqual(state.core.messages[0].save_status, "REVIEW")
+        self.assertEqual(state.core.messages[0].text, BODY)
+        self.assertFalse(self.isolated.path.exists())
 
     def test_contact_avatar_is_taken_from_current_scan_not_a_previous_roster(self):
         self.start()
@@ -477,7 +494,8 @@ class CoreFlowTests(unittest.TestCase):
         self.runtime.export(report, "detection", self.service.detection_id, {})
         with zipfile.ZipFile(report) as archive:
             self.assertTrue(archive.namelist())
-            self.assertFalse(any(name.endswith(".png") for name in archive.namelist()))
+            self.assertTrue(any(name.endswith("-masked.png") for name in archive.namelist()))
+            self.assertFalse(any(name.endswith(("-original.png", "-annotated.png")) for name in archive.namelist()))
 
     def test_repeated_observation_of_same_task_does_not_add_messages(self):
         self.start()

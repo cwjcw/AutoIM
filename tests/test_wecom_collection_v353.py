@@ -133,13 +133,15 @@ class VisualEvidenceTests(TestCase):
         selected = original.contacts[1]
         title = (TextSpan(selected.display_name, Box(0, 0, 70, 25), .99),
                  TextSpan("@示例商贸", Box(73, 3, 130, 23), .99))
-        matching = (replace(selected, peer_type="EXTERNAL_WECOM", identity_labels=("示例商贸",)),)
-        conflict = (replace(selected, peer_type="EXTERNAL_WECOM", identity_labels=("另一机构",)),)
-        self.assertFalse(compare_conversation(title, matching, VisualThresholds()).title_name_reliable)
+        matching = (replace(selected, display_name=selected.display_name + "@示例商贸",
+                            peer_type="EXTERNAL_WECOM", identity_labels=("示例商贸",)),)
+        conflict = (replace(selected, display_name=selected.display_name + "@另一机构",
+                            peer_type="EXTERNAL_WECOM", identity_labels=("另一机构",)),)
+        self.assertTrue(compare_conversation(title, matching, VisualThresholds()).title_name_reliable)
         self.assertEqual(compare_conversation(title, matching, VisualThresholds(), multi_feature=True).match_status,
                          "VISUAL_MATCH")
         self.assertEqual(compare_conversation(title, conflict, VisualThresholds(), multi_feature=True).match_status,
-                         "UNKNOWN")
+                         "CONVERSATION_MISMATCH")
 
 
 class IsolatedHistoryTests(TestCase):
@@ -151,9 +153,10 @@ class IsolatedHistoryTests(TestCase):
         self.template = analyze_read(sample(selected=1), "synthetic-task", "合成会话", 1, "", verified=True,
                                      badge_cleared=True, refreshed=True)
 
-    def save(self, entries, *, time="今天 16:54", gaps=(), check=lambda: None):
+    def save(self, entries, *, time="今天 16:54", gaps=(), check=lambda: None, contact="合成会话"):
         messages = tuple(replace(self.template.messages[0], sequence=i, text=body, direction=direction, time=time,
-                                 quality=quality) for i, (body, direction, quality) in enumerate(entries, 1))
+                                 quality=quality, contact=contact)
+                         for i, (body, direction, quality) in enumerate(entries, 1))
         return save_visible(self.store, ACCOUNT, replace(self.template, messages=messages, gaps=gaps),
                             "CONTACT", NOW, "synthetic-run", check)
 
@@ -182,6 +185,30 @@ class IsolatedHistoryTests(TestCase):
         self.assertEqual([r[0] for r in self.rows()], ["开场", "重复", "重复"])
         result = self.save([first, repeated, repeated])
         self.assertEqual((result.existing, result.new), (3, 0))
+
+    def test_same_base_names_use_three_histories_and_never_deduplicate_across_suffixes(self):
+        entries = [("共同文字", "INBOUND", "RELIABLE"), ("第二条", "OUTBOUND", "RELIABLE")]
+        for title in ("合成会话", "合成会话@微信", "合成会话@演示机构"):
+            self.assertEqual(self.save(entries, contact=title).first, 2)
+        result = self.save([*entries, ("新增", "INBOUND", "RELIABLE")], contact="合成会话@微信")
+        self.assertEqual((result.new, result.existing), (1, 2))
+        with self.store.transaction() as db:
+            self.assertEqual(dict(db.execute("SELECT c.display_name, COUNT(m.id) FROM conversations c JOIN messages m "
+                                             "ON c.id=m.conversation_id GROUP BY c.id").fetchall()),
+                             {"合成会话": 2, "合成会话@微信": 3, "合成会话@演示机构": 2})
+
+    def test_legacy_bare_name_history_is_retained_and_never_linked_without_evidence(self):
+        entries = [("原序列", "INBOUND", "RELIABLE")]
+        self.save(entries)
+        with self.store.transaction() as db:
+            previous_id = db.execute("SELECT id FROM conversations").fetchone()[0]
+            db.execute("UPDATE conversations SET evidence='VISUAL_MULTI_EVIDENCE' WHERE id=?", (previous_id,))
+        result = self.save(entries)
+        self.assertEqual((result.first, result.existing), (1, 0))
+        retained = self.store.browse(ACCOUNT.profile)["conversations"]
+        self.assertEqual(len(retained), 2)
+        self.assertEqual(next(row for row in retained if row["id"] == previous_id)["last_status"], "旧版基础姓名 · 待复核")
+        self.assertEqual(self.store.browse(ACCOUNT.profile, previous_id)["messages"][0]["body"], "原序列")
 
     def test_repeated_weak_single_message_cannot_prove_continuity(self):
         self.save([("相同", "INBOUND", "RELIABLE")], time="")

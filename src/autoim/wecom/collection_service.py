@@ -20,8 +20,9 @@ from autoim.calibration import CalibrationStore
 from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
+from autoim.wecom.collection_evidence import contact_scan, message_evidence, rect, title_evidence
 from autoim.wecom.collection_incremental import CoreAccount, attach_times, save_visible
-from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, row_target
+from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, isolated_row, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
 from autoim.wecom.collection_runtime import safe_reason
@@ -219,6 +220,7 @@ class _Target:
     avatar: str
     blockers: tuple[str, ...]
     skip_reason: str = ""
+    duplicate_name: bool = False
 
     @property
     def scope_decision(self):
@@ -239,7 +241,7 @@ class _Target:
     @property
     def key(self) -> str:
         labels = "|".join(map(name_key, self.row.identity_labels))
-        if not self.row.name_reliable and self.row.geometry_reliable:
+        if self.duplicate_name or not self.row.name_reliable and self.row.geometry_reliable:
             return f"GEOMETRY|{self.row.box.left}|{self.row.box.top}|{self.avatar}|{self.name}"
         return f"{self.name}|{self.avatar}|{self.row.peer_type}|{labels}"
 
@@ -271,23 +273,29 @@ def _core_read_rank(analysis):
             -len(analysis.gaps), analysis.latest != "UNKNOWN", len(analysis.messages))
 
 
-def unread_targets(observation: VisualObservation, scope: CollectionScope | None = None) -> tuple[_Target, ...]:
+def unread_targets(observation: VisualObservation, scope: CollectionScope | None = None, *,
+                   allow_duplicate=False) -> tuple[_Target, ...]:
     """B2 is the source, including muted rows and undifferentiated red dots."""
     if observation.page != "MESSAGES_CANDIDATE" or observation.layout.get("B2") is None:
         return ()
-    names = Counter(name_key(row.display_name) for row in observation.contacts if row.display_name)
+    names = Counter(name_key(row.display_name) for row in observation.contacts if row.name_reliable and row.display_name)
     targets = []
     for row in observation.contacts:
         if not row.has_unread_indicator:
             continue
         name = name_key(row.display_name)
+        duplicate = names[name] > 1
+        physical = isolated_row(row, observation.contacts)
+        duplicate_read = allow_duplicate and duplicate and row.geometry_reliable and physical
         geometric_target = (row.geometry_reliable and row.status == "NAME_UNCERTAIN" and
                             (row.activity_time_reliable or row.boundary_source == "GRAY_DIVIDERS") and
                             row.badge_kind in ("NORMAL_NUMBER", "SMALL_RED") and
                             not name.startswith(("折叠", "新的联系", "消息管理")))
         checks = (
             (row.kind not in ("CONTACT", "GROUP_CANDIDATE"), "未知或未核实的会话入口类型"),
-            (not geometric_target and (names[name] != 1 or not row.name_reliable), "联系人身份重复或姓名不可靠"),
+            (duplicate and not duplicate_read or (not row.name_reliable or not name) and not geometric_target,
+             "完整名称重复且行不可独立定位" if duplicate else "完整名称未确认"),
+            (allow_duplicate and not physical, "未读徽标与联系人行重复分割或归属不唯一"),
             (row.status != "CANDIDATE" and not geometric_target, "联系人行部分可见或状态不可靠"),
             (scope is not None and not scope.muted and row.is_muted is None, "静音状态无法确认"),
             (not geometric_target and row.avatar is None and row.peer_type == "UNKNOWN"
@@ -300,7 +308,7 @@ def unread_targets(observation: VisualObservation, scope: CollectionScope | None
         )
         blockers = tuple(reason for failed, reason in checks if failed)
         skip = (scope or CollectionScope(muted=True)).exclusion(row)
-        targets.append(_Target(row, name, avatar_key(observation, row), blockers, skip))
+        targets.append(_Target(row, name, avatar_key(observation, row), blockers, skip, duplicate))
     return tuple(targets)
 
 
@@ -369,6 +377,18 @@ def _verify_transition(before: VisualObservation, after: VisualObservation, targ
 
 
 def _core_selection_evidence(before, after, target, refreshed):
+    if target.duplicate_name:
+        selected = [row for row in after.contacts if row.is_selected is True]
+        if (len(selected) != 1 or not refreshed or after.conversation.match_status != "VISUAL_MATCH"
+                or name_key(after.conversation.title) != target.name or not after.conversation.title_name_reliable
+                or not selected[0].name_reliable or name_key(selected[0].display_name) != target.name
+                or not selected[0].geometry_reliable or not selected[0].box.contains(target.row.box.center)
+                or selected[0].has_unread_indicator or selected[0].badge is not None):
+            return "REPEATED_NAME_ROW_UNVERIFIED", None
+        distance = avatar_distance(before, target.row, after, selected[0])
+        if distance is not None and distance > 22:
+            return "AVATAR_CONFLICT", distance
+        return "CLICK_REPEATED_FULL_NAME_ROW", distance
     if _matches_target(after, target):
         row = next(row for row in after.contacts if name_key(row.display_name) == target.name)
         distance = avatar_distance(before, target.row, after, row)
@@ -385,9 +405,6 @@ def _core_selection_evidence(before, after, target, refreshed):
             or rows[0].is_selected is not True or rows[0].has_unread_indicator or rows[0].badge is not None):
         return "TRANSITION_EVIDENCE_MISSING", None
     row = rows[0]
-    if row.peer_type == target.row.peer_type == "PERSONAL_WECHAT":
-        # Both labels have already been parsed as the same known peer type.
-        target = replace(target, row=replace(target.row, identity_labels=row.identity_labels))
     if not _matches_target(after, target, avatar_corroborated=True):
         return "NAME_ROW_OR_PEER_EVIDENCE_CONFLICT", None
     distance = avatar_distance(before, target.row, after, row)
@@ -1312,7 +1329,7 @@ class CollectionService:
             raise NavigationPaused("预检与 OCR 截图窗口身份或坐标系不一致", health=health)
 
     def _record_b2_result(self, raw, attempted_at, *, blocked_reason=""):
-        observed = unread_targets(raw, self.scope)
+        observed = unread_targets(raw, self.scope, allow_duplicate=self._core is not None)
         skipped = tuple(target for target in observed if target.skip_reason)
         targets = tuple(target for target in observed if not target.skip_reason)
         unowned = tuple(item for item in raw.b2_badges if not any(
@@ -1803,10 +1820,35 @@ class CollectionService:
     def _core_event(self, code, task=None, result="", **details):
         if task:
             details["core_task"] = task.id
+            details["scan"] = task.scan_id
             details["target_id"] = blake2s((self._run_id + task.target.key).encode(), digest_size=8).hexdigest()
         stage = ("CORE" if code in ("TARGET_COMPLETED", "TARGET_PARTIAL", "TARGET_FAILED",
                                     "CORE_WINDOW_IDENTITY_CHANGED") else "CORE_EVIDENCE")
-        self._record(stage, code, result, details=details, task_id=task.id if task else "")
+        return self._record(stage, code, result, details=details, task_id=task.id if task else "")
+
+    def _keep_core_evidence(self, kind, raw, data, regions, *, task=None, task_id="", scan="", source_event=""):
+        if not self.runtime or not self._core:
+            return ""
+        return self.runtime.keep_visual(self._run_id, task.id if task else task_id,
+                                        task.scan_id if task else scan, kind, raw, data, regions,
+                                        source_event=source_event)
+
+    def _keep_core_failure(self, reason, task=None):
+        run = self._core
+        if not self.runtime:
+            return
+        raw, frame = run.evidence_raw, run.evidence_frame
+        if frame is not None and (raw is None or raw.frame is not frame):
+            raw = VisualObservation(frame, detect_layout(frame.pixels, {}, VisualThresholds()), "CAPTURE_ONLY")
+        if raw is None and task:
+            raw = task.before
+        if raw is not None:
+            data, marks = title_evidence(raw)
+            data["failure_reason"] = safe_reason(reason)
+            self._keep_core_evidence("failure", raw, data,
+                                     [("b2", raw.layout.get("B2"), []), ("c1", raw.layout.get("C1"), marks),
+                                      ("c2", raw.layout.get("C2"), [])] if task and task.clicked_at
+                                     else [("b2", raw.layout.get("B2"), [])], task=task)
 
     def _invalidate_core(self, reason):
         run = self._core
@@ -1874,6 +1916,7 @@ class CollectionService:
         run.navigation_task = None
         missing_read = bool(task.clicked_at and code != "TARGET_COMPLETED")
         if code != "TARGET_COMPLETED":
+            self._keep_core_failure(reason, task)
             self._core_failure_crop(task, raw, analysis)
         result = {"TARGET_COMPLETED": "AUTO_PASS", "TARGET_PARTIAL": "PARTIAL", "TARGET_FAILED": "FAILED"}[code]
         run.clock.complete(result, reason, clicked=bool(task.clicked_at), ocr_completed=bool(analysis))
@@ -1908,28 +1951,40 @@ class CollectionService:
     def _core_persist(self, task, raw, analysis, *, allow):
         run = self._core
         at = task.read_at or raw.frame.captured_at
+        if task.target.duplicate_name:
+            reason = "DUPLICATE_FULL_NAME_HISTORY_AMBIGUOUS"
+            event = self._core_event("CORE_DB_NOT_SAVED", task, "PARTIAL", reason=reason)
+            review = tuple(replace(item, collection_status="REVIEW", save_status="REVIEW")
+                           for item in attach_times(analysis.messages, at, recent=False))
+            self._keep_core_database(task, raw, review, {"committed": False, "reason": reason}, event)
+            self._core_state(review_messages=run.view.review_messages + len(review))
+            return replace(analysis, messages=review)
         if not self._core_account or not task.verified or not allow:
             if self._isolate_core_reads:
                 reason = "DEFAULT_ACCOUNT_UNAVAILABLE" if not self._core_account else "CAPTURE_EXPIRED_OR_UNVERIFIED"
-                self._core_event("CORE_DB_NOT_SAVED", task, "PARTIAL", reason=reason)
+                event = self._core_event("CORE_DB_NOT_SAVED", task, "PARTIAL", reason=reason)
+                self._keep_core_database(task, raw, analysis.messages, {"committed": False, "reason": reason}, event)
             return replace(analysis, messages=attach_times(analysis.messages, at, recent=analysis.latest != "UNKNOWN"))
         try:
             result = save_visible(self.test_store, self._core_account, analysis, task.conversation_kind, at,
                                   self._run_id, self._core_check)
         except (TestDeadline, sqlite3.Error, OSError, ValueError) as exc:
-            self._core_event("CORE_DB_SAVE_FAILED", task, "FAILED", reason=type(exc).__name__)
+            reason = type(exc).__name__
+            event = self._core_event("CORE_DB_SAVE_FAILED", task, "FAILED", reason=reason)
             self._core_state(save_failures=run.view.save_failures + 1)
             if isinstance(exc, TestDeadline):
                 run.clock.complete("TIMEOUT", str(exc))
-            return replace(analysis, messages=tuple(replace(item, save_status="FAILED")
-                                                    for item in attach_times(analysis.messages, at, recent=False)))
+            failed = tuple(replace(item, save_status="FAILED") for item in attach_times(analysis.messages, at, recent=False))
+            self._keep_core_database(task, raw, failed, {"committed": False, "reason": reason}, event)
+            return replace(analysis, messages=failed)
         except CancelledError:
             return analysis
-        self._core_event("CORE_DB_COMMITTED", task, "AUTO_PASS", first=result.first, new=result.new,
-                         existing=result.existing, review=result.uncertain, history=result.historical,
-                         visible=len(result.messages), overlap=result.overlap, gap=result.gap,
-                         anchor_status=result.anchor_status, had_anchor=result.had_anchor,
-                         anchor_updated=result.anchor_updated)
+        details = dict(first=result.first, new=result.new, existing=result.existing, review=result.uncertain,
+                       history=result.historical, visible=len(result.messages), overlap=result.overlap, gap=result.gap,
+                       anchor_status=result.anchor_status, had_anchor=result.had_anchor, anchor_updated=result.anchor_updated)
+        event = self._core_event("CORE_DB_COMMITTED", task, "AUTO_PASS", **details)
+        self._keep_core_database(task, raw, result.messages, {**details, "committed": True,
+                                                              "previous_anchor": result.previous_anchor}, event)
         self._core_state(first_saved=run.view.first_saved + result.first, new_saved=run.view.new_saved + result.new,
                          existing=run.view.existing + result.existing, review_messages=run.view.review_messages + result.uncertain)
         self._set(saved=self._status.saved + result.first + result.new, added=self._status.added + result.new,
@@ -1937,6 +1992,14 @@ class CollectionService:
                   sqlite_result=f"隔离库已提交 · 首次 {result.first} · 新增 {result.new} · 待复核 {result.uncertain}",
                   last_collected_at=EventTime.now() if result.first or result.new else self._status.last_collected_at)
         return replace(analysis, messages=result.messages)
+
+    def _keep_core_database(self, task, raw, messages, details, event):
+        data, _ = message_evidence(raw, messages, body=False)
+        data.update(database={**details, "key": name_key(messages[0].contact) if messages else ""},
+                    c2_evidence=task.c2_evidence, conversation_verified=task.verified)
+        data.pop("ocr")
+        data.pop("containers")
+        self._keep_core_evidence("database", raw, data, [], task=task, source_event=event)
 
     def _timed_core_event(self, code, result, details):
         stage = f"TEST_STAGE_{details['stage_number']}" if "stage_number" in details else "TEST_RUN"
@@ -1963,6 +2026,7 @@ class CollectionService:
         frame = (run.reader.request("capture", self._core_check, self._cancel) if run.reader else self.capture())
         self._core_check()
         self._validate_read_frame(frame)
+        run.evidence_frame = frame
         return frame
 
     def _core_read_frame(self, frame, operation):
@@ -1994,9 +2058,13 @@ class CollectionService:
         run.independent_reason = ""
         run.clock.complete("PARTIAL" if analysis.gaps or not displayed else "AUTO_PASS",
                            "独立 OCR · 未确认目标未读归属", ocr_completed=True)
-        self._core_event("INDEPENDENT_C2_OBSERVED", result="PARTIAL" if analysis.gaps or not displayed else "AUTO_PASS",
-                         count=len(displayed), completeness=analysis.completeness,
-                         messages=[item.diagnostic() for item in displayed], gaps=analysis.gaps)
+        event = self._record("CORE_EVIDENCE", "INDEPENDENT_C2_OBSERVED",
+                             "PARTIAL" if analysis.gaps or not displayed else "AUTO_PASS", task_id=identifier,
+                             details=dict(count=len(displayed), completeness=analysis.completeness,
+                                          messages=[item.diagnostic() for item in displayed], gaps=analysis.gaps))
+        data, marks = message_evidence(raw, displayed)
+        self._keep_core_evidence("c2", raw, {**data, "conversation_verified": False},
+                                 [("c2", raw.layout.get("C2"), marks)], task_id=identifier, source_event=event)
         if displayed:
             run.clock.begin(7, "展示独立 OCR 正文及未确认归属")
             run.presentation = identifier
@@ -2024,6 +2092,7 @@ class CollectionService:
             run.independent_done = True
             run.independent_reason = ""
         else:
+            self._keep_core_failure(reason)
             run.independent_reason = reason
             run.finish_after_independent = True
         return self._set(status="RUNNING", reason=reason)
@@ -2109,7 +2178,8 @@ class CollectionService:
             task.match_evidence = evidence
             task.match_distance = round(distance, 2) if distance is not None else None
             if evidence not in ("EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR",
-                                "CLICK_TITLE_ROW_BADGE_REFRESH_AVATAR_UNAVAILABLE", "CLICK_GEOMETRY_TITLE_BADGE_REFRESH"):
+                                "CLICK_TITLE_ROW_BADGE_REFRESH_AVATAR_UNAVAILABLE", "CLICK_GEOMETRY_TITLE_BADGE_REFRESH",
+                                "CLICK_REPEATED_FULL_NAME_ROW"):
                 task.previous = None
                 return False
             phase = "WAITING_C2_REFRESH" if not refreshed else "WAITING_C2_STABILITY"
@@ -2120,7 +2190,8 @@ class CollectionService:
                     phase = "C2_WINDOW_OR_OVERLAY_UNVERIFIED"
                     task.previous = None
                     return False
-            row = next(row for row in candidate.contacts if row.is_selected is True) if evidence == "CLICK_GEOMETRY_TITLE_BADGE_REFRESH" else (
+            row = next(row for row in candidate.contacts if row.is_selected is True) if evidence in (
+                "CLICK_GEOMETRY_TITLE_BADGE_REFRESH", "CLICK_REPEATED_FULL_NAME_ROW") else (
                 next(row for row in candidate.contacts if name_key(row.display_name) == task.target.name))
             cleared = not row.has_unread_indicator and row.badge is None
             if not task.verified and (refreshed or row.is_selected is True):
@@ -2155,6 +2226,8 @@ class CollectionService:
         if not self.active:
             return self._status
         self._validate_read_frame(raw.frame, frame)
+        run.evidence_raw = raw
+        run.evidence_frame = raw.frame
         if self._window_probe:
             current = self._window_probe()
             self._record_window(current)
@@ -2190,7 +2263,7 @@ class CollectionService:
         run = self._core
         task.polls += 1
         matching_rows = [row for row in raw.contacts if name_key(row.display_name) == task.target.name]
-        self._core_event("CONVERSATION_SAMPLE", task, poll=task.polls, phase=phase,
+        event = self._core_event("CONVERSATION_SAMPLE", task, poll=task.polls, phase=phase,
                          title_reliable=raw.conversation.title_name_reliable,
                          title_exact=name_key(raw.conversation.title) == task.target.name,
                          matching_rows=len(matching_rows), c2_changed=task.changed,
@@ -2199,6 +2272,16 @@ class CollectionService:
                          avatar_distance=task.match_distance,
                          after_avatar_contour=bool(len(matching_rows) == 1 and matching_rows[0].avatar),
                          ready_for_body=bool(ready))
+        if self.runtime:
+            data, title_marks = title_evidence(raw)
+            selection = [(rect(row.box), "SELECTED") for row in raw.contacts if row.is_selected is True]
+            self._keep_core_evidence("after", raw, {**data, "poll": task.polls, "phase": phase,
+                                     "badge_after": any(row.has_unread_indicator for row in raw.contacts
+                                                        if row.is_selected is True),
+                                     "confirmation": task.match_evidence, "avatar_distance": task.match_distance,
+                                     "before_evidence": task.before_evidence},
+                                     [("b2", raw.layout.get("B2"), selection), ("c1", raw.layout.get("C1"), title_marks),
+                                      ("c2", raw.layout.get("C2"), [])], task=task, source_event=event)
         if ready:
             verified, cleared = ready
             if cleared:
@@ -2212,10 +2295,14 @@ class CollectionService:
                              captured_at=raw.frame.captured_at.isoformat(), poll=task.polls)
             self._core_event("LATEST_POSITION_CHECKED", task,
                              "PARTIAL" if analysis.latest == "UNKNOWN" else "AUTO_PASS", method=analysis.latest)
-            self._core_event("MESSAGE_OCR_COMPLETED", task, "PARTIAL" if analysis.gaps or not analysis.messages else "AUTO_PASS",
+            event = self._core_event("MESSAGE_OCR_COMPLETED", task, "PARTIAL" if analysis.gaps or not analysis.messages else "AUTO_PASS",
                              messages=[item.diagnostic() for item in analysis.messages],
                              completeness=analysis.completeness, gaps=analysis.gaps,
                              recognition_ms=round(raw.recognition_ms))
+            data, marks = message_evidence(raw, attach_times(analysis.messages, raw.frame.captured_at,
+                                                             recent=analysis.latest != "UNKNOWN"))
+            shot = self._keep_core_evidence("c2", raw, {**data, "conversation_verified": True, "gaps": analysis.gaps},
+                                            [("c2", raw.layout.get("C2"), marks)], task=task, source_event=event)
             confirmed = sum(item.unread == "CONFIRMED_UNREAD" for item in analysis.messages)
             self._core_event("UNREAD_RANGE_CHECKED", task, "AUTO_PASS" if confirmed else "PARTIAL", unread_confirmed=confirmed,
                              badge_cleared=cleared, before_count=row.unread_count if row.unread_count_reliable else None)
@@ -2231,6 +2318,7 @@ class CollectionService:
             if analysis.messages and (task.best is None or _core_read_rank(analysis) >= _core_read_rank(task.best)):
                 task.best = analysis
                 task.read_at, task.conversation_kind = raw.frame.captured_at, verified.conversation.conversation_type
+                task.c2_evidence = shot
             if analysis.messages and not analysis.gaps:
                 return self._finish_core_target(task, raw, "TARGET_COMPLETED", analysis=analysis)
             if self._core_account and task.best and repeat:
@@ -2264,9 +2352,20 @@ class CollectionService:
                 run.precheck_failures.pop(key, None)
         foreground_block = "WINDOW_NOT_FOREGROUND" if current and not current.foreground else ""
         targets = self._record_b2_result(raw, attempted, blocked_reason=foreground_block)
-        self._record("B2", "B2_SCANNED", "AUTO_PASS", elapsed_ms=raw.recognition_ms,
+        event = self._record("B2", "B2_SCANNED", "AUTO_PASS", elapsed_ms=raw.recognition_ms,
                      details={"scan": self._status.scan_id, "contacts": len(raw.contacts),
                               "unread": self._status.unread_marker_count})
+        if self.runtime:
+            data, marks = contact_scan(raw, unread_targets(raw, self.scope, allow_duplicate=True),
+                                       self._status.scan_id, foreground_block)
+            box, header = raw.layout.get("B2"), raw.layout.get("C1")
+            regions = [("b2", box, marks)]
+            if box and header and box.top - header.bottom >= round(18 * raw.frame.state.dpi / 96):
+                start = max(header.bottom, box.top - round(100 * raw.frame.state.dpi / 96))
+                regions.append(("b2-edge", Box(box.left, start, box.right, box.top + 2),
+                                [([box.left, box.top, box.right, box.top + 1], "B2 START")]))
+            self._keep_core_evidence("b2", raw, data, regions,
+                                     scan=self._status.scan_id, source_event=event)
         eligible = []
         for target in sorted(targets, key=lambda item: item.row.box.top):
             key, signature = target.key, target.unread_signature
@@ -2330,6 +2429,7 @@ class CollectionService:
             clock.complete()
             clock.begin(4, "核对 B2 实际操作点并点击联系人")
             run.navigation_task = task
+        task.scan_id = self._status.scan_id
         self._set(trace_job=task.id)
         self._core_state(phase="NAVIGATION_PRECHECK", contact=target.row.display_name,
                          before_count=target.unread_signature[0], clicked=False, title_match=False,
@@ -2347,7 +2447,7 @@ class CollectionService:
                          foreground=current.foreground if current else None, window_box=raw.frame.capture.rect)
         try:
             self._core_check()
-            point = row_target(raw, target.row)
+            point = row_target(raw, target.row, allow_duplicate=True)
             if isinstance(self.navigator, CollectionNavigation):
                 self.navigator.verify_normal_message(raw)
             else:
@@ -2355,7 +2455,16 @@ class CollectionService:
             self.permit.ensure_current()
             if not self.active or run.invalidated:
                 return self._status
-            self._core_event("NAVIGATION_PRECHECK", task, "AUTO_PASS", point=point)
+            event = self._core_event("NAVIGATION_PRECHECK", task, "AUTO_PASS", point=point)
+            data, markers = title_evidence(raw)
+            x, y = point
+            plan = {**data, "contact": target.row.display_name, "key": target.name,
+                    "row": target.row.sequence, "row_box": rect(target.row.box), "badge": rect(target.row.badge),
+                    "unread_count": target.unread_signature[0], "point": point}
+            task.before_evidence = self._keep_core_evidence("before", raw, plan,
+                [("b2", target.row.box, [(rect(target.row.box), "TARGET"), (rect(target.row.badge), "BADGE"),
+                                        ([x-4, y-4, x+5, y+5], "POINT")]),
+                 ("c1", raw.layout.get("C1"), markers)], task=task, source_event=event)
             # Keep the native action in the original gateway; capture runs in the read-only process.
             run.task = task
             if isinstance(self.navigator, CollectionNavigation):

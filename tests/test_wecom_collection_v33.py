@@ -61,7 +61,9 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.export(target, "detection", "selected", {"scan": 1})
         with zipfile.ZipFile(target) as bundle:
             self.assertEqual(set(bundle.namelist()), {"autoim.log", "events.jsonl", "environment.json",
-                                                     "diagnostic.json", "flow-report.json"})
+                                                      "diagnostic.json", "flow-report.json", "contacts.json",
+                                                      "message-observations.json", "recognition-report.html",
+                                                      "evidence-manifest.json"})
             raw = bundle.read("events.jsonl").decode("utf-8")
             event = json.loads(raw)
             self.assertEqual(event["detection"], "selected")

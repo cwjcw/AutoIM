@@ -13,6 +13,7 @@ from autoim.wecom.visual_store import database_path, name_key
 from autoim.wecom.visual_time import normalized_time, parse_message_time
 
 SOURCE = "CORE_VISIBLE_INCREMENTAL"
+FULL_NAME_EVIDENCE = "VISUAL_FULL_DISPLAY_NAME"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,7 @@ class SaveVisible:
     gap: bool
     anchor_updated: bool
     had_anchor: bool
+    previous_anchor: str | None
 
 
 def attach_times(messages, observed, *, recent):
@@ -161,15 +163,16 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
             raise ValueError("默认账号记录有冲突")
         aid = aid[0]
         conversations = db.execute("""SELECT id FROM conversations WHERE account_id=? AND name_key=?
-            AND association_status='CORE_NAME_CONFIRMED'""", (aid, name_key(contact))).fetchall()
+            AND association_status='CORE_NAME_CONFIRMED' AND evidence=?""",
+                                   (aid, name_key(contact), FULL_NAME_EVIDENCE)).fetchall()
         if len(conversations) > 1:
             raise ValueError("本地会话记录有冲突")
         cid = conversations[0][0] if conversations else uuid4().hex
         if not conversations:
             db.execute("""INSERT INTO conversations
                 (id,account_id,name_key,display_name,visual_title,kind,association_status,evidence,first_seen,last_seen,last_status)
-                VALUES (?,?,?,?,?,?,'CORE_NAME_CONFIRMED','VISUAL_MULTI_EVIDENCE',?,?,'VISIBLE')""",
-                       (cid, aid, name_key(contact), contact, contact, conversation_kind, at, at))
+                VALUES (?,?,?,?,?,?,'CORE_NAME_CONFIRMED',?,?,?,'VISIBLE')""",
+                       (cid, aid, name_key(contact), contact, contact, conversation_kind, FULL_NAME_EVIDENCE, at, at))
         history = list(reversed(db.execute("""SELECT m.position,m.direction,m.kind,m.sender_name,m.body,m.time_text,t.anchor
             FROM messages m JOIN core_message_times t ON m.id=t.message_id
             WHERE m.conversation_id=? AND m.source=? ORDER BY m.position DESC LIMIT 160""", (cid, SOURCE)).fetchall()))
@@ -220,4 +223,4 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                    for item, decision in zip(messages, decisions))
     return SaveVisible(result, decisions.count("FIRST"), decisions.count("NEW"), decisions.count("EXISTING"),
                        decisions.count("REVIEW"), historical, overlap, anchor_status, gap, newest != last_anchor,
-                       bool(last_anchor))
+                       bool(last_anchor), last_anchor)

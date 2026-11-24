@@ -150,7 +150,8 @@ class CollectionHistory(QDialog):
         choose = QHBoxLayout()
         self.conversation = QComboBox()
         for row in data["conversations"]:
-            self.conversation.addItem(f"{row['display_name']} · {row['kind']} · {row['id'][:8]}", row["id"])
+            review = " · 旧版名称待复核" if row["last_status"] == "旧版基础姓名 · 待复核" else ""
+            self.conversation.addItem(f"{row['display_name']} · {row['kind']} · {row['id'][:8]}{review}", row["id"])
         self.previous = QPushButton("更早 200 条")
         self.latest = QPushButton("最新")
         self.previous.setEnabled(False)
@@ -615,6 +616,10 @@ class VisualCollectionPanel(QWidget):
         choice, accepted = QInputDialog.getItem(self, "导出诊断 ZIP", "日志范围", list(scopes), 0, False)
         if not accepted:
             return
+        modes = ["普通诊断（脱敏）", "包含完整视觉证据（可能含真实联系人和聊天内容）"]
+        export_mode, accepted = QInputDialog.getItem(self, "导出诊断 ZIP", "导出内容", modes, 0, False)
+        if not accepted:
+            return
         filename, _ = QFileDialog.getSaveFileName(self, "导出诊断 ZIP",
                                                  f"AutoIM-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip",
                                                  "诊断 ZIP (*.zip)")
@@ -632,9 +637,12 @@ class VisualCollectionPanel(QWidget):
             snapshot["core"] = {"phase": core.phase, "clicks": core.clicks, "verified": core.verified,
                                 "messages": len(core.messages), "failures": core.failures,
                                 "partial": core.partial, "read_unfinished": core.read_unfinished}
-        self.run_worker(lambda: self.runtime.export(Path(filename), scopes[choice], detection, snapshot),
+        self.run_worker(lambda: self.runtime.export(Path(filename), scopes[choice], detection, snapshot,
+                                                    full_visual=export_mode == modes[1]),
                         on_result=lambda _: self.hotkey_status.setText("诊断 ZIP 已导出"),
-                        on_error=lambda _: self.hotkey_status.setText("导出失败，请选择新的可写文件路径"))
+                        on_error=lambda error: self.hotkey_status.setText(
+                            error.split(": ", 1)[-1] if error.startswith("EvidenceExportError:")
+                            else "导出失败，请检查目标路径和本地证据"))
 
     def _save_scope(self):
         if self.settings is not None:

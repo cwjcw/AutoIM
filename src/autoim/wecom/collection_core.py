@@ -260,6 +260,9 @@ class CoreTask:
     match_distance: float | None = None
     read_at: datetime | None = None
     conversation_kind: str = "UNKNOWN"
+    scan_id: str = ""
+    before_evidence: str = ""
+    c2_evidence: str = ""
 
 
 @dataclass(slots=True)
@@ -288,6 +291,8 @@ class CoreRun:
     mute_trials: Counter = field(default_factory=Counter)
     mute_recent: dict = field(default_factory=dict)
     muted_crops: set = field(default_factory=set)
+    evidence_raw: object | None = None
+    evidence_frame: object | None = None
     view: CoreView = CoreView()
 
     def accept_messages(self, task, analysis):

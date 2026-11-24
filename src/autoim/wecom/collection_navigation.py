@@ -17,7 +17,7 @@ from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.collection_profile import PopupEvidence, ProfileWindows, owner_chain
 from autoim.wecom.collection_profile import ProfileAction, ProfileSurface, changed_regions
 from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client, _render_complete_client, capture_visible_window)
-from autoim.wecom.visual_contacts import ContactObservation, recover_b2_start
+from autoim.wecom.visual_contacts import ContactObservation, name_key, recover_b2_start
 from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_observation import VisualObservation
 from autoim.wecom.window_manager import WeComWindowManager
@@ -162,7 +162,13 @@ def _occlusion_detail(hwnd, root, xy, gui, process) -> str:
     return f"目标屏幕坐标 {xy} · WindowFromPoint 0x{hwnd:X} · " + " · ".join(facts)
 
 
-def row_target(observation: VisualObservation, row: ContactObservation) -> tuple[int, int]:
+def isolated_row(row, rows):
+    return bool(row.badge and all(other is row or (
+        not other.box.contains(row.box.center) and not other.box.contains(row.badge.center)
+        and not row.box.contains(other.box.center)) for other in rows))
+
+
+def row_target(observation: VisualObservation, row: ContactObservation, *, allow_duplicate=False) -> tuple[int, int]:
     """Only an independently recognized and fully visible B2 row is targetable."""
     area = observation.layout.get("B2")
     geometry_only = (row.geometry_reliable and row.status == "NAME_UNCERTAIN"
@@ -170,8 +176,9 @@ def row_target(observation: VisualObservation, row: ContactObservation) -> tuple
     if (observation.page != "MESSAGES_CANDIDATE" or area is None or row not in observation.contacts
             or not (geometry_only or row.status == "CANDIDATE" and row.name_reliable) or row.is_selected is True
             or row.kind not in ("CONTACT", "GROUP_CANDIDATE")
-            or not geometry_only and sum(r.name_reliable and r.display_name.casefold() == row.display_name.casefold()
-                                         for r in observation.contacts) != 1
+            or not geometry_only and not (allow_duplicate and row.geometry_reliable and isolated_row(row, observation.contacts))
+            and sum(r.name_reliable and name_key(r.display_name) == name_key(row.display_name)
+                    for r in observation.contacts) != 1
             or not row.has_unread_indicator or row.badge is None):
         raise NavigationPaused("B2 未读联系人行缺少可靠的可操作边界", local=True)
     box = row.box
@@ -633,7 +640,7 @@ class CollectionNavigation:
         return xy, foreground, self._activity(True)
 
     def select(self, observation: VisualObservation, row: ContactObservation, *, fresh_capture=None, deadline_check=None) -> None:
-        self._act(observation, row_target(observation, row), row.box, scroll=False,
+        self._act(observation, row_target(observation, row, allow_duplicate=deadline_check is not None), row.box, scroll=False,
                   fresh_capture=fresh_capture, deadline_check=deadline_check)
 
     def scroll_visible_contacts(self, observation: VisualObservation) -> None:

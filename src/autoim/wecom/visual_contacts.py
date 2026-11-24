@@ -26,29 +26,51 @@ class VisualName:
     labels: tuple[str, ...] = ()
     peer_type: str = "UNKNOWN"
     issue: str = ""
+    base_name: str = ""
 
 
-def parse_visual_name(raw: str, *, labels_from_title: tuple[str, ...] = (),
-                      allow_short_organization=False) -> VisualName:
-    """Separate only recognized PC identity labels from reliable name text."""
-    name, *inline = raw.replace("＠", "@").split("@")
-    labels = tuple(tag.strip() for tag in inline) + labels_from_title
-    if not labels:
-        return VisualName(raw.strip())
-    tags = tuple(unicodedata.normalize("NFKC", tag) for tag in labels)
-    personal = tuple(tag for tag in tags if "".join(tag.split()) in _PERSONAL_LABELS)
-    if not name.strip() or not all(tags):
-        return VisualName(raw, labels, issue="名称或身份标签不完整")
-    if personal and len(personal) != len(tags):
-        return VisualName(raw, labels, issue="个人微信与其他身份标签冲突")
+def name_key(value: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def parse_visual_name(raw: str) -> VisualName:
+    """Keep the entire visible name. Labels serve only as auxiliary evidence."""
+    full = unicodedata.normalize("NFKC", raw).strip()
+    full = re.sub(r"\s*([@()])\s*", r"\1", full)
+    name, *inline = full.split("@")
+    base = name.strip()
+    if not full or "..." in full or not base or "" in inline:
+        return VisualName(full, tuple(inline), issue="名称或后缀被截断或缺失", base_name=base)
+    if not inline:
+        return VisualName(full, base_name=full)
+    if _contact_kind(full) == "GROUP_CANDIDATE":
+        return VisualName(full, base_name=full)
+    personal = [tag for tag in inline if "".join(tag.split()) in _PERSONAL_LABELS]
+    if personal and len(personal) != len(inline):
+        return VisualName(full, tuple(inline), issue="个人微信与其他身份标签冲突", base_name=base)
     if personal:
-        return VisualName(name.strip(), labels, "PERSONAL_WECHAT")
-    if (len(tags) == 1 and (_ORGANIZATION_LABEL.search(tags[0])
-            or allow_short_organization and re.fullmatch(r"[\u3400-\u9fff]{2,12}", "".join(tags[0].split())))
-            and any(char.isalpha() for char in tags[0])
-            and not re.search(r"[|…]|\.\.\.", tags[0])):
-        return VisualName(name.strip(), labels, "EXTERNAL_WECOM")
-    return VisualName(raw, labels, issue="无法可靠分离身份标签")
+        return VisualName(full, tuple(inline), "PERSONAL_WECHAT", base_name=base)
+    if len(inline) == 1 and (_ORGANIZATION_LABEL.search(inline[0])
+                             or re.fullmatch(r"[\u3400-\u9fff]{2,12}", "".join(inline[0].split()))):
+        return VisualName(full, tuple(inline), "EXTERNAL_WECOM", base_name=base)
+    return VisualName(full, base_name=full)
+
+
+def name_line(spans):
+    """Join neighboring OCR fragments on one baseline, with a gap limit."""
+    if not spans:
+        return (), ()
+    first = min(spans, key=lambda item: (item.box.center[1], item.box.left))
+    same_line = sorted((item for item in spans if
+                        abs(item.box.bottom - first.box.bottom) <= .40 * max(item.box.height, first.box.height)
+                        and abs(item.box.center[1] - first.box.center[1]) <= .55 * max(item.box.height, first.box.height)),
+                       key=lambda item: item.box.left)
+    selected = []
+    for item in same_line:
+        if selected and item.box.left - selected[-1].box.right > max(first.box.height, selected[-1].box.height) * 1.35:
+            break
+        selected.append(item)
+    return tuple(selected), tuple(item for item in spans if item not in selected)
 
 
 ACTIVITY_TIME = re.compile(r"(?:[0-9]+\s*分钟前|(?:[01]?[0-9]|2[0-3]):[0-5][0-9]|"
@@ -87,6 +109,13 @@ class ContactObservation:
     mute_evidence: str = ""
     mute_score: float | None = None
     row_pitch: float | None = None
+    base_name: str = ""
+    name_spans: tuple[TextSpan, ...] = ()
+    name_rejected: tuple[TextSpan, ...] = ()
+    activity_span: TextSpan | None = None
+    divider_y: tuple[int, ...] = ()
+    highlight_box: Box | None = None
+    name_threshold: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,10 +503,15 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
             _, sy = span.box.center
             if not row.top <= sy < row.bottom or span.box.left < text_left:
                 continue
-            if sy >= y and span.box.left >= right_column:
+            if span.box.left >= right_column and (sy >= y or activity_text(span.text)):
                 activities.append(span)
-            elif not (sy < y and span.box.left >= row.left + round(row.width * .8)):
+            elif not (span.box.left >= row.left + round(row.width * .88) and sy >= y):
                 (name if sy < y else preview).append(span)
+        eligible_names = (*name, *(item for item in preview if item.text.lstrip().startswith(("@", "＠"))
+                                  and any(abs(head.box.bottom - item.box.bottom) <= max(head.box.height, item.box.height) * .4
+                                          for head in name)))
+        picked, rejected = name_line(eligible_names)
+        preview = [item for item in preview if item not in picked]
         activity = activities[0] if len(activities) == 1 else None
         row_times = [item for item in time_spans if row.contains(item.box.center)
                      and abs(item.box.center[1] - y - time_offset) <= pitch * .30]
@@ -499,10 +533,12 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
             muted, mute_reason, mute_score = mute_evidence(pixels, row, unit, badge_kind)
         else:
             muted = _muted(pixels, row, unit)
-        good_names = tuple(item for item in name if item.score >= thresholds.text_score)
-        name_text = " ".join(text_lines(good_names))
-        raw_name = " ".join(text_lines(tuple(name)))
-        parsed_name = parse_visual_name(name_text, allow_short_organization=multi_feature)
+        good_names = tuple(item for item in picked if item.score >= thresholds.text_score)
+        raw_name = " ".join(item.text for item in picked)
+        parsed_name = parse_visual_name(raw_name)
+        split_issue = any("@" in item.text or "＠" in item.text for item in rejected)
+        name_issue = parsed_name.issue or ("身份后缀未能归入同一名称行" if split_issue else
+                     "名称文字置信度不足" if len(good_names) != len(picked) else "")
         used.update(good_names)
         used.update(preview)
         if activity:
@@ -512,8 +548,7 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                    and (y - pitch / 2 < region.top - tolerance or y + pitch / 2 > region.bottom + tolerance))
                    or bool(avatar and (avatar.top <= region.top + 1 or avatar.bottom >= region.bottom - 1))
                    or any(item.box.top <= region.top or item.box.bottom >= region.bottom for item in good_names))
-        reliable_name = (bool(name_text) and len(good_names) == len(name) and not parsed_name.issue
-                         and "…" not in name_text and "..." not in name_text
+        reliable_name = (bool(good_names) and not name_issue
                          and all(item.box.top > region.top and item.box.bottom < region.bottom
                                  and item.box.right < region.right - tolerance for item in good_names))
         status = "PARTIALLY_VISIBLE" if partial else "CANDIDATE" if reliable_name else "NAME_UNCERTAIN"
@@ -527,7 +562,7 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
         if partial:
             evidence.append("联系人行触及 B2 视口，字段可能截断")
         if not reliable_name:
-            evidence.append(parsed_name.issue or "名称不完整或缺少可靠 OCR")
+            evidence.append(name_issue or "名称不完整或缺少可靠 OCR")
         if not preview:
             evidence.append("未识别预览字段")
         if badge:
@@ -546,7 +581,7 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                                           status, tuple(evidence), reliable_name, kind,
                                           raw_name=raw_name, identity_labels=parsed_name.labels,
                                           peer_type=parsed_name.peer_type if reliable_name else "UNKNOWN",
-                                          name_issue=parsed_name.issue,
+                                          name_issue=name_issue,
                                           selection_method=method if selected is not None or method == "CONFLICTING_HIGHLIGHT"
                                           else "SUBTLE_ROW_FILL" if i == subtle else "UNKNOWN",
                                           selection_evidence=fills[i],
@@ -554,7 +589,11 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                                           all(item.score >= thresholds.text_score for item in preview),
                                           geometry_reliable=geometry, boundary_source=sources[i] if multi_feature else "",
                                           badge_kind=badge_kind, mute_evidence=mute_reason, mute_score=mute_score,
-                                          row_pitch=pitch if multi_feature else None))
+                                          row_pitch=pitch if multi_feature else None, base_name=parsed_name.base_name,
+                                          name_spans=picked, name_rejected=rejected, activity_span=activity,
+                                          divider_y=tuple(line for line in lines if row.top - 2 <= line <= row.bottom + 2),
+                                          highlight_box=highlight if i == selected else None,
+                                          name_threshold=thresholds.text_score))
     if diagnostics is not None:
         for span in spans:
             if span not in used:
