@@ -966,7 +966,8 @@ def main() -> int:
     runtime = CollectionRuntime()
     collection.enable_runtime(runtime)
     collection.bind_hotkey(window)
-    QTimer.singleShot(0, collection, collection.identify_account)
+    if collection.mode_select.currentData() == "production":
+        QTimer.singleShot(0, collection, collection.identify_account)
     try:
         return app.exec()
     finally:

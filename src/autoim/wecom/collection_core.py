@@ -166,7 +166,7 @@ def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared,
 
 @dataclass(frozen=True, slots=True)
 class CoreView:
-    phase: str = "VALIDATING_ACCOUNT"
+    phase: str = "PREPARING_WINDOW"
     contact: str = ""
     before_count: int | None = None
     clicked: bool = False
@@ -209,18 +209,14 @@ class CoreTask:
 
 @dataclass(slots=True)
 class CoreRun:
-    account: str
-    names: tuple[str, ...]
     failure_crops: bool
     login: object | None = None
     lifetime: tuple | None = None
-    binding_frames: int = 0
     invalidated: bool = False
-    targets: dict = field(default_factory=dict)
     seen: set = field(default_factory=set)
     signatures: dict = field(default_factory=dict)
     discovered_at: dict = field(default_factory=dict)
-    handled: dict = field(default_factory=dict)
+    handled: set = field(default_factory=set)
     precheck_failures: Counter = field(default_factory=Counter)
     cleared: set = field(default_factory=set)
     results_seen: dict = field(default_factory=dict)

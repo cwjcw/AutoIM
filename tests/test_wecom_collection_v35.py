@@ -26,7 +26,7 @@ from test_wecom_visual_capture import fixture, span
 from test_wecom_window_recovery import BASE, health
 
 
-ACCOUNT = "合成授权账号"
+ACCOUNT = "合成登录账号"
 BODY = "合成消息 27Q"
 
 
@@ -77,8 +77,8 @@ class CoreFlowTests(unittest.TestCase):
         self.addCleanup(avatars.stop)
         self.addCleanup(self.service.stop)
 
-    def start(self, *names, failure_crops=False):
-        self.service.start(core_scope=(ACCOUNT, names or (NAMES[1],)), failure_crops=failure_crops)
+    def start(self, *, failure_crops=False):
+        self.service.start(core_test=True, failure_crops=failure_crops)
 
     def poll(self, observation=None, count=1):
         if observation is not None:
@@ -94,9 +94,11 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_core_without_email_reads_b_and_never_opens_profile_or_database(self):
         self.start()
-        self.poll(count=2)
+        first = self.poll()
+        self.assertEqual(first.core.clicks, 1)
+        self.assertIsNotNone(first.b2_scan_completed_at)
         state = self.poll(sample(1, {2: (1, False)}, tone=160), count=2)
-        self.assertEqual((state.account_state, state.core.clicks, state.core.verified), ("TEST_A1_BOUND", 1, 1))
+        self.assertEqual((state.account_state, state.core.clicks, state.core.verified), ("TEST_A1_OBSERVED", 1, 1))
         self.assertEqual([(item.text, item.unread) for item in state.core.messages], [(BODY, "CONFIRMED_UNREAD")])
         self.navigator.profile_start.assert_not_called()
         self.assertFalse(self.formal.path.exists())
@@ -105,7 +107,7 @@ class CoreFlowTests(unittest.TestCase):
         self.service.confirm_core_displayed(state.core.messages)
         events = self.events()
         codes = [event["code"] for event in events]
-        for code in ("UNREAD_DETECTED", "TARGET_AUTHORIZED", "TARGET_SELECTED", "NAVIGATION_PRECHECK", "CONTACT_CLICKED",
+        for code in ("UNREAD_DETECTED", "TARGET_IN_SCOPE", "TARGET_SELECTED", "NAVIGATION_PRECHECK", "CONTACT_CLICKED",
                      "CONVERSATION_CHANGED", "CONVERSATION_VERIFIED", "C2_CAPTURED", "LATEST_POSITION_CHECKED",
                      "MESSAGE_OCR_COMPLETED", "UNREAD_RANGE_CHECKED", "RESULT_DISPLAYED", "TARGET_COMPLETED", "NEXT_TARGET"):
             self.assertIn(code, codes)
@@ -132,35 +134,70 @@ class CoreFlowTests(unittest.TestCase):
         self.assertFalse(self.formal.path.exists())
         self.assertFalse(self.isolated.path.exists())
 
-    def test_same_named_rows_are_not_authorized(self):
+    def test_missing_a1_is_diagnostic_and_does_not_block_the_core_read(self):
+        missing = LoginEvidence(reason="合成 A1 OCR 不可用")
+        self.start()
+        first = self.poll(replace(self.before, login=missing))
+        self.assertEqual((first.account_state, first.core.clicks), ("TEST_A1_UNAVAILABLE", 1))
+        result = self.poll(replace(sample(1, tone=135), login=missing), count=2)
+        self.assertEqual(result.core.messages[0].text, BODY)
+        self.assertFalse(self.formal.path.exists())
+        self.assertFalse(self.isolated.path.exists())
+
+    def test_unverified_window_lifetime_blocks_native_input(self):
+        self.start()
+        self.window_generation = None
+        status = self.poll()
+        self.assertIn("WINDOW_STATE_UNCERTAIN", status.reason)
+        self.navigator.select.assert_not_called()
+        self.window_generation = 1
+        self.assertEqual(self.poll().core.clicks, 1)
+
+    def test_same_named_rows_are_not_clicked(self):
         self.start()
         original = self.before.contacts
         duplicate = replace(original[2], display_name=original[1].display_name)
         self.poll(replace(self.before, contacts=(*original[:2], duplicate)), count=2)
         self.navigator.select.assert_not_called()
 
-    def test_changed_avatar_cannot_rebind_authorized_name(self):
+    def test_contact_avatar_is_taken_from_current_scan_not_a_previous_roster(self):
         self.start()
-        self.poll(sample(), count=2)
+        self.poll(sample())
         with patch("autoim.wecom.collection_service.avatar_key", side_effect=lambda _, row: "new-" + row.display_name):
-            self.poll(self.before)
-        self.navigator.select.assert_not_called()
+            status = self.poll(self.before)
+        self.assertEqual(status.core.clicks, 1)
+        self.assertEqual(self.service._core.task.target.avatar, "new-" + NAMES[1])
 
-    def test_unauthorized_target_and_unknown_muted_status_are_not_clicked(self):
-        self.start(NAMES[1])
+    def test_unknown_muted_status_is_skipped_and_next_in_scope_is_clicked(self):
+        self.start()
         rows = self.before.contacts
-        self.poll(replace(self.before, contacts=(rows[0], replace(rows[1], is_muted=None), rows[2])), count=2)
+        status = self.poll(replace(self.before, contacts=(rows[0], replace(rows[1], is_muted=None), rows[2])))
+        self.assertEqual(status.unknown_muted_unread, 1)
+        self.assertEqual(self.navigator.select.call_args.args[1].display_name, NAMES[2])
+
+    def test_default_scope_skips_muted_and_folded_and_applies_configured_muted(self):
+        self.start()
+        personal, muted, folded = self.before.contacts
+        raw = replace(self.before, contacts=(personal, replace(muted, is_muted=True),
+                                             replace(folded, kind="FOLDED_CHAT_CONTAINER")))
+        status = self.poll(raw)
+        self.assertEqual((status.policy_skipped_unread, status.unsupported_unread), (1, 1))
         self.navigator.select.assert_not_called()
+        self.service.stop()
+        self.service.scope = CollectionScope(muted=True)
+        self.start()
+        self.poll(raw)
+        self.assertEqual(self.navigator.select.call_args.args[1].display_name, NAMES[1])
 
     def test_multiple_contacts_use_fresh_b2_order_and_preserve_message_content(self):
-        self.start(NAMES[1], NAMES[2])
-        self.poll(count=2)
+        self.start()
+        self.poll()
         self.poll(sample(1, {2: (1, False)}, tone=147), count=2)
         next_view = sample(1, {0: (1, False), 2: (1, False)}, tone=147)
         a, b, group = next_view.contacts
-        fresh_group = replace(group, box=b.box, badge=b.badge or Box(b.box.left + 10, b.box.top+7, b.box.left+19, b.box.top+18),
-                              avatar=b.avatar)
-        self.poll(replace(next_view, contacts=(fresh_group, a)))
+        fresh_group = replace(group, box=a.box, badge=a.badge, avatar=a.avatar)
+        fresh_a = replace(a, box=b.box, badge=a.badge.offset(0, b.box.top - a.box.top), avatar=b.avatar)
+        self.poll(replace(next_view, contacts=(fresh_a, fresh_group)))
         result = self.poll(sample(2, tone=101), count=2)
         targets = [call.args[1] for call in self.navigator.select.call_args_list]
         self.assertEqual([row.display_name for row in targets], [NAMES[1], NAMES[2]])
@@ -170,29 +207,30 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_no_initial_highlight_and_no_post_highlight_use_transition_evidence(self):
         self.start()
-        self.poll(sample(unread={1: (1, False)}, highlight=False), count=2)
+        self.poll(sample(unread={1: (1, False)}, highlight=False))
         result = self.poll(sample(1, tone=130, highlight=False), count=2)
         self.assertEqual((result.core.clicks, result.core.verified), (1, 1))
         self.assertEqual(result.core.messages[0].unread, "CONFIRMED_UNREAD")
 
     def test_wrong_conversation_does_not_expose_body_and_next_target_can_proceed(self):
-        self.start(NAMES[1], NAMES[2])
-        self.poll(count=2)
-        failed = self.poll(sample(0, {2: (1, False)}, tone=99), count=MAX_READ_POLLS)
+        self.start()
+        self.poll()
+        failed = self.poll(sample(0, {1: (1, False), 2: (1, False)}, tone=99), count=MAX_READ_POLLS)
         self.assertEqual((failed.core.failures, failed.core.read_unfinished, failed.core.messages), (1, 1, ()))
         self.poll()
         self.assertEqual([call.args[1].display_name for call in self.navigator.select.call_args_list], [NAMES[1], NAMES[2]])
+        self.assertTrue(any(event["details"].get("scope_decision") == "UNREAD_ALREADY_HANDLED" for event in self.events()))
 
     def test_unchanged_c2_never_confirms_after_click(self):
         self.start()
-        self.poll(count=2)
+        self.poll()
         result = self.poll(sample(1), count=MAX_READ_POLLS)
         self.assertEqual((result.core.verified, result.core.read_unfinished), (0, 1))
         self.navigator.select.assert_called_once()
 
     def test_nonconsecutive_correct_title_does_not_establish_stability(self):
         self.start()
-        self.poll(count=2)
+        self.poll()
         self.poll(sample(1, tone=100))
         self.poll(sample(0, tone=100))
         self.assertFalse(self.poll(sample(1, tone=100)).core.messages)
@@ -200,7 +238,7 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_core_retries_ocr_without_reclick_and_preserves_reliable_body_on_incomplete_page(self):
         self.start()
-        self.poll(count=2)
+        self.poll()
         unknown = bubble(view(), "", y=425, kind="UNKNOWN", status="UNCLASSIFIED")
         partial = sample(1, tone=120)
         partial = replace(partial, messages=(*partial.messages, unknown), message_completeness="VISIBLE_MESSAGES_INCOMPLETE")
@@ -211,25 +249,25 @@ class CoreFlowTests(unittest.TestCase):
         self.assertEqual(result.core.completeness, "VISIBLE_MESSAGES_INCOMPLETE")
         self.assertEqual((result.core.phase, result.core.read_unfinished), ("TARGET_PARTIAL", 1))
 
-    def test_window_recreation_and_changed_a1_both_revoke_authorization(self):
+    def test_window_recreation_and_changed_a1_both_stop_navigation(self):
         self.start()
-        self.poll(count=2)
+        self.poll()
         result = self.poll(sample(1, tone=120, avatar="other"))
-        self.assertEqual(result.core.phase, "AUTHORIZATION_INVALID")
+        self.assertEqual(result.core.phase, "WINDOW_IDENTITY_CHANGED")
         self.assertEqual(result.core.read_unfinished, 1)
         self.permit.revoke.assert_called_once()
         self.service.stop()
         self.start()
-        self.poll(self.before)
+        self.poll(sample())
         self.window_generation += 1
         result = self.poll()
-        self.assertEqual(result.core.phase, "AUTHORIZATION_INVALID")
+        self.assertEqual(result.core.phase, "WINDOW_IDENTITY_CHANGED")
         self.navigator.select.assert_called_once()
 
     def test_native_gate_failure_is_bounded_and_next_target_is_attempted(self):
-        self.start(NAMES[1], NAMES[2])
+        self.start()
         self.navigator.select.side_effect = [NavigationPaused("遮挡"), NavigationPaused("用户正在操作"), None]
-        self.poll(count=4)
+        self.poll(count=3)
         self.assertEqual([call.args[1].display_name for call in self.navigator.select.call_args_list],
                          [NAMES[1], NAMES[1], NAMES[2]])
         self.assertEqual(self.service.snapshot().core.failures, 1)
@@ -239,8 +277,8 @@ class CoreFlowTests(unittest.TestCase):
         foreground = health()
         self.service._window_probe = Mock(return_value=background)
         self.start()
-        result = self.poll(count=2)
-        self.assertEqual((result.core.phase, result.core.discovered, result.core.waiting), ("WAITING_FOREGROUND", 1, 1))
+        result = self.poll()
+        self.assertEqual((result.core.phase, result.core.discovered, result.core.waiting), ("WAITING_FOREGROUND", 2, 2))
         self.navigator.select.assert_not_called()
         self.service._window_probe.return_value = foreground
         self.poll(sample(unread={1: (2, False)}))
@@ -266,7 +304,7 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_stop_retains_results_and_clear_only_affects_display(self):
         self.start()
-        self.poll(count=2)
+        self.poll()
         self.poll(sample(1, tone=120), count=2)
         self.service.begin_worker()
         self.service.stop(source="hotkey")
@@ -287,7 +325,7 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_opt_in_failed_title_crop_excluded_from_diagnostics(self):
         self.start(failure_crops=True)
-        self.poll(count=2)
+        self.poll()
         private = self.root / "private-crops"
         with patch("autoim.wecom.collection_service.failure_crop_directory", return_value=private):
             self.poll(sample(0, tone=99), count=MAX_READ_POLLS)
@@ -300,7 +338,7 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_repeated_observation_of_same_task_does_not_add_messages(self):
         self.start()
-        self.poll(count=2)
+        self.poll()
         task = self.service._core.task
         result = self.poll(sample(1, tone=120), count=2)
         self.assertEqual(len(result.core.messages), 1)
@@ -362,9 +400,16 @@ class CoreReadTests(unittest.TestCase):
         gate.assert_called_once()
         self.assertFalse(any(area.region.startswith(("C2", "C3")) for area in raw.ocr_areas))
 
+    def test_header_only_gate_accepts_b2_without_c1_title(self):
+        frame, reader = fixture(title="")
+        raw = observe_frame(frame, {}, reader, message_gate=lambda _: False)
+        self.assertEqual(raw.page, "MESSAGES_CANDIDATE")
+        self.assertFalse(raw.conversation.title_name_reliable)
+        self.assertTrue(any(row.has_unread_indicator for row in raw.contacts))
+
 
 class CorePanelTests(unittest.TestCase):
-    def test_default_gui_requires_explicit_scope_and_displays_ocr_body(self):
+    def test_start_button_uses_core_without_prompt_and_displays_ocr_body(self):
         app = QApplication.instance() or QApplication([])
         service = Mock()
         service.active = False
@@ -373,13 +418,10 @@ class CorePanelTests(unittest.TestCase):
         service.stop.side_effect = lambda **_: setattr(service, "active", False)
         panel = VisualCollectionPanel(Mock(), Mock(return_value=service))
         panel.enable_runtime(Mock())
-        panel.start()
-        service.start.assert_not_called()
-        panel.test_account.setText(ACCOUNT)
-        panel.test_contacts.setText(f"{NAMES[1]}，{NAMES[2]}")
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
-            panel.start()
-        service.start.assert_called_once_with(core_scope=(ACCOUNT, NAMES[1:]), failure_crops=False)
+        with patch.object(QMessageBox, "question") as prompt:
+            panel.start_button.click()
+        prompt.assert_not_called()
+        service.start.assert_called_once_with(core_test=True, failure_crops=False)
         messages = analyze_read(sample(1), "synthetic-task", NAMES[1], 1, BODY,
                                 verified=True, badge_cleared=True, refreshed=True).messages
         panel._render(ScanStatus(core=CoreView(messages=messages)))
@@ -387,6 +429,26 @@ class CorePanelTests(unittest.TestCase):
         self.assertEqual(panel.core_table.item(0, 7).text(), "已确认未读")
         service.confirm_core_displayed.assert_called_once_with(messages)
         panel.stop()
+        panel.close()
+        app.processEvents()
+
+    def test_first_hotkey_starts_core_without_prompt_and_second_stops(self):
+        app = QApplication.instance() or QApplication([])
+        service = Mock()
+        service.active = False
+        service.snapshot.return_value = ScanStatus("RUNNING")
+        service.start.side_effect = lambda **_: setattr(service, "active", True)
+        service.stop.side_effect = lambda **_: setattr(service, "active", False)
+        panel = VisualCollectionPanel(Mock(), Mock(return_value=service))
+        panel.enable_runtime(Mock())
+        with patch.object(QMessageBox, "question") as prompt:
+            panel.toggle()
+            self.assertTrue(panel._timer.isActive())
+            panel.toggle()
+        prompt.assert_not_called()
+        service.start.assert_called_once_with(core_test=True, failure_crops=False)
+        service.stop.assert_called_once_with(source="hotkey")
+        self.assertFalse(panel._timer.isActive())
         panel.close()
         app.processEvents()
 

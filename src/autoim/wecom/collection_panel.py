@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections import deque
 from datetime import datetime
@@ -14,14 +13,14 @@ from dataclasses import replace
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl, QSettings, QTimer, Qt, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPlainTextEdit,
-                               QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+                               QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from autoim import __version__
 from autoim.vision_widgets import fit_dialog_to_screen
 from autoim.wecom.collection_core import failure_crop_directory
 from autoim.wecom.collection_notifications import CollectionNotifier
 from autoim.wecom.collection_hotkey import CollectionHotkey
-from autoim.wecom.collection_runtime import safe_reason
+from autoim.wecom.collection_runtime import PC_VERSION, safe_reason
 from autoim.wecom.collection_service import CollectionScope, CollectionService, ScanStatus
 from autoim.wecom.visual_diagnostics import DiagnosticCopyControls
 from autoim.wecom.visual_store import VisualStore
@@ -292,19 +291,6 @@ class VisualCollectionPanel(QWidget):
             ranges.addWidget(check)
         ranges.addStretch(1)
         layout.addLayout(ranges)
-        self.test_scope = QWidget(self)
-        scope_layout = QVBoxLayout(self.test_scope)
-        scope_layout.setContentsMargins(0, 0, 0, 0)
-        self.test_account = QLineEdit()
-        self.test_account.setPlaceholderText("测试企业微信账号的显示姓名")
-        self.test_contacts = QLineEdit()
-        self.test_contacts.setPlaceholderText("授权的 B2 测试会话准确名称，用逗号或分号分隔")
-        for label, field in (("测试账号", self.test_account), ("本轮授权会话", self.test_contacts)):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            row.addWidget(field)
-            scope_layout.addLayout(row)
-        layout.addWidget(self.test_scope)
         diagnostics, self.diagnostics_toggle, details = collapsible("运行诊断", self)
         tools, self.advanced_toggle, advanced = collapsible("高级工具", self)
         self.advanced_tools = tools
@@ -416,7 +402,7 @@ class VisualCollectionPanel(QWidget):
             button.clicked.connect(lambda _, tab=i: self._show_history(tab))
             history.addWidget(button)
         history.addStretch(1)
-        layout.addLayout(history)
+        advanced.addLayout(history)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
@@ -706,8 +692,6 @@ class VisualCollectionPanel(QWidget):
         test = bool(self.runtime and self.mode_select.currentData() == "test")
         self.start_button.setEnabled(enabled)
         self.mode_select.setEnabled(enabled)
-        self.test_scope.setVisible(test)
-        self.test_scope.setEnabled(enabled)
         self.core_results.setVisible(test or self._status.core is not None)
         self.failure_crops.setVisible(test)
         self.failure_crops.setEnabled(enabled)
@@ -753,19 +737,10 @@ class VisualCollectionPanel(QWidget):
         if self.busy or not self._available or self._asking_permission:
             return
         core = bool(self.runtime and self.mode_select.currentData() == "test" and not advanced)
-        account = self.test_account.text().strip()
-        names = tuple(dict.fromkeys(value.strip() for value in re.split(r"[,，;；]", self.test_contacts.text()) if value.strip()))
-        if core and (not account or not names or len(names) > 20):
-            self.compact_status.setText("请先输入测试账号显示姓名及 1–20 个获授权的测试会话名称。")
-            return
-        if core or advanced or not self._authorized:
+        if not core and (advanced or not self._authorized):
             self._asking_permission = True
             try:
-                if core:
-                    description = (f"测试账号 {account}\n允许打开的测试会话 {', '.join(names)}\n"
-                                   "允许 AutoIM 恢复、最大化并激活企业微信窗口。打开授权会话可能清除未读。"
-                                   "测试消息仅显示在本轮内存。请确认你有权读取这些测试会话。")
-                elif advanced == "email":
+                if advanced == "email":
                     description = ("允许 AutoIM 恢复、最大化并激活当前测试账号的企业微信，打开该账号的个人资料以单独核验邮箱。"
                                    "该工具只用于你有权操作的测试账号。")
                 elif advanced == "isolated":
@@ -783,17 +758,17 @@ class VisualCollectionPanel(QWidget):
                 self._asking_permission = False
             if result != QMessageBox.StandardButton.Yes:
                 return
-            if not core and not advanced:
+            if not advanced:
                 self._authorized = True
         service = self._get_service()
-        if self.settings is not None:
+        if core or self.settings is not None:
             service.scope = CollectionScope(**{key: self.scope_checks[key].isChecked()
                                                for key in ("personal", "group", "muted")})
         if self._hotkey and self._hotkey.active_id is not None:
             self.hotkey_status.clear()
         try:
             if core:
-                service.start(core_scope=(account, names), failure_crops=self.failure_crops.isChecked())
+                service.start(core_test=True, failure_crops=self.failure_crops.isChecked())
             elif advanced == "email":
                 service.start(email_test_only=True)
             else:
@@ -812,7 +787,7 @@ class VisualCollectionPanel(QWidget):
         self._pulse.start()
         if not core:
             self._notifier.announce("自动采集已启动", "正在准备企业微信窗口并核验账号")
-        self._timer.start(2500)
+        self._timer.start(0 if core else 2500)
 
     def stop(self):
         self._pending_assist = None
@@ -928,7 +903,7 @@ class VisualCollectionPanel(QWidget):
                 self._profile_assist(action)
                 return
             self._pending_assist = None
-            if not result.core or result.core.phase != "AUTHORIZATION_INVALID":
+            if not result.core or result.core.phase != "WINDOW_IDENTITY_CHANGED":
                 fast = result.core and result.core.clicked and result.core.risk == "CLICKED_AWAITING_READ"
                 delay = CORE_READ_DELAY_MS if fast else PAUSE_RECHECK_MS if result.status == "PAUSED" else SCAN_DELAY_MS
                 self._timer.start(delay)
@@ -989,9 +964,10 @@ class VisualCollectionPanel(QWidget):
         self._render_core(result.core)
         self.assistance_button.setVisible(bool(result.assist or result.failure_at))
         self.isolated_button.setVisible(bool(self.runtime and result.isolated_choices))
-        self.account_label.setText(
-            f"当前账号 {result.account_name or '—'} · 邮箱 {result.account_email or '—'} · "
-            f"{result.account_reason or '等待识别'}")
+        account = f"当前账号 {result.account_name or '—'}"
+        if result.account_email or self.mode_select.currentData() == "production":
+            account += f" · 邮箱 {result.account_email or '—'}"
+        self.account_label.setText(f"{account} · {result.account_reason or '等待识别'}")
         committed = result.last_collected_at
         mode = "自动采集模式" if self._service and self._service.active else "人工操作模式"
         if result.core:
@@ -1118,7 +1094,7 @@ class VisualCollectionPanel(QWidget):
     def _report(self, full):
         state = self._status
         candidates = str(state.candidates) if state.b2_scan_completed_at else "—"
-        lines = [f"AutoIM {__version__} · PC-V3.5 · WINDOW_VISUAL_OCR",
+        lines = [f"AutoIM {__version__} · {PC_VERSION} · WINDOW_VISUAL_OCR",
                  f"状态 {state.status} · 匹配 {state.match} · {state.reason}",
                  f"候选 {candidates} · 等待 {state.queued} · 完成 {state.completed} · 异常 {state.errors}",
                  f"已保存 {state.saved} · 新增 {state.added} · 重复观察 {state.repeated} · 未确认 {state.uncertain}"]

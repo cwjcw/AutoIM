@@ -396,8 +396,11 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     corroborated = bool(conversation.title and ((composer and composer.send_button)
                        or (search and add and contacts) or unread.entry or conversation.selected_name))
     if message_gate is not None:
+        # B2 can be reliable before any conversation is open. C2 still needs
+        # its own corroboration and the caller's verified-target gate.
+        list_verified = bool(b2 and contacts and (unread.entry or (search and add)))
         header = VisualObservation(frame, layout, "HEADER_ONLY",
-                                   page="MESSAGES_CANDIDATE" if corroborated else "UNKNOWN",
+                                   page="MESSAGES_CANDIDATE" if corroborated or list_verified else "UNKNOWN",
                                    contacts=contacts, conversation=conversation, composer=composer,
                                    search_box=search, add_button=add, global_unread=unread,
                                    ocr_areas=tuple(trace.observations), ocr_status=ocr_status,

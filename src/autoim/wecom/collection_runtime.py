@@ -18,6 +18,8 @@ from uuid import uuid4
 from autoim import __version__
 from autoim.wecom.visual_store import database_path
 
+PC_VERSION = "PC-V3.5.1"
+
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",
     "A1": "可靠识别登录姓名及头像",
@@ -41,7 +43,7 @@ STAGES = {
     "TEST_CONVERSATION": "独立核实授权测试会话",
     "TEST_SAVE": "隔离数据库提交与去重",
     "TEST_NOTIFY": "提交 TEST 通知及人工可见确认",
-    "CORE": "按授权范围发现、导航、读取并展示测试消息",
+    "CORE": "按当前采集范围发现、导航、读取并展示测试消息",
 }
 SUBSTEPS = {
     "WINDOW_LOCATED": ("WINDOW_LOCATE", "定位主窗口"),
@@ -80,7 +82,7 @@ SUBSTEPS = {
     "SQLITE_COMMIT": ("SQLITE_COMMIT", "事务提交与去重"),
     "WINDOWS_NOTIFICATION": ("NOTICE_SUBMIT", "系统通知 API 结果"),
     "POLL_RESUMED": ("POLL_CONTINUE", "持续巡检"),
-    "TARGET_AUTHORIZED": ("CORE_AUTHORIZATION", "复核测试范围"),
+    "TARGET_IN_SCOPE": ("CORE_SCOPE", "核对当前采集范围"),
     "NAVIGATION_PRECHECK": ("CORE_PRECHECK", "导航前安全校验"),
     "CONTACT_CLICKED": ("CORE_CLICK", "实际点击授权目标"),
     "LATEST_POSITION_CHECKED": ("CORE_LATEST", "核查 C2 最新位置"),
@@ -219,7 +221,7 @@ class CollectionRuntime:
             if "reason" in details:
                 details["reason"] = safe_reason(details["reason"])
             event = {"id": uuid4().hex, "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                     "app_version": __version__, "pc_version": "PC-V3.5", "git": self.revision,
+                     "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision,
                      "session": self.session, "detection": detection, "task": task, "mode": mode,
                      "stage": stage, "code": code, "result": result, "level": level, "elapsed_ms": elapsed_ms,
                      "details": details}
@@ -326,7 +328,7 @@ class CollectionRuntime:
                 outcome = "AUTO_PASS" if passed else "PARTIAL"
                 stop.update(status=outcome, final_status=outcome, completed=passed, waiting=False,
                             reason="" if passed else "停止审计缺少必要子步骤证据")
-            return {"version": "PC-V3.5", "git": self.revision, "session": self.session,
+            return {"version": PC_VERSION, "git": self.revision, "session": self.session,
                     "detection": detection, "evidence_scopes": sorted(self.scopes.get(detection, ())),
                     "stop_audit": dict(audit), "stages": stages, "substeps": substeps}
 
@@ -388,7 +390,7 @@ class CollectionRuntime:
                                 copyfileobj(stream, entry)
                         archive.writestr("environment.json", json.dumps({"platform": platform.system(),
                                           "release": platform.release(), "python": platform.python_version(),
-                                          "app_version": __version__, "pc_version": "PC-V3.5", "git": self.revision}))
+                                          "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision}))
                         archive.writestr("diagnostic.json", json.dumps(snapshot, ensure_ascii=False, indent=2))
                         archive.writestr("flow-report.json", json.dumps(self.report(detection), ensure_ascii=False, indent=2))
         except BaseException:
