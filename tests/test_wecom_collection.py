@@ -405,8 +405,11 @@ class ScanWorkflowTests(unittest.TestCase):
         self.assertEqual(result.queued, 0)
 
     def set_unconfirmed_unread(self, *, activity="刚刚", preview="测试预览", count=1, move=0):
+        from autoim.wecom.collection_service import CollectionScope
+
+        self.service.scope = CollectionScope()
         raw = view(unread={1: (count, False)})
-        rows = tuple(replace(row, is_selected=None, activity_text=activity, preview=preview,
+        rows = tuple(replace(row, is_selected=None, is_muted=None, activity_text=activity, preview=preview,
                              box=row.box.offset(0, move)) if i == 1 else replace(row, is_selected=None)
                      for i, row in enumerate(raw.contacts))
         self.raw = replace(raw, contacts=rows)

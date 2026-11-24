@@ -6,7 +6,7 @@ import unittest
 import cv2
 import numpy as np
 
-from autoim.wecom.collection_navigation import NavigationPaused, row_target
+from autoim.wecom.collection_navigation import row_target
 from autoim.wecom.collection_service import unread_targets
 from autoim.wecom.visual_layout import Box
 from autoim.wecom.visual_observation import observe_frame
@@ -52,10 +52,9 @@ class B2SelectionTests(unittest.TestCase):
         self.assertTrue(raw.conversation.title_name_reliable)
         self.assertIn("缺少独立行底证据", raw.conversation.selection_evidence)
         self.assertTrue(all(row.is_selected is None for row in raw.contacts))
-        self.assertTrue(all(target.ambiguous for target in unread_targets(raw)))
+        self.assertTrue(all(not target.ambiguous for target in unread_targets(raw)))
         unread = next(row for row in raw.contacts if row.has_unread_indicator)
-        with self.assertRaises(NavigationPaused):
-            row_target(raw, unread)
+        self.assertTrue(raw.layout.get("B2").contains(row_target(raw, unread)))
 
     def test_same_name_blocks_pale_selection(self):
         raw = self.read_sample((241, 237, 233), same_name=True)

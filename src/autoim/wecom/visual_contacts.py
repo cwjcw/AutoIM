@@ -319,6 +319,10 @@ def _text_row_seeds(positioned: list[tuple[int, Box | None, str]], title_spans: 
 
 
 def _contact_kind(name: str) -> str:
+    if name.strip() == "折叠的聊天":
+        return "FOLDED_CHAT_CONTAINER"
+    if name.strip() in {"新的联系人", "通讯录", "服务通知", "公众号", "企业微信助手", "消息管理器"}:
+        return "SPECIAL_ENTRY"
     if re.search(r"机器人|机器人服务|bot\b", name, re.I):
         return "BOT_CANDIDATE"
     if re.search(r"系统[通知消息]+|官方[通知消息]+|企业微信.*团队$", name):

@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThreadPool, Qt, Signal, QTimer
+from PySide6.QtCore import QObject, QSettings, QThreadPool, Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QScrollArea,
     QSpinBox,
-    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -86,19 +85,6 @@ def label(text: str, style: str = "") -> QLabel:
     return widget
 
 
-def card(title: str, value: str, note: str = "") -> tuple[QFrame, QLabel, QLabel]:
-    frame = QFrame()
-    frame.setObjectName("card")
-    layout = QVBoxLayout(frame)
-    layout.setContentsMargins(20, 18, 20, 18)
-    layout.addWidget(label(title, "color:#8290a5;font-size:13px;font-weight:600"))
-    value_label = label(value, "font-size:24px;font-weight:700;color:#172235")
-    layout.addWidget(value_label)
-    note_label = label(note, "color:#8290a5;font-size:12px")
-    layout.addWidget(note_label)
-    return frame, value_label, note_label
-
-
 class MainWindow(QMainWindow):
     def __init__(self, log_bus: LogBus) -> None:
         super().__init__()
@@ -121,42 +107,25 @@ class MainWindow(QMainWindow):
         self.status_timer.start()
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        self.setCentralWidget(central)
-
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(220)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(18, 24, 18, 18)
-        side.setSpacing(8)
-        side.addWidget(label("AutoIM", "font-size:24px;font-weight:800;color:#f4f7fb;padding:4px 8px"))
-        side.addWidget(label("桌面自动化工作台", "font-size:12px;color:#90a0b8;padding:0 8px 18px"))
-        self.nav_buttons: list[QPushButton] = []
-        self.stack = QStackedWidget()
-        pages = [self._home_page(), self._messages_page(), self._wecom_page(), self._simple_page("AI 设置", "本阶段不包含 AI 或 LLM 能力。"), self._simple_page("系统设置", "当前版本使用默认路径与日志设置。"), self._logs_page()]
-        nav_names = ["首页", "消息", "企业微信", "AI 设置", "系统设置", "日志"]
-        for index, name in enumerate(nav_names):
-            button = QPushButton(name)
-            button.setObjectName("navButton")
-            button.setCheckable(True)
-            button.clicked.connect(lambda checked=False, i=index: self.show_page(i))
-            self.nav_buttons.append(button)
-            side.addWidget(button)
-            self.stack.addWidget(pages[index])
-        side.addStretch(1)
-        side.addWidget(label(f"Windows · v{__version__}", "font-size:11px;color:#8290a5;padding:8px"))
-        root.addWidget(sidebar)
-        content = QFrame()
-        content.setObjectName("content")
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(34, 28, 34, 28)
-        content_layout.addWidget(self.stack)
-        root.addWidget(content, 1)
-        self.show_page(0)
+        self.settings = QSettings("AutoIM", "AutoIM")
+        page, layout = self._page_shell("AutoIM", "企业微信消息采集")
+        layout.setContentsMargins(28, 22, 28, 22)
+        layout.setSpacing(12)
+        advanced = self._wecom_page()
+        collection = self.visual_capture_panel.collection_panel
+        self.visual_capture_panel.layout().removeWidget(collection)
+        layout.addWidget(collection)
+        collection.advanced_layout.addWidget(advanced)
+        collection.advanced_layout.addWidget(self._logs_page())
+        self.home_detect_button = self.detect_button
+        self.home_connection = QLabel()
+        self.home_connection_note = QLabel()
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        self.setCentralWidget(scroll)
 
     def _page_shell(self, title: str, subtitle: str) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
@@ -166,37 +135,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(label(title, "font-size:27px;font-weight:750;color:#172235"))
         layout.addWidget(label(subtitle, "font-size:13px;color:#7c899c"))
         return page, layout
-
-    def _home_page(self) -> QWidget:
-        page, layout = self._page_shell("首页", "企业微信连接与本地 Agent 运行概览")
-        cards = QHBoxLayout()
-        c, self.home_connection, self.home_connection_note = card("企业微信连接", "未检测", "等待检测")
-        cards.addWidget(c)
-        c, self.home_agent, _ = card("Agent 运行状态", "未启动", "当前阶段仅提供桌面检测能力")
-        cards.addWidget(c)
-        c, self.home_messages, _ = card("消息数量", "0", "当前阶段未读取消息")
-        cards.addWidget(c)
-        layout.addLayout(cards)
-        panel = QFrame(); panel.setObjectName("panel")
-        panel_layout = QVBoxLayout(panel); panel_layout.setContentsMargins(22, 20, 22, 20)
-        panel_layout.addWidget(label("快速开始", "font-size:16px;font-weight:700;color:#172235"))
-        panel_layout.addWidget(label("前往「企业微信」页面检测客户端进程、主窗口和 UI Automation 可访问性。", "color:#66758a"))
-        self.home_detect_button = QPushButton("检测企业微信")
-        self.home_detect_button.setObjectName("primaryButton")
-        self.home_detect_button.clicked.connect(self.start_detection)
-        panel_layout.addWidget(self.home_detect_button, 0, Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(panel)
-        layout.addStretch(1)
-        return page
-
-    def _messages_page(self) -> QWidget:
-        page, layout = self._page_shell("消息", "消息读取功能不在当前阶段范围内")
-        panel = QFrame(); panel.setObjectName("panel")
-        box = QVBoxLayout(panel); box.setContentsMargins(22, 22, 22, 22)
-        box.addWidget(label("消息数量：0", "font-size:18px;font-weight:700;color:#172235"))
-        box.addWidget(label("当前版本不会读取消息、监听未读状态或自动回复。", "color:#66758a"))
-        layout.addWidget(panel); layout.addStretch(1)
-        return page
 
     def _wecom_page(self) -> QWidget:
         page, layout = self._page_shell("企业微信", "检测 Windows 客户端，并验证 UI Automation 能力")
@@ -248,7 +186,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(diagnostics_panel)
 
         self.visual_capture_panel = VisualCapturePanel(
-            ROOT / "config" / "wecom-pc-visual-calibration-v12.json", self._run_worker)
+            ROOT / "config" / "wecom-pc-visual-calibration-v12.json", self._run_worker, settings=self.settings)
         layout.addWidget(self.visual_capture_panel)
 
         parse_panel = QFrame(); parse_panel.setObjectName("panel")
@@ -381,12 +319,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(vision_panel)
         self._refresh_calibration_label()
 
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame); scroll.setWidget(page)
-        return scroll
-
-    def _simple_page(self, title: str, text: str) -> QWidget:
-        page, layout = self._page_shell(title, text)
-        layout.addStretch(1)
         return page
 
     def _logs_page(self) -> QWidget:
@@ -395,17 +327,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_output, 1)
         return page
 
-    def show_page(self, index: int) -> None:
-        self.stack.setCurrentIndex(index)
-        for i, button in enumerate(self.nav_buttons):
-            button.setChecked(i == index)
-
     def append_log(self, message: str) -> None:
         if hasattr(self, "log_output"):
             self.log_output.appendPlainText(message)
 
     def closeEvent(self, event) -> None:
         self.visual_capture_panel.stop_monitoring()
+        self.visual_capture_panel.collection_panel.close_hotkey()
         self.status_timer.stop()
         super().closeEvent(event)
 
@@ -1038,6 +966,9 @@ def main() -> int:
     setup_logging(bus)
     window = MainWindow(bus)
     window.show()
+    collection = window.visual_capture_panel.collection_panel
+    collection.bind_hotkey(window)
+    QTimer.singleShot(0, collection, collection.identify_account)
     return app.exec()
 
 

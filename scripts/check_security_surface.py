@@ -26,7 +26,7 @@ _COLLECTOR_FORBIDDEN = frozenset({
 
 
 def inspect_collector_input(path: Path, source: str) -> list[str]:
-    """Keep native collector input confined to the scoped B2 gateway."""
+    """Keep native collector input confined to the B2 and profile mouse gateway."""
     tree = ast.parse(source, filename=str(path))
     checks = []
     navigation = path.name == "collection_navigation.py"
@@ -44,18 +44,18 @@ def inspect_collector_input(path: Path, source: str) -> list[str]:
         if navigation and function == "mouse_event":
             if not node.args or getattr(node.args[0], "attr", "") not in (
                     "MOUSEEVENTF_LEFTDOWN", "MOUSEEVENTF_LEFTUP", "MOUSEEVENTF_WHEEL"):
-                checks.append(f"{node.lineno}: B2 网关包含未授权的鼠标事件")
+                checks.append(f"{node.lineno}: 采集网关包含未授权的鼠标事件")
     if navigation:
         gateway = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_act"), None)
         guarded = {id(node) for node in ast.walk(gateway)} if gateway else set()
         for node in ast.walk(tree):
             if (isinstance(node, ast.Call) and getattr(node.func, "attr", "") in _COLLECTOR_INPUT
                     and id(node) not in guarded):
-                checks.append(f"{node.lineno}: 输入调用位于 B2 网关之外")
-        if gateway is None or not {"perform", "verify_view", "contains"} <= {
+                checks.append(f"{node.lineno}: 输入调用位于采集网关之外")
+        if gateway is None or not {"perform", "ensure_current", "verify_view", "_profile_point", "contains"} <= {
                 node.func.attr for node in ast.walk(gateway) if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)}:
-            checks.append("缺少 B2 范围、窗口或模式许可复核")
+            checks.append("缺少 B2、资料、窗口或许可复核")
     return [f"{path.name}: {item}" for item in checks]
 
 

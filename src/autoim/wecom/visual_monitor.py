@@ -232,7 +232,7 @@ def summarize(observation: VisualObservation) -> MonitorObservation:
     header, rows, history = (observation.layout.get(name) for name in ("C1", "B2", "C2"))
     regions = ViewRegions(header, rows, history) if header and rows and history else None
     selected = [row for row in observation.contacts if row.is_selected is True]
-    row = selected[0] if len(selected) == 1 else None
+    row = selected[0] if len(selected) == 1 else observation.verified_target if not selected else None
     duplicates = sum(bool(contact.display_name and _key(contact.display_name) == _key(conv.selected_name))
                      for contact in observation.contacts)
     hint = tuple(_key(item) for item in conv.visible_identity if _key(item))

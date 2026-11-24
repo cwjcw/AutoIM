@@ -18,6 +18,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from autoim.wecom.collection_profile import normalize_email
 from autoim.wecom.collection_events import EventTime
 from autoim.wecom.visual_account import LoginEvidence
 from autoim.wecom.visual_contacts import ContactObservation
@@ -27,7 +28,7 @@ from autoim.wecom.visual_monitor import (FrameProbe, MonitorObservation, _histor
 from autoim.wecom.visual_observation import VisualObservation
 
 SOURCE = "WINDOW_VISUAL_OCR"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _MIGRATIONS = {
     1: (
         """CREATE TABLE accounts (id INTEGER PRIMARY KEY, profile TEXT NOT NULL UNIQUE,
@@ -76,6 +77,12 @@ _MIGRATIONS = {
         "ALTER TABLE accounts ADD COLUMN login_name TEXT",
         "ALTER TABLE accounts ADD COLUMN login_key TEXT",
         "ALTER TABLE accounts ADD COLUMN login_avatar TEXT",
+    ),
+    4: (
+        "ALTER TABLE accounts ADD COLUMN email TEXT",
+        "ALTER TABLE accounts ADD COLUMN email_verified_at TEXT",
+        "ALTER TABLE accounts ADD COLUMN email_window TEXT",
+        "CREATE UNIQUE INDEX account_email_lookup ON accounts(email) WHERE email IS NOT NULL",
     ),
 }
 
@@ -131,6 +138,7 @@ class LocalAccount:
     label: str
     key: str | None
     avatar: str | None
+    email: str | None = None
 
 
 @dataclass(slots=True)
@@ -196,7 +204,7 @@ class VisualStore:
     @staticmethod
     def _accounts(db) -> tuple[LocalAccount, ...]:
         return tuple(LocalAccount(*row) for row in db.execute(
-            "SELECT id, COALESCE(login_name, profile), login_key, login_avatar FROM accounts ORDER BY id"))
+            "SELECT id, COALESCE(login_name, profile), login_key, login_avatar, email FROM accounts ORDER BY id"))
 
     def accounts(self) -> tuple[LocalAccount, ...]:
         with self.transaction() as db:
@@ -234,6 +242,43 @@ class VisualStore:
                           identity_status='VISUAL_LOCAL_BINDING' WHERE id=?""",
                        (evidence.name, evidence.key, evidence.avatar, account_id))
             return account_id
+
+    def verified_login(self, evidence, lifetime):
+        if not evidence.key or not evidence.avatar or not lifetime or lifetime[-1] is None:
+            return None
+        with self.transaction() as db:
+            matches = db.execute("""SELECT id, email FROM accounts WHERE email IS NOT NULL
+                     AND login_key=? AND login_avatar=? AND email_window=?""",
+                     (evidence.key, evidence.avatar, _json(lifetime))).fetchall()
+            return tuple(matches[0]) if len(matches) == 1 else None
+
+    def bind_email(self, evidence, email, lifetime, *, confirmed=False, account_id=None):
+        email = normalize_email(email)
+        if not evidence.key or not evidence.avatar or not email or not lifetime or lifetime[-1] is None:
+            raise ValueError("邮箱、A1 头像或窗口生命周期核验不完整")
+        with self.transaction() as db:
+            accounts = self._accounts(db)
+            existing = next((row for row in accounts if row.email == email), None)
+            if existing:
+                if confirmed and account_id != existing.id:
+                    raise ValueError("邮箱已关联另一账号，历史记录保持独立")
+                account = existing.id
+            else:
+                legacy = tuple(row for row in accounts if row.email is None and
+                               (row.key in (None, evidence.key) or row.avatar == evidence.avatar))
+                if legacy and not confirmed:
+                    return None, legacy
+                if confirmed and account_id is not None:
+                    if account_id not in {row.id for row in legacy}:
+                        raise ValueError("所选历史账号不具备绑定资格")
+                    account = account_id
+                else:
+                    account = self._insert_login(db, evidence)
+            db.execute("""UPDATE accounts SET login_name=?, login_key=?, login_avatar=?, email=?,
+                          email_verified_at=?, email_window=?, identity_status='VISUAL_PROFILE_EMAIL'
+                          WHERE id=?""", (evidence.name, evidence.key, evidence.avatar, email,
+                                         _now(), _json(lifetime), account))
+            return account, ()
 
     def break_continuity(self) -> None:
         with self._lock:
@@ -275,7 +320,7 @@ class VisualStore:
         observed = summarize(raw)
         at = observed.at.isoformat(timespec="milliseconds")
         capture_id = uuid4().hex
-        selected = next((row for row in raw.contacts if row.is_selected is True), None)
+        selected = next((row for row in raw.contacts if row.is_selected is True), raw.verified_target)
         with self._lock:
             with self.transaction() as db:
                 account = self._account(db, profile)
@@ -458,9 +503,14 @@ class VisualStore:
             changes.append({"at": at.iso(), "status": status, "detail": detail})
             db.execute("UPDATE scan_jobs SET transitions=? WHERE id=?", (_json(changes), job_id))
 
-    def observe_waiting_job(self, job_id: str, row: ContactObservation, reason: str, scan_id: str) -> None:
+    def observe_waiting_job(self, job_id: str, row: ContactObservation, reason: str | None, scan_id: str,
+                            *, no_click: bool = False) -> None:
         with self.transaction() as db:
-            job = db.execute("SELECT transitions FROM scan_jobs WHERE id=?", (job_id,)).fetchone()
+            job = db.execute("SELECT transitions, status, failure_reason FROM scan_jobs WHERE id=?", (job_id,)).fetchone()
+            if reason is None:
+                if job["status"] != "WAITING_REVALIDATION":
+                    return
+                reason = job["failure_reason"]
             changes = json.loads(job["transitions"])
             at = _now()
             detail = {"scan_id": scan_id, "last_observed_at": at, "observations": 1,
@@ -468,13 +518,18 @@ class VisualStore:
                       "unread_count": row.unread_count if row.unread_count_reliable else None}
             if changes[-1]["status"] == "WAITING_REVALIDATION":
                 previous = changes.pop()
-                detail["observations"] += previous["detail"]["observations"]
+                detail["observations"] += previous["detail"]["observations"] - int(previous["detail"]["scan_id"] == scan_id)
                 first = previous["at"]
             else:
                 first = at
             changes.append({"at": first, "status": "WAITING_REVALIDATION", "reason": reason, "detail": detail})
-            db.execute("""UPDATE scan_jobs SET status='WAITING_REVALIDATION', failure_reason=?, transitions=?
-                       WHERE id=?""", (reason, _json(changes), job_id))
+            db.execute("""UPDATE scan_jobs SET status='WAITING_REVALIDATION', failure_reason=?, transitions=?,
+                          read_risk=CASE WHEN ? THEN 0 ELSE read_risk END,
+                          navigation_status=CASE WHEN ? THEN 'BLOCKED' ELSE navigation_status END
+                          WHERE id=?""", (reason, _json(changes), no_click, no_click, job_id))
+
+    def refresh_waiting_job(self, job_id: str, row: ContactObservation, scan_id: str) -> None:
+        self.observe_waiting_job(job_id, row, None, scan_id)
 
     @staticmethod
     def _update_job(db, job_id, state, *, navigation="", risk=False, no_click=False,
@@ -484,7 +539,10 @@ class VisualStore:
             raise ValueError("未找到已持久化巡检任务")
         at = _now()
         changes = json.loads(row["transitions"])
-        changes.append({"at": at, "status": state, "reason": reason, "detail": detail})
+        matching_pause = (state == "PAUSED" and changes[-1]["status"] == state
+                          and changes[-1].get("reason") == reason and changes[-1].get("detail") == detail)
+        if not matching_pause:
+            changes.append({"at": at, "status": state, "reason": reason, "detail": detail})
         attempt = state == "NAVIGATING"
         db.execute("""UPDATE scan_jobs SET status=?, attempted_at=?, attempts=attempts+?, navigation_status=?,
                    read_risk=?, capture_result=?, persistence_result=?, failure_reason=?, transitions=? WHERE id=?""",

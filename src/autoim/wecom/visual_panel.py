@@ -279,7 +279,7 @@ def _distance(value: float | None) -> str:
 
 
 class VisualCapturePanel(QFrame):
-    def __init__(self, calibration_path: Path, run_worker, parent=None) -> None:
+    def __init__(self, calibration_path: Path, run_worker, parent=None, *, settings=None) -> None:
         super().__init__(parent)
         self.setObjectName("panel")
         self.calibration = CalibrationStore(calibration_path)
@@ -331,7 +331,7 @@ class VisualCapturePanel(QFrame):
         self.monitor_panel = VisualMonitorPanel(run_worker, self._make_monitor, self)
         self.monitor_panel.busyChanged.connect(self._monitor_busy_changed)
         layout.addWidget(self.monitor_panel)
-        self.collection_panel = VisualCollectionPanel(run_worker, self._make_collection, self)
+        self.collection_panel = VisualCollectionPanel(run_worker, self._make_collection, self, settings=settings)
         self.use_calibration.toggled.connect(self._refresh_collection_calibration)
         self.collection_panel.busyChanged.connect(self._monitor_busy_changed)
         layout.addWidget(self.collection_panel)
@@ -355,7 +355,7 @@ class VisualCapturePanel(QFrame):
     def _make_collection(self, profile, store) -> CollectionService:
         path = self.calibration.path if self.use_calibration.isChecked() else None
         reader = CollectionReader(path, self.calibration.path.with_name("wecom-pc-visual-thresholds.json"))
-        return CollectionService(profile, store, reader)
+        return CollectionService(profile, store, reader, require_email=self.collection_panel.settings is not None)
 
     def _refresh_collection_calibration(self) -> None:
         self.collection_panel.set_calibration(self.calibration.path if self.use_calibration.isChecked() else None)

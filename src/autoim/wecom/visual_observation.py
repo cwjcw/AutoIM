@@ -125,6 +125,7 @@ class VisualObservation:
     message_completeness: str = "VISIBLE_MESSAGES_UNVERIFIED"
     board_scrollbar: Box | None = None
     login: LoginEvidence = LoginEvidence()
+    verified_target: ContactObservation | None = None
 
 
 def _group_senders(messages: tuple[VisibleMessageObservation, ...], dispositions: tuple[OcrDisposition, ...],

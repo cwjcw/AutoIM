@@ -29,6 +29,27 @@ class CollectionNotifier(QObject):
         if not self._timer.isActive():
             self._timer.start(2200)
 
+    def _system_tray(self):
+        if not self._tray_factory.isSystemTrayAvailable() or not self._tray_factory.supportsMessages():
+            return None
+        if self._tray is None:
+            app = QApplication.instance()
+            icon = app.windowIcon()
+            if icon.isNull():
+                icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self._tray = self._tray_factory(icon, self)
+            self._tray.setToolTip("AutoIM")
+            self._tray.show()
+        return self._tray
+
+    def announce(self, title, text):
+        try:
+            tray = self._system_tray()
+            if tray:
+                tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Information)
+        except Exception:
+            pass
+
     def flush(self):
         self._timer.stop()
         notices, self._pending = self._pending, []
@@ -37,22 +58,14 @@ class CollectionNotifier(QObject):
         count = sum(notice.count for notice in notices)
         result = "系统桌面通知不可用"
         try:
-            if self._tray_factory.isSystemTrayAvailable() and self._tray_factory.supportsMessages():
-                if self._tray is None:
-                    app = QApplication.instance()
-                    icon = app.windowIcon()
-                    if icon.isNull():
-                        icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-                    tray = self._tray_factory(icon, self)
-                    tray.setToolTip("AutoIM")
-                    tray.show()
-                    self._tray = tray
+            tray = self._system_tray()
+            if tray:
                 latest = notices[-1]
                 durations = latest.trace.durations()
                 total = durations.get("unread_to_commit_ms")
                 title = latest.title[:60] if len(notices) == 1 else f"{len(notices)} 批采集"
                 duration = f" · 耗时 {total / 1000:.1f} 秒" if total is not None and len(notices) == 1 else ""
-                self._tray.showMessage("AutoIM 采集成功", f"{title or '当前会话'} · 新增 {count} 条消息 · 已保存{duration}",
+                tray.showMessage("AutoIM 采集成功", f"{title or '当前会话'} · 新增 {count} 条消息 · 已保存{duration}",
                                        QSystemTrayIcon.MessageIcon.Information)
                 result = "已提交给系统通知"
         except Exception:

@@ -7,17 +7,34 @@ import sqlite3
 from collections import deque
 from dataclasses import replace
 
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
+from PySide6.QtCore import QSettings, QTimer, Qt, Signal
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
                                QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from autoim import __version__
 from autoim.vision_widgets import fit_dialog_to_screen
 from autoim.wecom.collection_notifications import CollectionNotifier
-from autoim.wecom.collection_service import CollectionService, ScanStatus
+from autoim.wecom.collection_hotkey import CollectionHotkey
+from autoim.wecom.collection_service import CollectionScope, CollectionService, ScanStatus
 from autoim.wecom.visual_diagnostics import DiagnosticCopyControls
 from autoim.wecom.visual_store import VisualStore
 from autoim.wecom.window_state import window_diagnostic
+
+def collapsible(title, parent=None):
+    section = QWidget(parent)
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
+    button = QPushButton(title)
+    button.setCheckable(True)
+    body = QWidget(section)
+    body.hide()
+    button.toggled.connect(body.setVisible)
+    layout.addWidget(button)
+    layout.addWidget(body)
+    content = QVBoxLayout(body)
+    content.setContentsMargins(0, 0, 0, 0)
+    return section, button, content
+
 
 SCAN_DELAY_MS = 2000
 PAUSE_RECHECK_MS = 3000
@@ -36,8 +53,8 @@ def _collection_lines(state: ScanStatus) -> list[str]:
                       "IDENTIFICATION_FAILED": "识别失败", "CONFIRMATION_REQUIRED": "需要确认"}
     account = f"本地 ID {state.account_id}" if state.account_id is not None else "尚未绑定"
     return [
-        f"登录账号 {state.account_name or '—'} · {account_states[state.account_state]} · {account}"
-        f" · 最近识别 {at(state.account_at)} · {state.account_reason or '—'}",
+        f"登录账号 {state.account_name or '—'} · {account_states.get(state.account_state, state.account_state)} · {account}"
+        f" · 邮箱 {state.account_email or '—'} · 最近识别 {at(state.account_at)} · {state.account_reason or '—'}",
         f"最近未读发现 {at(recent.unread_detected_at)}",
         f"导航尝试 {at(recent.navigation_started_at)} · 打开 {at(recent.conversation_opened_at)}"
         f" · {state.navigation_result or '—'}",
@@ -61,6 +78,8 @@ def _scan_lines(state: ScanStatus) -> list[str]:
         f"选中行 {state.selection_name or '—'} · 姓名 {'可靠' if state.selection_name_reliable else '未确认'}"
         f" · {state.selection_method} · {state.selection_confidence}"
         f" · {state.selection_evidence or '—'}",
+        f"策略跳过 {state.skipped_unread} · {'；'.join(state.skipped_reasons) or '—'}",
+        f"输入复核 {state.input_diagnostic or '—'}",
         f"不可靠原因 {'；'.join(state.unreliable_reasons) or '—'} · 等待导航 {state.awaiting_navigation}"
         f" · 进入导航 {('通过预检' if state.navigation_allowed else '未通过或无任务') if state.navigation_allowed is not None else '待核对'}"
         f" · 导航阻断 "
@@ -194,10 +213,15 @@ class CollectionHistory(QDialog):
 class VisualCollectionPanel(QWidget):
     busyChanged = Signal(bool)
 
-    def __init__(self, run_worker, make_service, parent=None):
+    def __init__(self, run_worker, make_service, parent=None, *, settings=None):
         super().__init__(parent)
         self.run_worker = run_worker
         self.make_service = make_service
+        self.settings = settings
+        self._authorized = False
+        self._asking_permission = False
+        self._hotkey = None
+        self._shortcut = "F10"
         self.store = VisualStore()
         self._service: CollectionService | None = None
         self._status = ScanStatus()
@@ -218,29 +242,63 @@ class VisualCollectionPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(QLabel("多会话自动采集"))
+        self.account_label = QLabel()
+        self.account_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.account_label.setWordWrap(True)
+        layout.addWidget(self.account_label)
+        ranges = QHBoxLayout()
+        ranges.addWidget(QLabel("采集范围"))
+        self.scope_checks = {}
+        for key, title, default in (("personal", "普通单聊", True), ("group", "普通群聊", True),
+                                    ("muted", "静音会话", False), ("folded", "折叠的聊天（待实现）", False)):
+            check = QCheckBox(title)
+            check.setChecked(settings.value(f"collection/scope/{key}", default, type=bool)
+                             if settings is not None and key != "folded" else default)
+            if key == "folded":
+                check.setEnabled(False)
+            self.scope_checks[key] = check
+            check.toggled.connect(self._save_scope)
+            ranges.addWidget(check)
+        ranges.addStretch(1)
+        layout.addLayout(ranges)
+        diagnostics, self.diagnostics_toggle, details = collapsible("运行诊断", self)
+        tools, self.advanced_toggle, advanced = collapsible("高级工具", self)
+        self.advanced_tools = tools
+        self.advanced_layout = advanced
         account = QHBoxLayout()
-        self.identify_button = QPushButton("识别当前登录账号")
-        self.identify_button.clicked.connect(self.identify_account)
+        self.identify_button = QPushButton("重新核验登录账号")
+        self.identify_button.clicked.connect(self.reverify_account)
         self.confirm_button = QPushButton("确认账号绑定")
         self.confirm_button.clicked.connect(self.confirm_account)
         account.addWidget(self.identify_button)
-        account.addWidget(self.confirm_button)
         account.addStretch(1)
-        layout.addLayout(account)
+        advanced.addLayout(account)
         self.scroll = QCheckBox("可见会话真机通过后启用有限 B2 滚动")
-        layout.addWidget(self.scroll)
+        advanced.addWidget(self.scroll)
+        if settings is not None:
+            self.scroll.hide()
         actions = QHBoxLayout()
-        self.start_button = QPushButton("开始自动采集所有未读会话")
-        self.stop_button = QPushButton("停止自动采集")
+        self.start_button = QPushButton("开始检测")
+        self.stop_button = QPushButton("停止检测")
         self.save_button = QPushButton("保存当前可见消息")
         self.start_button.clicked.connect(self.start)
         self.stop_button.clicked.connect(self.stop)
         self.save_button.clicked.connect(self.save_current)
-        for button in (self.start_button, self.stop_button, self.save_button):
+        advanced.addWidget(self.save_button)
+        self.shortcut_button = QPushButton("全局启停快捷键 · F10")
+        self.shortcut_button.clicked.connect(self._change_shortcut)
+        self.hotkey_status = QLabel()
+        self.hotkey_status.setWordWrap(True)
+        self.compact_status = QLabel()
+        self.compact_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.compact_status.setWordWrap(True)
+        for button in (self.start_button, self.stop_button, self.shortcut_button):
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
+        layout.addWidget(self.confirm_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.hotkey_status)
+        layout.addWidget(self.compact_status)
         history = QHBoxLayout()
         for i, title in enumerate(("查看已保存聊天记录", "查看自动巡检任务", "查看采集异常")):
             button = QPushButton(title)
@@ -251,11 +309,54 @@ class VisualCollectionPanel(QWidget):
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.summary)
+        details.addWidget(self.summary)
         self.copy_controls = DiagnosticCopyControls(self._report, self)
-        layout.addWidget(self.copy_controls)
+        details.addWidget(self.copy_controls)
+        layout.addWidget(diagnostics)
+        layout.addWidget(tools)
         self._render(self._status)
         self._controls()
+
+    def _save_scope(self):
+        if self.settings is not None:
+            for key in ("personal", "group", "muted"):
+                self.settings.setValue(f"collection/scope/{key}", self.scope_checks[key].isChecked())
+
+    def bind_hotkey(self, window):
+        self._hotkey = CollectionHotkey(QApplication.instance(), int(window.winId()), self.toggle)
+        shortcut = self.settings.value("collection/hotkey", "F10", type=str) if self.settings is not None else "F10"
+        self._set_shortcut(shortcut)
+
+    def close_hotkey(self):
+        if self._hotkey is not None:
+            self._hotkey.close()
+
+    def _set_shortcut(self, text):
+        if not self._hotkey:
+            return
+        try:
+            self._hotkey.set_shortcut(text)
+        except (OSError, ValueError) as exc:
+            self.hotkey_status.setText(str(exc))
+            return
+        self._shortcut = text
+        self.shortcut_button.setText(f"全局启停快捷键 · {text}")
+        self.hotkey_status.clear()
+        if self.settings is not None:
+            self.settings.setValue("collection/hotkey", text)
+
+    def _change_shortcut(self):
+        text, accepted = QInputDialog.getText(self, "全局启停快捷键", "例如 F9 或 Ctrl+Alt+M", text=self._shortcut)
+        if accepted:
+            self._set_shortcut(text.strip())
+
+    def toggle(self):
+        if self._service and self._service.active:
+            self.stop()
+        elif self._authorized:
+            self.start()
+        else:
+            self.hotkey_status.setText("首次使用请在 AutoIM 中点击「开始检测」并确认授权。")
 
     @property
     def busy(self) -> bool:
@@ -277,6 +378,8 @@ class VisualCollectionPanel(QWidget):
         self.confirm_button.setVisible(self._status.account_state == "CONFIRMATION_REQUIRED")
         self.confirm_button.setEnabled(self._available and not self._in_flight)
         self.scroll.setEnabled(enabled)
+        for key, check in self.scope_checks.items():
+            check.setEnabled(enabled and key != "folded")
         self.stop_button.setEnabled(bool(self._service and self._service.active))
 
     def _refresh(self):
@@ -289,17 +392,28 @@ class VisualCollectionPanel(QWidget):
         return self._service
 
     def start(self):
-        if self.busy or not self._available:
+        if self.busy or not self._available or self._asking_permission:
             return
-        if QMessageBox.question(
-                self, "开启多会话自动采集",
-                "请仅用于获授权的测试账号。程序在您切回最大化企业微信且操作空闲时，"
-                "会点击经过核对的联系人行，可能改变当前会话并清除未读。"
-                "视觉观察会写入本机 SQLite。程序不会输入或发送消息，您可以随时停止。",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
-            return
+        if not self._authorized:
+            self._asking_permission = True
+            try:
+                result = QMessageBox.question(
+                    self, "授予企业微信自动采集权限",
+                    "自动采集会移动鼠标、核验账号、打开聊天会话，可能改变未读状态。"
+                    f"采集结果会保存到本机 SQLite。本次运行中按 {self._shortcut} 可随时停止。",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+            finally:
+                self._asking_permission = False
+            if result != QMessageBox.StandardButton.Yes:
+                return
+            self._authorized = True
         service = self._get_service()
+        if self.settings is not None:
+            service.scope = CollectionScope(**{key: self.scope_checks[key].isChecked()
+                                               for key in ("personal", "group", "muted")})
+        if self._hotkey and self._hotkey.active_id is not None:
+            self.hotkey_status.clear()
         try:
             service.start(scroll=self.scroll.isChecked())
         except (OSError, RuntimeError) as exc:
@@ -309,6 +423,7 @@ class VisualCollectionPanel(QWidget):
         self._stop_requested = False
         self._refresh()
         self._pulse.start()
+        self._notifier.announce("自动采集已启动", "等待企业微信处于前台并核验账号")
         self._timer.start(2500)
 
     def stop(self):
@@ -316,7 +431,10 @@ class VisualCollectionPanel(QWidget):
         self._timer.stop()
         self._pulse.stop()
         if self._service:
+            was_active = self._service.active
             self._service.stop()
+            if was_active:
+                self._notifier.announce("自动采集已停止", "鼠标控制权已交还")
         self._render(replace(self._status, status="STOPPED", reason="许可已撤销", waiting_for_window=False))
         self._refresh()
 
@@ -325,6 +443,11 @@ class VisualCollectionPanel(QWidget):
             return
         self._stop_requested = False
         self._submit(self._get_service().save_current)
+
+    def reverify_account(self):
+        if not self.busy and self._available:
+            self._stop_requested = False
+            self._submit(self._get_service().request_identity_check)
 
     def identify_account(self):
         if not self.busy and self._available:
@@ -338,7 +461,7 @@ class VisualCollectionPanel(QWidget):
         choices = {f"{row.label} · 本地 ID {row.id}": row.id for row in self._status.account_choices}
         choices["创建独立的本地账号"] = None
         label, accepted = QInputDialog.getItem(self, "确认账号绑定",
-                                               f"当前显示 {self._status.account_name}。请选择能确认归属的历史账号，"
+                                               f"当前账号 {self._status.account_name} · {self._status.account_email or '邮箱未显示'}。请选择能确认归属的历史账号，"
                                                "也可创建独立的本地账号。",
                                                list(choices), 0, False)
         if accepted and label in choices:
@@ -409,6 +532,16 @@ class VisualCollectionPanel(QWidget):
 
     def _render(self, result):
         self._status = result
+        self.account_label.setText(
+            f"当前账号 {result.account_name or '—'} · 邮箱 {result.account_email or '—'} · "
+            f"{result.account_reason or '等待识别'}")
+        committed = result.last_collected_at
+        mode = "自动采集模式" if self._service and self._service.active else "人工操作模式"
+        self.compact_status.setText(
+            f"{mode} · {result.status} · {result.reason}\n"
+            f"发现未读 {result.unread_marker_count if result.b2_scan_completed_at else '—'} · "
+            f"等待采集 {result.queued} · 已完成任务 {result.completed} · 采集异常 {result.errors}\n"
+            f"已保存消息 {result.saved} · 新增消息 {result.added} · 最近成功采集 {committed.iso() if committed else '—'}")
         candidates = str(result.candidates) if result.b2_scan_completed_at else "—"
         self.summary.setText(
             f"{result.status} · {result.reason}\n"
@@ -453,7 +586,7 @@ class VisualCollectionPanel(QWidget):
     def _report(self, full):
         state = self._status
         candidates = str(state.candidates) if state.b2_scan_completed_at else "—"
-        lines = [f"AutoIM {__version__} · PC-V3.1 · WINDOW_VISUAL_OCR",
+        lines = [f"AutoIM {__version__} · PC-V3.2 · WINDOW_VISUAL_OCR",
                  f"状态 {state.status} · 匹配 {state.match} · {state.reason}",
                  f"候选 {candidates} · 等待 {state.queued} · 完成 {state.completed} · 异常 {state.errors}",
                  f"已保存 {state.saved} · 新增 {state.added} · 重复观察 {state.repeated} · 未确认 {state.uncertain}"]

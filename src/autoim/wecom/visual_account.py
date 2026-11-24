@@ -20,6 +20,7 @@ class LoginEvidence:
     box: Box | None = None
     signature: str = ""
     reason: str = ""
+    avatar_box: Box | None = None
 
     @property
     def key(self) -> str:
@@ -69,4 +70,5 @@ def read_login(pixels: np.ndarray, rail: Box | None, reader: TextRecognizer, dpi
         colors = tile // 16
         if float(np.max(tile.std(axis=(0, 1)))) >= 9 and len(np.unique(colors.reshape(-1, 3), axis=0)) >= 14:
             avatar = _signature(colors)
-    return LoginEvidence(span.text.strip(), avatar, top, _signature(top.crop(pixels)))
+    return LoginEvidence(span.text.strip(), avatar, top, _signature(top.crop(pixels)),
+                         avatar_box=avatar_box if avatar else None)
