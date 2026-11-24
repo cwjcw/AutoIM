@@ -16,9 +16,10 @@ from tempfile import TemporaryFile
 from uuid import uuid4
 
 from autoim import __version__
+from autoim.wecom.collection_test import PHASES
 from autoim.wecom.visual_store import database_path
 
-PC_VERSION = "PC-V3.5.1"
+PC_VERSION = "PC-V3.5.2"
 
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",
@@ -44,6 +45,7 @@ STAGES = {
     "TEST_SAVE": "隔离数据库提交与去重",
     "TEST_NOTIFY": "提交 TEST 通知及人工可见确认",
     "CORE": "按当前采集范围发现、导航、读取并展示测试消息",
+    **{f"TEST_STAGE_{number}": name for number, (name, _) in PHASES.items()},
 }
 SUBSTEPS = {
     "WINDOW_LOCATED": ("WINDOW_LOCATE", "定位主窗口"),
@@ -218,8 +220,9 @@ class CollectionRuntime:
             if self.closed or (mode == "production" and level == "DEBUG" and result not in RESULTS):
                 return ""
             details = dict(details or {})
-            if "reason" in details:
-                details["reason"] = safe_reason(details["reason"])
+            for key in ("reason", "last_issue"):
+                if key in details:
+                    details[key] = safe_reason(details[key])
             event = {"id": uuid4().hex, "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                      "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision,
                      "session": self.session, "detection": detection, "task": task, "mode": mode,

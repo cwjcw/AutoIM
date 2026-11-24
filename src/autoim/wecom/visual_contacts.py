@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -154,6 +154,37 @@ def _badge(pixels: np.ndarray, avatar: Box, row: Box, unit: float,
     return hits[0] if len(hits) == 1 else None
 
 
+def recover_b2_start(layout, pixels, unit, thresholds):
+    """Reject an automatic B1 seam that cuts off a corroborated early unread row."""
+    b1, b2, c1 = (layout.get(part) for part in ("B1", "B2", "C1"))
+    if (not b1 or not b2 or not c1 or b2.top <= c1.bottom + 20 * unit
+            or any("人工" in part.evidence for part in layout.regions if part.name in ("B1", "B2"))):
+        return layout
+    search = Box(b2.left, c1.bottom, b2.right, b2.bottom)
+    avatars = _avatars(pixels, search, unit)
+    if len(avatars) < 3 or avatars[0].top >= b2.top or avatars[1].top < b2.top:
+        return layout
+    first, second = avatars[:2]
+    pitch = second.center[1] - first.center[1]
+    subsequent = [b.center[1] - a.center[1] for a, b in zip(avatars[1:4], avatars[2:5])]
+    if (pitch < first.height or pitch > first.height * 2.2
+            or not any(abs(step - pitch) <= pitch * .20 for step in subsequent)):
+        return layout
+    start = round(first.center[1] - pitch / 2)
+    if start < c1.bottom - round(5 * unit):
+        return layout
+    start = max(c1.bottom, start)
+    early = Box(b2.left, start, b2.right, round((first.center[1] + second.center[1]) / 2))
+    if early.bottom <= early.top or not _badge(pixels, first, early, unit, thresholds):
+        return layout
+    height, width = pixels.shape[:2]
+    adjusted = {"B1": replace(b1, bottom=start), "B2": replace(b2, top=start)}
+    return replace(layout, regions=tuple(
+        replace(item, box=adjusted[item.name], normalized=adjusted[item.name].relative(width, height),
+                evidence="首行头像、红色未读徽标与后续行距交叉确认")
+        if item.name in adjusted else item for item in layout.regions))
+
+
 def _badge_number(pixels: np.ndarray, box: Box, reader: TextRecognizer,
                   thresholds: VisualThresholds) -> tuple[int | None, bool]:
     # A solid dot offers no white ink to read. Ignore the outside ring.
@@ -204,11 +235,15 @@ def detect_global_unread(pixels: np.ndarray, area: Box, reader: TextRecognizer,
                                    "A 区消息入口文字及右侧红色徽标 · 非静音会话范围")
 
 
-def _muted(pixels: np.ndarray, row: Box, unit: float) -> bool | None:
+def muted_icon_region(row: Box, unit: float) -> Box:
     half = row.center[1]
     # Exclude the side gutter and the lower activity time line.
-    area = Box(row.left + round(row.width * .75), row.top + max(1, round(3 * unit)),
+    return Box(row.left + round(row.width * .75), row.top + max(1, round(3 * unit)),
                row.right - max(3, round(8 * unit)), half)
+
+
+def _muted(pixels: np.ndarray, row: Box, unit: float) -> bool | None:
+    area = muted_icon_region(row, unit)
     if min(area.width, area.height) < 3:
         return None
     mask = (~near_background(area.crop(pixels), 36)).astype(np.uint8)

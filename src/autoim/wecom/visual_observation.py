@@ -17,7 +17,7 @@ from autoim.vision import NormalizedRect
 from autoim.wecom.visual_account import LoginEvidence
 from autoim.wecom.visual_capture import VisualFrame, capture_visible_window
 from autoim.wecom.visual_contacts import (ContactObservation, ContactTextDiagnostic, GlobalUnreadObservation,
-                                          VisualName, detect_contacts, detect_global_unread, parse_visual_name)
+                                          VisualName, detect_contacts, detect_global_unread, parse_visual_name, recover_b2_start)
 from autoim.wecom.visual_layout import (Box, LayoutObservation, VisualThresholds, contours,
                                        detect_layout, detect_scroll_thumb, near_background)
 from autoim.wecom.visual_messages import (Container, OcrDisposition, VisibleMessageObservation,
@@ -340,11 +340,13 @@ def _corroborate_selection(title_spans, contacts, thresholds, mouse):
 def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                   reader: TextRecognizer | None = None,
                   thresholds: VisualThresholds = VisualThresholds(), *, on_conversation=None,
-                  contacts_only=False, message_gate=None) -> VisualObservation:
+                  contacts_only=False, message_gate=None, history_only=False) -> VisualObservation:
     started = perf_counter()
     pixels = frame.pixels
     layout = detect_layout(pixels, calibration, thresholds)
     unit = max(.65, min(frame.state.dpi / 96, 3.0))
+    if message_gate is not None and not history_only:
+        layout = recover_b2_start(layout, pixels, unit, thresholds)
     a, b1, b2, c1, c2, c3 = (layout.get(name) for name in ("A", "B1", "B2", "C1", "C2", "C3"))
     search, add = _toolbar_controls(pixels, b1) if b1 else (None, None)
     hover = next((item.name for item in layout.regions if item.name not in ("B", "C")
@@ -368,7 +370,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     unread = detect_global_unread(pixels, a, trace, thresholds) if a else GlobalUnreadObservation()
     trace.region = "B2 联系人"
     contact_diagnostics: list[ContactTextDiagnostic] = []
-    contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics) if b2 else ()
+    contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics) if b2 and not history_only else ()
     if contacts_only:
         page = "MESSAGES_CANDIDATE" if b2 and (unread.entry or (search and add and contacts)) else "UNKNOWN"
         return VisualObservation(frame, layout, "CONTACTS_ONLY", page=page, contacts=contacts,
@@ -395,6 +397,9 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                          unit, thresholds) if c3 else None
     corroborated = bool(conversation.title and ((composer and composer.send_button)
                        or (search and add and contacts) or unread.entry or conversation.selected_name))
+    if history_only:
+        corroborated = bool(c1 and c2 and c3 and b2 and (
+            (search and add) or (unread.entry and (conversation.title or (composer and composer.toolbar)))))
     if message_gate is not None:
         # B2 can be reliable before any conversation is open. C2 still needs
         # its own corroboration and the caller's verified-target gate.

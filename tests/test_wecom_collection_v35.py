@@ -85,6 +85,8 @@ class CoreFlowTests(unittest.TestCase):
             self.current = observation
         for _ in range(count):
             state = self.service.tick()
+            if self.service._core and self.service._core.presentation:
+                self.service.confirm_core_displayed(state.core.messages)
         return state
 
     def events(self):
@@ -162,7 +164,9 @@ class CoreFlowTests(unittest.TestCase):
 
     def test_contact_avatar_is_taken_from_current_scan_not_a_previous_roster(self):
         self.start()
-        self.poll(sample())
+        early = sample(unread={1: (1, False)})
+        self.poll(replace(early, contacts=tuple(replace(row, is_muted=None) if row.has_unread_indicator else row
+                                                for row in early.contacts)))
         with patch("autoim.wecom.collection_service.avatar_key", side_effect=lambda _, row: "new-" + row.display_name):
             status = self.poll(self.before)
         self.assertEqual(status.core.clicks, 1)
@@ -217,15 +221,18 @@ class CoreFlowTests(unittest.TestCase):
         self.poll()
         failed = self.poll(sample(0, {1: (1, False), 2: (1, False)}, tone=99), count=MAX_READ_POLLS)
         self.assertEqual((failed.core.failures, failed.core.read_unfinished, failed.core.messages), (1, 1, ()))
+        independent = self.poll()
+        self.assertEqual(independent.core.messages[0].unread, "INDEPENDENT_OCR")
+        self.assertNotEqual(independent.core.messages[0].contact, NAMES[1])
         self.poll()
         self.assertEqual([call.args[1].display_name for call in self.navigator.select.call_args_list], [NAMES[1], NAMES[2]])
         self.assertTrue(any(event["details"].get("scope_decision") == "UNREAD_ALREADY_HANDLED" for event in self.events()))
 
-    def test_unchanged_c2_never_confirms_after_click(self):
+    def test_unchanged_c2_never_confirms_messages_after_click(self):
         self.start()
         self.poll()
         result = self.poll(sample(1), count=MAX_READ_POLLS)
-        self.assertEqual((result.core.verified, result.core.read_unfinished), (0, 1))
+        self.assertEqual((result.core.verified, result.core.read_unfinished, result.core.messages), (1, 1, ()))
         self.navigator.select.assert_called_once()
 
     def test_nonconsecutive_correct_title_does_not_establish_stability(self):
@@ -258,16 +265,16 @@ class CoreFlowTests(unittest.TestCase):
         self.permit.revoke.assert_called_once()
         self.service.stop()
         self.start()
-        self.poll(sample())
+        self.poll(sample(unread={1: (1, False)}))
         self.window_generation += 1
         result = self.poll()
         self.assertEqual(result.core.phase, "WINDOW_IDENTITY_CHANGED")
-        self.navigator.select.assert_called_once()
+        self.assertEqual(self.navigator.select.call_count, 2)
 
     def test_native_gate_failure_is_bounded_and_next_target_is_attempted(self):
         self.start()
         self.navigator.select.side_effect = [NavigationPaused("遮挡"), NavigationPaused("用户正在操作"), None]
-        self.poll(count=3)
+        self.poll(count=4)
         self.assertEqual([call.args[1].display_name for call in self.navigator.select.call_args_list],
                          [NAMES[1], NAMES[1], NAMES[2]])
         self.assertEqual(self.service.snapshot().core.failures, 1)
@@ -300,6 +307,70 @@ class CoreFlowTests(unittest.TestCase):
         failed = OcrAreaObservation("B2 联系人", self.before.layout.get("B2"), "FAILED")
         status = self.poll(replace(self.before, ocr_areas=(failed,)), count=2)
         self.assertEqual(status.scan_disposition, "B2_SCAN_FAILED")
+        self.navigator.select.assert_not_called()
+
+    def test_b2_deadline_discards_late_results_and_continues_independent_c2(self):
+        self.start()
+        clock = self.service._core.clock
+        def slow(_frame):
+            end = clock.phase.started + 15.1
+            clock.now = lambda: end
+            return self.before
+
+        with patch.object(self.service, "read", side_effect=slow):
+            self.poll()
+        self.navigator.select.assert_not_called()
+        self.assertEqual(clock.outcomes[2], "TIMEOUT")
+        result = self.poll(sample())
+        self.assertTrue(result.core.messages)
+        self.assertEqual(result.core.messages[0].unread, "INDEPENDENT_OCR")
+        self.assertEqual(self.poll().core.phase, "TEST_FINISHED")
+        self.assertLess(clock.finished - clock.started, 180)
+
+    def test_no_visible_unread_can_read_and_finish_without_navigation(self):
+        self.start()
+        self.poll(sample())
+        status = self.poll()
+        self.assertEqual(status.core.messages[0].unread, "INDEPENDENT_OCR")
+        self.assertEqual(self.poll().core.phase, "TEST_FINISHED")
+        self.navigator.select.assert_not_called()
+        self.assertFalse(self.formal.path.exists())
+        self.assertFalse(self.isolated.path.exists())
+
+    def test_muted_unknown_has_two_samples_then_independent_c2(self):
+        self.start()
+        raw = sample(unread={1: (1, False)})
+        rows = tuple(replace(row, is_muted=None) if row.has_unread_indicator else row for row in raw.contacts)
+        frame = replace(raw.frame, state=replace(raw.frame.state, dpi=168))
+        self.poll(replace(raw, frame=frame, contacts=rows), count=2)
+        self.assertEqual(max(self.service._core.mute_trials.values()), 2)
+        result = self.poll()
+        self.assertTrue(result.core.messages)
+        self.assertEqual(self.poll().core.phase, "TEST_FINISHED")
+        self.navigator.select.assert_not_called()
+
+    def test_same_recent_mute_crop_can_recover_an_unknown_result(self):
+        self.start()
+        self.service._window_probe = Mock(return_value=health(replace(BASE, foreground_hwnd=999)))
+        raw = sample(unread={1: (1, False)})
+        self.poll(raw)
+        self.service._window_probe.return_value = health()
+        rows = tuple(replace(row, is_muted=None) if row.has_unread_indicator else row for row in raw.contacts)
+        revised = self.poll(replace(raw, contacts=rows))
+        self.assertEqual(revised.core.clicks, 1)
+        self.assertTrue(any(event["details"].get("method") == "RECENT_SAME_IDENTITY_UNCHANGED_ICON_AREA"
+                            for event in self.events()))
+
+    def test_run_watchdog_ends_without_waiting_for_read_worker_to_return(self):
+        self.start()
+        self.service.begin_worker()
+        clock = self.service._core.clock
+        clock.now = lambda: clock.end
+        self.service.check_core_watchdog()
+        self.assertFalse(self.service.active)
+        self.assertTrue(clock.snapshot()["finished"])
+        self.assertEqual(self.service.snapshot().stop_reason, "timeout")
+        self.service.end_worker()
         self.navigator.select.assert_not_called()
 
     def test_stop_retains_results_and_clear_only_affects_display(self):

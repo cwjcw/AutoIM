@@ -17,7 +17,7 @@ from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.collection_profile import PopupEvidence, ProfileWindows, owner_chain
 from autoim.wecom.collection_profile import ProfileAction, ProfileSurface, changed_regions
 from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client, _render_complete_client, capture_visible_window)
-from autoim.wecom.visual_contacts import ContactObservation
+from autoim.wecom.visual_contacts import ContactObservation, recover_b2_start
 from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_observation import VisualObservation
 from autoim.wecom.window_manager import WeComWindowManager
@@ -62,6 +62,9 @@ class CollectionPermit:
             if self._handle is not None:
                 self._handle.Close()
             self._handle, self._scroll = None, False
+
+    def cancel_input(self) -> None:
+        self._revoked.set()
 
     def ensure_current(self):
         if self._revoked.is_set() or self._handle is None:
@@ -203,10 +206,12 @@ class CollectionNavigation:
         self.input_diagnostic = ""
         self.report = lambda *args, **kwargs: None
 
-    def prepare_window(self, cancel):
+    def prepare_window(self, cancel, *, deadline_check=None):
         def check():
             if cancel.is_set():
                 raise CancelledError()
+            if deadline_check:
+                deadline_check()
             self.permit.ensure_current()
             if not self._desktop():
                 raise NavigationPaused("Windows 输入桌面不可操作")
@@ -218,6 +223,7 @@ class CollectionNavigation:
         check()
         return self.manager.prepare_collection_window(
             self._probe, self.permit.perform, check, wait,
+            async_visibility=deadline_check is not None,
             report=lambda code, result, details: self.report("WINDOW", code, result=result, details=details))
 
     def mark_started(self):
@@ -283,10 +289,23 @@ class CollectionNavigation:
             try:
                 hit = win32gui.WindowFromPoint(xy)
                 root = win32gui.GetAncestor(hit, 2) if hit else 0
-            except OSError as exc:
+            except (OSError, win32gui.error) as exc:
                 raise NavigationPaused(f"WindowFromPoint/GetAncestor 失败 · 坐标 {xy} · {exc}") from exc
             if root != c.hwnd:
+                details = {"region": "B2", "purpose": "B2_ACTUAL_INPUT", "actual_point": True,
+                           "point": point, "screen_point": xy, "hwnd": hit, "root": root, "obscured": True,
+                           "expected": c.hwnd, "rule": "ROOT_NOT_EXPECTED_MAIN"}
+                if hit:
+                    try:
+                        details.update(class_name=win32gui.GetClassName(hit), owner=win32gui.GetWindow(hit, 4),
+                                       pid=win32process.GetWindowThreadProcessId(hit)[1])
+                    except (OSError, win32gui.error):
+                        pass
+                self.report("WINDOW", "B2_TARGET_HIT", details=details)
                 raise NavigationPaused(_occlusion_detail(hit, c.hwnd, xy, win32gui, win32process), local=True)
+            self.report("WINDOW", "B2_TARGET_HIT", details={"region": "B2", "purpose": "B2_ACTUAL_INPUT",
+                        "actual_point": True, "point": point, "screen_point": xy, "hwnd": hit, "root": root,
+                        "expected": c.hwnd, "obscured": False})
             return xy
 
         return unobscured, activity
@@ -520,20 +539,11 @@ class CollectionNavigation:
                     Box(surface.bounds.right-1, surface.bounds.bottom-1, surface.bounds.right, surface.bounds.bottom))))
 
     def verify_normal_message(self, raw):
-        """Inspect message-area hit targets and reject visible profile-like popups."""
-        map_point, _ = self.verify_view(raw)
-        health = self._profile_health(raw.frame)
-        for hwnd, (popup, detached, reason) in self._profile_inventory(health).items():
-            if reason:
-                continue
-            if (popup.class_name == "UserInfoWindow" or popup.root_owner == health.window.hwnd
-                    or detached and popup.class_name == "WXworkWindow"):
-                raise NavigationPaused(f"需要先手动关闭资料层 · HWND {hwnd}")
-        for part in ("B1", "B2", "C1", "C2"):
-            box = raw.layout.get(part)
-            if box is None:
-                raise NavigationPaused("正常消息页面区域未能确认")
-            map_point(box.center)
+        """Check visual structure only. The input gateway checks the actual action point."""
+        missing = [part for part in ("B1", "B2", "C1", "C2") if raw.layout.get(part) is None]
+        if raw.page != "MESSAGES_CANDIDATE" or missing:
+            self.report("WINDOW", "MESSAGE_STRUCTURE_UNVERIFIED", details={"missing": missing, "actual_point": False})
+            raise NavigationPaused("正常消息页面结构未能确认 · " + ", ".join(missing))
 
     def profile_start(self, observation):
         frame = observation.frame
@@ -620,8 +630,9 @@ class CollectionNavigation:
         self.report("WINDOW", "TARGET_HIT", details={"hwnd": hit, "expected": hwnd, "point": xy})
         return xy, foreground, self._activity(True)
 
-    def select(self, observation: VisualObservation, row: ContactObservation) -> None:
-        self._act(observation, row_target(observation, row), row.box, scroll=False)
+    def select(self, observation: VisualObservation, row: ContactObservation, *, fresh_capture=None, deadline_check=None) -> None:
+        self._act(observation, row_target(observation, row), row.box, scroll=False,
+                  fresh_capture=fresh_capture, deadline_check=deadline_check)
 
     def scroll_visible_contacts(self, observation: VisualObservation) -> None:
         area = observation.layout.get("B2")
@@ -631,7 +642,7 @@ class CollectionNavigation:
         self._act(observation, point, area, scroll=True)
 
     def _act(self, observation: VisualObservation, point: tuple[int, int], target: Box, *, scroll: bool,
-             profile: ProfileAction | None = None, known_windows=(), menu=None) -> None:
+             profile: ProfileAction | None = None, known_windows=(), menu=None, fresh_capture=None, deadline_check=None) -> None:
         frame = observation.frame
         if profile:
             profile_check = self._profile_point(observation, profile, known_windows, menu)
@@ -643,7 +654,7 @@ class CollectionNavigation:
             if not 0 <= age <= 30:
                 raise NavigationPaused("联系人 OCR 结果已过期")
             _, activity = self.verify_view(observation, need_idle=True)
-            fresh = self.capture()
+            fresh = (fresh_capture or self.capture)()
             if _identity(frame) != _identity(fresh):
                 raise NavigationPaused("操作前窗口或坐标系已变化")
             health = fresh.diagnostics.window_health
@@ -651,13 +662,17 @@ class CollectionNavigation:
                 raise NavigationPaused(f"{health.status} · 操作前复查截图时窗口前台未确认", health=health)
             if observation.login.name and not observation.login.unchanged(fresh.pixels):
                 raise NavigationPaused("操作前 A1 登录账号区域已变化")
-            automatic_b2 = detect_layout(fresh.pixels, {}, VisualThresholds()).get("B2")
+            thresholds = VisualThresholds()
+            automatic_layout = detect_layout(fresh.pixels, {}, thresholds)
+            if fresh_capture:
+                automatic_layout = recover_b2_start(automatic_layout, fresh.pixels, fresh.state.dpi / 96, thresholds)
+            automatic_b2 = automatic_layout.get("B2")
             if automatic_b2 is None or not automatic_b2.contains(point):
                 raise NavigationPaused("自动分区无法独立确认该位置属于 B2")
-            for name in ("B1", "B2", "C1"):
-                region = observation.layout.get(name)
+            regions = (target,) if fresh_capture else tuple(observation.layout.get(name) for name in ("B1", "B2", "C1"))
+            for region in regions:
                 if region is None or not np.array_equal(region.crop(frame.pixels), region.crop(fresh.pixels)):
-                    raise NavigationPaused("操作前联系人列表或标题已变化，重新定位")
+                    raise NavigationPaused("操作前目标行已变化，重新定位" if fresh_capture else "操作前联系人列表或标题已变化，重新定位")
 
         def send() -> None:
             import win32api
@@ -682,6 +697,8 @@ class CollectionNavigation:
                     raise NavigationPaused("资料操作前窗口已禁用")
             if self._idle()[0] != current_activity:
                 raise NavigationPaused("复核期间检测到新的用户操作")
+            if deadline_check:
+                deadline_check()
             self.permit.ensure_current()
             win32api.SetCursorPos(xy)
             if not profile:
@@ -694,6 +711,8 @@ class CollectionNavigation:
                     raise NavigationPaused(f"资料点击前命中窗口变化 · {xy} · HWND 0x{hit:X}")
             elif map_point(point) != xy:
                 raise NavigationPaused("鼠标就位后目标点已变化")
+            if deadline_check:
+                deadline_check()
             self.permit.ensure_current()
             if scroll:
                 win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)

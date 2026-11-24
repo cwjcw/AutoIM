@@ -8,7 +8,6 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import blake2s
 from pathlib import Path
-from time import perf_counter
 from uuid import uuid4
 
 import numpy as np
@@ -18,7 +17,6 @@ from autoim.wecom.visual_monitor import _different, _history_content_box, _thumb
 from autoim.wecom.visual_store import database_path
 
 MAX_READ_POLLS = 4
-READ_WINDOW_SECONDS = 40
 MAX_DISPLAYED_MESSAGES = 500
 MAX_CACHED_OBSERVATIONS = 2500
 
@@ -195,7 +193,6 @@ class CoreTask:
     before_sample: np.ndarray | None
     id: str = field(default_factory=lambda: uuid4().hex)
     clicked_at: datetime | None = None
-    deadline: float = field(default_factory=lambda: perf_counter() + READ_WINDOW_SECONDS)
     polls: int = 0
     previous: np.ndarray | None = None
     previous_box: Box | None = None
@@ -222,6 +219,17 @@ class CoreRun:
     results_seen: dict = field(default_factory=dict)
     displayed: set = field(default_factory=set)
     task: CoreTask | None = None
+    navigation_task: CoreTask | None = None
+    clock: object | None = None
+    reader: object | None = None
+    presentation: str = ""
+    independent_reason: str = ""
+    independent_done: bool = False
+    finish_after_independent: bool = False
+    selection_waits: int = 0
+    mute_trials: Counter = field(default_factory=Counter)
+    mute_recent: dict = field(default_factory=dict)
+    muted_crops: set = field(default_factory=set)
     view: CoreView = CoreView()
 
     def accept_messages(self, task, analysis):

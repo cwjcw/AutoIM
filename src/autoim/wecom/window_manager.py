@@ -220,7 +220,8 @@ class WeComWindowManager:
         logger.error(error)
         raise WindowResolutionError(error)
 
-    def prepare_collection_window(self, probe, perform, check, wait, *, report=lambda *args, **kwargs: None):
+    def prepare_collection_window(self, probe, perform, check, wait, *, async_visibility=False,
+                                  report=lambda *args, **kwargs: None):
         """Prepare one fixed WeCom lifecycle on an explicit collection start."""
         first = probe()
         def facts(health):
@@ -234,6 +235,13 @@ class WeComWindowManager:
             return first
         original = first.identity
         gui, _ = self._windows_api()
+        show_window = gui.ShowWindow
+        if async_visibility:
+            from ctypes import windll, wintypes
+
+            show_window = windll.user32.ShowWindowAsync
+            show_window.argtypes = (wintypes.HWND, wintypes.INT)
+            show_window.restype = wintypes.BOOL
 
         def checked():
             check()
@@ -258,6 +266,9 @@ class WeComWindowManager:
                 return previous
             try:
                 observed = change(action)
+                if async_visibility and not verified(observed):
+                    wait()
+                    observed = checked()
             except gui.error as exc:
                 report(code, "FAILED", details={"before": facts(previous), "executed": True,
                                                "reason": f"Win32 {type(exc).__name__} {getattr(exc, 'winerror', '')}"})
@@ -267,11 +278,11 @@ class WeComWindowManager:
             return observed
 
         current = execute("WINDOW_RESTORE", first, first.status == "WINDOW_MINIMIZED",
-                          lambda hwnd: gui.ShowWindow(hwnd, 9), lambda state: state.status != "WINDOW_MINIMIZED")
+                          lambda hwnd: show_window(hwnd, 9), lambda state: state.status != "WINDOW_MINIMIZED")
         if current.status == "WINDOW_MINIMIZED":
             return current
         current = execute("WINDOW_MAXIMIZE", current, not current.last.zoomed,
-                          lambda hwnd: gui.ShowWindow(hwnd, 3), lambda state: state.last.zoomed)
+                          lambda hwnd: show_window(hwnd, 3), lambda state: state.last.zoomed)
         try:
             current = execute("WINDOW_ACTIVATE", current, current.status == "WINDOW_NOT_FOREGROUND" and current.last.zoomed,
                               gui.SetForegroundWindow, lambda state: state.foreground)

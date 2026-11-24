@@ -10,13 +10,14 @@ from pathlib import Path
 from time import monotonic
 from dataclasses import replace
 
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl, QSettings, QTimer, Qt, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtCore import QPoint, QUrl, QSettings, QTimer, Qt, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPlainTextEdit,
                                QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from autoim import __version__
 from autoim.vision_widgets import fit_dialog_to_screen
+from autoim.wecom.collection_bubble import CollectionBubble
 from autoim.wecom.collection_core import failure_crop_directory
 from autoim.wecom.collection_notifications import CollectionNotifier
 from autoim.wecom.collection_hotkey import CollectionHotkey
@@ -44,7 +45,7 @@ def collapsible(title, parent=None):
 
 SCAN_DELAY_MS = 2000
 PAUSE_RECHECK_MS = 3000
-CORE_READ_DELAY_MS = 1000
+CORE_READ_DELAY_MS = 250
 
 
 def _collection_lines(state: ScanStatus) -> list[str]:
@@ -236,6 +237,7 @@ class VisualCollectionPanel(QWidget):
         self._last_detection = ""
         self._stop_source = "control"
         self._pending_assist = None
+        self._bubble = None
         self._failure_key = None
         self._failure_seen = ""
         self._failure_count = 0
@@ -785,6 +787,7 @@ class VisualCollectionPanel(QWidget):
         self._stop_requested = False
         self._refresh()
         self._pulse.start()
+        self._update_bubble()
         if not core:
             self._notifier.announce("自动采集已启动", "正在准备企业微信窗口并核验账号")
         self._timer.start(0 if core else 2500)
@@ -803,12 +806,13 @@ class VisualCollectionPanel(QWidget):
                 self._notifier.flush()
             else:
                 self._service.stop()
-            if was_active:
+            if was_active and not self._service.snapshot().core:
                 self._notifier.announce("自动采集已停止", "鼠标控制权已交还")
         state = self._service.snapshot() if self.runtime and self._service else self._status
         self._stop_source = "control"
         self._render(replace(state, status="STOPPED", reason="许可已撤销", waiting_for_window=False, assist=""))
         self._refresh()
+        self._update_bubble()
 
     def save_current(self):
         if self.busy or not self._available:
@@ -847,8 +851,30 @@ class VisualCollectionPanel(QWidget):
             self._timer.start(PAUSE_RECHECK_MS)
 
     def _refresh_progress(self):
-        if self._service and self._in_flight and not self._stop_requested:
-            self._render(self._service.snapshot())
+        if self._service:
+            if self._service.snapshot().core:
+                self._service.check_core_watchdog()
+                self._update_bubble()
+            if self._in_flight and not self._stop_requested:
+                self._render(self._service.snapshot())
+
+    def _update_bubble(self):
+        if not self._service:
+            return
+        state = self._service.snapshot()
+        if not state.core:
+            return
+        progress = self._service.core_progress()
+        if not isinstance(progress, dict):
+            return
+        if self._bubble is None:
+            self._bubble = CollectionBubble()
+            QApplication.instance().aboutToQuit.connect(self._bubble.close)
+        rect = state.window_health.geometry[0] if state.window_health and state.window_health.geometry else None
+        screen = QGuiApplication.screenAt(QPoint(rect[0] + 20, rect[1] + 20)) if rect else None
+        self._bubble.update_test(progress, state.core, self._shortcut,
+                                 waiting_for=state.navigation_block_reason, target_screen=screen,
+                                 unread_markers=state.unread_marker_count)
 
     def _tick(self):
         if self._service and self._service.active and not self._in_flight:
@@ -895,7 +921,8 @@ class VisualCollectionPanel(QWidget):
             result = replace(result, status="STOPPED", reason="许可已撤销", waiting_for_window=False)
         self._render(result)
         self._refresh()
-        if not self._stop_requested:
+        self._update_bubble()
+        if not self._stop_requested and not result.core:
             self._handle_failure(result)
         if self._service and self._service.active:
             if self._pending_assist and result.assist:
@@ -904,8 +931,7 @@ class VisualCollectionPanel(QWidget):
                 return
             self._pending_assist = None
             if not result.core or result.core.phase != "WINDOW_IDENTITY_CHANGED":
-                fast = result.core and result.core.clicked and result.core.risk == "CLICKED_AWAITING_READ"
-                delay = CORE_READ_DELAY_MS if fast else PAUSE_RECHECK_MS if result.status == "PAUSED" else SCAN_DELAY_MS
+                delay = CORE_READ_DELAY_MS if result.core else PAUSE_RECHECK_MS if result.status == "PAUSED" else SCAN_DELAY_MS
                 self._timer.start(delay)
         else:
             self._pulse.stop()
@@ -998,7 +1024,7 @@ class VisualCollectionPanel(QWidget):
         self.clear_core_button.setEnabled(bool(messages) and not self._in_flight)
         if core:
             confirmed = sum(item.unread == "CONFIRMED_UNREAD" for item in messages)
-            uncertain = sum(item.unread in ("UNKNOWN", "UNREAD_CANDIDATE", "LATEST_VISIBLE", "ATTRIBUTION_UNCERTAIN")
+            uncertain = sum(item.unread in ("UNKNOWN", "UNREAD_CANDIDATE", "LATEST_VISIBLE", "ATTRIBUTION_UNCERTAIN", "INDEPENDENT_OCR")
                             for item in messages)
             self.core_stats.setText(
                 f"已发现未读联系人 {core.discovered} · 等待 {core.waiting} · 实际点击 {core.clicks} · 已确认会话 {core.verified}\n"
@@ -1018,7 +1044,8 @@ class VisualCollectionPanel(QWidget):
         self.core_table.setRowCount(len(messages))
         direction = {"INBOUND": "收到", "OUTBOUND": "发出", "UNKNOWN": "未知"}
         unread = {"CONFIRMED_UNREAD": "已确认未读", "UNREAD_CANDIDATE": "可能未读", "LATEST_VISIBLE": "最新可见",
-                  "HISTORY_VISIBLE": "历史可见", "ATTRIBUTION_UNCERTAIN": "会话归属未确认", "UNKNOWN": "未读未确认"}
+                  "HISTORY_VISIBLE": "历史可见", "ATTRIBUTION_UNCERTAIN": "会话归属未确认", "UNKNOWN": "未读未确认",
+                  "INDEPENDENT_OCR": "独立 OCR · 非已确认目标未读"}
         for row, message in enumerate(messages):
             values = (message.contact, str(message.sequence), direction.get(message.direction, message.direction),
                       message.time or "—", message.kind, message.text or "—", message.quality,
