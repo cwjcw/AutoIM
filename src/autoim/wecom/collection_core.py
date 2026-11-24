@@ -16,6 +16,7 @@ import numpy as np
 from autoim.wecom.visual_layout import Box
 from autoim.wecom.visual_monitor import _different, _history_content_box, _thumbnail
 from autoim.wecom.visual_store import database_path
+from autoim.wecom.visual_time import MessageTime
 
 MAX_READ_POLLS = 4
 MAX_DISPLAYED_MESSAGES = 500
@@ -102,6 +103,12 @@ class CoreMessage:
     unread: str
     reason: str
     parser_status: str
+    clock_source: str = "GROUP_ANCHOR"
+    clock: MessageTime = MessageTime()
+    clock_sequence: int = 0
+    collection_status: str = "NOT_COMPARED"
+    save_status: str = "NOT_SAVED"
+    file: object | None = None
 
     def diagnostic(self):
         return dict(observation_id=self.id, sequence=self.sequence, direction=self.direction,
@@ -139,7 +146,8 @@ def _read_message(item, task, contact):
     elif item.file and item.file.parse_status != "COMPLETE":
         quality, reason = "PARTIAL", "FILE_METADATA_INCOMPLETE"
     return CoreMessage(uuid4().hex[:12], task, contact, item.sequence, item.direction, item.kind, text,
-                       item.time_evidence, item.sender_name, confidence, item.box, quality, "UNKNOWN", reason, item.status)
+                       item.time_evidence, item.sender_name, confidence, item.box, quality, "UNKNOWN", reason, item.status,
+                       clock_source=item.time_source, file=item.file)
 
 
 def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared, refreshed):
@@ -222,6 +230,12 @@ class CoreView:
     repeated: int = 0
     messages: tuple[CoreMessage, ...] = ()
     read_unfinished: int = 0
+    first_saved: int = 0
+    new_saved: int = 0
+    existing: int = 0
+    review_messages: int = 0
+    save_failures: int = 0
+    independent_messages: int = 0
 
 
 @dataclass(slots=True)
@@ -244,6 +258,8 @@ class CoreTask:
     applied_point: tuple[int, int] | None = None
     match_evidence: str = ""
     match_distance: float | None = None
+    read_at: datetime | None = None
+    conversation_kind: str = "UNKNOWN"
 
 
 @dataclass(slots=True)

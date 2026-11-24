@@ -13,9 +13,7 @@ from autoim.vision import NormalizedRect
 from autoim.wecom.visual_files import FileCardObservation, parse_file_card, quiet_card_bounds
 from autoim.wecom.visual_layout import Box, VisualThresholds, near_background
 from autoim.wecom.visual_ocr import TextSpan, text_lines
-
-_TIME_LABEL = re.compile(r"(?:(?:今天|昨天|星期[一二三四五六日天]|\d{1,2}月\d{1,2}日|"
-                         r"\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})\s*)?(?:[01]?\d|2[0-3]):[0-5]\d")
+from autoim.wecom.visual_time import TIME_LABEL, normalized_time
 _SYSTEM = re.compile(r"撤回了[一1]条消息|加入了群聊|退出了群聊|移出了群聊|以下是新消息|开启了会话内容存档|你们已成为好友")
 _IMAGE_PLACEHOLDER = re.compile(r"\[图片\]|【图片】|图片加载中[.…]*|图片未加载|图片已过期")
 _COMPLEX_CARD = re.compile(r"引用|聊天记录|小程序|转发")
@@ -36,6 +34,7 @@ class VisibleMessageObservation:
     ocr_spans: tuple[TextSpan, ...]
     file: FileCardObservation | None = None
     sender_name: str = ""
+    time_source: str = "GROUP_ANCHOR"
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +287,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
     center = region.center[0]
     time_like = {span for span in spans if span.score >= thresholds.text_score
                  and abs(span.box.center[0] - center) <= region.width * .12
-                 and _TIME_LABEL.fullmatch(span.text.strip())}
+                 and TIME_LABEL.fullmatch(normalized_time(span.text))}
     attachment_spans = tuple(span for span in spans if span not in time_like)
     preliminary = _file_candidates(containers, attachment_spans, unit, thresholds.text_score) if page_verified else {}
     # Strong outer bounds own inner icon contours. Competing card-sized boxes

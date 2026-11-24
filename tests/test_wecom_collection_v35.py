@@ -12,6 +12,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from autoim.wecom.collection_core import MAX_READ_POLLS, CoreView, analyze_read
+from autoim.wecom.collection_incremental import SOURCE, CoreAccount
 from autoim.wecom.collection_navigation import NavigationPaused
 from autoim.wecom.collection_panel import VisualCollectionPanel
 from autoim.wecom.collection_runtime import CollectionRuntime
@@ -141,6 +142,32 @@ class CoreFlowTests(unittest.TestCase):
             self.poll()
         profile.assert_called_once()
         self.navigator.select.assert_not_called()
+
+    def test_confirmed_core_flow_commits_then_displays_and_never_writes_formal_store(self):
+        self.service._core_account = CoreAccount("合成采集账号", "core@example.test")
+        self.start()
+        self.poll()
+        result = self.poll(sample(1, {2: (1, False)}, tone=160), count=2)
+        self.assertEqual((result.core.clicks, result.core.verified, result.core.first_saved), (1, 1, 1))
+        self.assertEqual((result.core.messages[0].text, result.core.messages[0].save_status), (BODY, "SAVED"))
+        self.assertFalse(self.formal.path.exists())
+        with self.isolated.transaction() as db:
+            self.assertEqual(db.execute("SELECT body FROM messages WHERE source=?", (SOURCE,)).fetchone()[0], BODY)
+        events = self.events()
+        codes = [event["code"] for event in events]
+        self.assertLess(codes.index("CORE_DB_COMMITTED"), codes.index("RESULT_DISPLAYED"))
+        self.assertNotIn(BODY, repr(events))
+
+    def test_confirmed_core_flow_displays_body_after_isolated_commit_failure(self):
+        self.service._core_account = CoreAccount("合成采集账号", "core@example.test")
+        self.start()
+        self.poll()
+        with patch.object(self.isolated, "transaction", side_effect=OSError):
+            result = self.poll(sample(1, {2: (1, False)}, tone=160), count=2)
+        self.assertEqual((result.core.first_saved, result.core.save_failures), (0, 1))
+        self.assertEqual((result.core.messages[0].text, result.core.messages[0].save_status), (BODY, "FAILED"))
+        self.assertFalse(self.formal.path.exists())
+        self.assertFalse(self.isolated.path.exists())
 
     def test_startup_a1_preview_does_not_touch_databases(self):
         status = self.service.identify_account(visual_only=True)

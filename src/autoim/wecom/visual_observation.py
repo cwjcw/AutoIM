@@ -73,7 +73,10 @@ class _ObservedReader:
         self.observations: list[OcrAreaObservation] = []
 
     def read(self, pixels: np.ndarray, box: Box, *, single_line: bool = False) -> tuple[TextSpan, ...]:
-        region = f"{self.region} 徽标数字" if single_line else self.region
+        return self.read_region(f"{self.region} 徽标数字" if single_line else self.region,
+                                pixels, box, single_line=single_line)
+
+    def read_region(self, region, pixels, box, *, single_line=False):
         if self.reader is None:
             self.observations.append(OcrAreaObservation(region, box, "SKIPPED", reason="OCR 未初始化"))
             return ()
@@ -121,6 +124,7 @@ class VisualObservation:
     recognition_ms: float = 0
     anchors: tuple[int | None, int | None] = (None, None)
     message_ocr: tuple[OcrDisposition, ...] = ()
+    b2_badges: tuple = ()
     contact_text_diagnostics: tuple[ContactTextDiagnostic, ...] = ()
     message_completeness: str = "VISIBLE_MESSAGES_UNVERIFIED"
     board_scrollbar: Box | None = None
@@ -224,7 +228,7 @@ _PHONE_METADATA = re.compile(r"(?<![0-9])(?:(?:\+?86)[ \-]*)?1[3-9](?:[ \-]*[0-9
 _ORG_METADATA = re.compile(r"(?:有限公司|公司|集团|部门|中心|事业部|工作室|Corporation|Company|Inc\.?|Ltd\.?)$", re.I)
 
 
-def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds
+def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds, *, multi_feature=False
                     ) -> tuple[str, VisualName, tuple[str, ...], bool, str]:
     if not spans:
         return "", VisualName(""), (), False, "C1 无标题 OCR"
@@ -254,7 +258,7 @@ def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds
         details.insert(0, metadata)
         later_labels += tuple(tag.strip() for tag in metadata.split("@")[1:])
         text = text[:index].strip().rstrip("·-—,，:：|").strip()
-    parsed = parse_visual_name(text, labels_from_title=later_labels)
+    parsed = parse_visual_name(text, labels_from_title=later_labels, allow_short_organization=multi_feature)
     inline_label = "@" in text
     if inline_label and not parsed.issue:
         details.insert(0, text[text.index("@"):])
@@ -273,8 +277,8 @@ def _title_identity(spans: tuple[TextSpan, ...], thresholds: VisualThresholds
 
 
 def compare_conversation(title_spans: tuple[TextSpan, ...], contacts: tuple[ContactObservation, ...],
-                         thresholds: VisualThresholds) -> ConversationObservation:
-    raw, title_identity, details, title_reliable, note = _title_identity(title_spans, thresholds)
+                         thresholds: VisualThresholds, *, multi_feature=False) -> ConversationObservation:
+    raw, title_identity, details, title_reliable, note = _title_identity(title_spans, thresholds, multi_feature=multi_feature)
     title = title_identity.display_name
     selected = [row for row in contacts if row.is_selected is True]
     row = selected[0] if len(selected) == 1 else None
@@ -312,12 +316,12 @@ def compare_conversation(title_spans: tuple[TextSpan, ...], contacts: tuple[Cont
                                    selection_evidence=row.selection_evidence if row else "")
 
 
-def _corroborate_selection(title_spans, contacts, thresholds, mouse):
+def _corroborate_selection(title_spans, contacts, thresholds, mouse, *, multi_feature=False):
     if any(row.is_selected is True for row in contacts):
         return contacts, ""
     if any(row.selection_method == "CONFLICTING_HIGHLIGHT" for row in contacts):
         return contacts, "B2 行底与高亮带定位冲突，或存在多个蓝色候选"
-    raw, title, _, reliable, note = _title_identity(title_spans, thresholds)
+    raw, title, _, reliable, note = _title_identity(title_spans, thresholds, multi_feature=multi_feature)
     if not reliable:
         return contacts, "B2 无明确高亮，" + note
     names = {_name_key(title.display_name), _name_key(raw)}
@@ -332,7 +336,7 @@ def _corroborate_selection(title_spans, contacts, thresholds, mouse):
     reason = row.selection_evidence + " · C1 标题与唯一可靠 B2 行一致"
     corroborated = tuple(replace(item, is_selected=item is row, selection_method="SUBTLE_FILL_AND_C1",
                                  selection_evidence=reason) for item in contacts)
-    if compare_conversation(title_spans, corroborated, thresholds).match_status != "VISUAL_MATCH":
+    if compare_conversation(title_spans, corroborated, thresholds, multi_feature=multi_feature).match_status != "VISUAL_MATCH":
         return contacts, "浅色行与 C1 身份核对冲突"
     return corroborated, ""
 
@@ -340,7 +344,7 @@ def _corroborate_selection(title_spans, contacts, thresholds, mouse):
 def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                   reader: TextRecognizer | None = None,
                   thresholds: VisualThresholds = VisualThresholds(), *, on_conversation=None,
-                  contacts_only=False, message_gate=None, history_only=False) -> VisualObservation:
+                  contacts_only=False, message_gate=None, history_only=False, multi_feature=False) -> VisualObservation:
     started = perf_counter()
     pixels = frame.pixels
     layout = detect_layout(pixels, calibration, thresholds)
@@ -370,15 +374,19 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     unread = detect_global_unread(pixels, a, trace, thresholds) if a else GlobalUnreadObservation()
     trace.region = "B2 联系人"
     contact_diagnostics: list[ContactTextDiagnostic] = []
-    contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics) if b2 and not history_only else ()
+    b2_badges = []
+    contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics,
+                               multi_feature=multi_feature, badge_diagnostics=b2_badges,
+                               read_activity=lambda pixels, box: trace.read_region("B2 活动时间", pixels, box)
+                               ) if b2 and not history_only else ()
     if contacts_only:
         page = "MESSAGES_CANDIDATE" if b2 and (unread.entry or (search and add and contacts)) else "UNKNOWN"
         return VisualObservation(frame, layout, "CONTACTS_ONLY", page=page, contacts=contacts,
                                  search_box=search, add_button=add, global_unread=unread,
                                  ocr_areas=tuple(trace.observations), ocr_status=ocr_status,
                                  recognition_ms=(perf_counter() - started) * 1000)
-    contacts, selection_issue = _corroborate_selection(title_spans, contacts, thresholds, frame.mouse)
-    conversation = compare_conversation(title_spans, contacts, thresholds)
+    contacts, selection_issue = _corroborate_selection(title_spans, contacts, thresholds, frame.mouse, multi_feature=multi_feature)
+    conversation = compare_conversation(title_spans, contacts, thresholds, multi_feature=multi_feature)
     if selection_issue:
         fills = [row.selection_evidence for row in contacts if row.selection_method == "SUBTLE_ROW_FILL"]
         conversation = replace(conversation, selection_evidence=" · ".join((selection_issue, *fills)))
@@ -406,7 +414,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
         list_verified = bool(b2 and contacts and (unread.entry or (search and add)))
         header = VisualObservation(frame, layout, "HEADER_ONLY",
                                    page="MESSAGES_CANDIDATE" if corroborated or list_verified else "UNKNOWN",
-                                   contacts=contacts, conversation=conversation, composer=composer,
+                                   contacts=contacts, conversation=conversation, composer=composer, b2_badges=tuple(b2_badges),
                                    search_box=search, add_button=add, global_unread=unread,
                                    ocr_areas=tuple(trace.observations), ocr_status=ocr_status,
                                    recognition_ms=(perf_counter() - started) * 1000)
@@ -468,7 +476,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
               "CANDIDATE" if corroborated else "PAGE_UNCERTAIN")
     return VisualObservation(
         frame, layout, status, page="MESSAGES_CANDIDATE" if corroborated else "UNKNOWN",
-        contacts=contacts, conversation=replace(conversation, completeness=completeness),
+        contacts=contacts, conversation=replace(conversation, completeness=completeness), b2_badges=tuple(b2_badges),
         messages=messages, context_text=context, search_box=search, add_button=add, composer=composer,
         list_scrollbar=detect_scroll_thumb(pixels, b2, unit) if b2 else None,
         history_scrollbar=detect_scroll_thumb(pixels, c2, unit) if c2 else None,

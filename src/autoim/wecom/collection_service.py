@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from concurrent.futures import CancelledError
 from hashlib import blake2s
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +20,7 @@ from autoim.calibration import CalibrationStore
 from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
+from autoim.wecom.collection_incremental import CoreAccount, attach_times, save_visible
 from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
@@ -28,6 +29,7 @@ from autoim.wecom.collection_test import TestClock, TestDeadline
 from autoim.wecom.collection_worker import CoreReadWorker
 from autoim.wecom.visual_account import LoginEvidence, read_login
 from autoim.wecom.visual_capture import CaptureError, capture_visible_window
+from autoim.wecom.visual_b2 import mute_region
 from autoim.wecom.visual_contacts import ContactObservation, muted_icon_region
 from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_monitor import _different, probe_frame, summarize
@@ -44,6 +46,7 @@ class CollectionReader:
         self._thresholds_path = thresholds
         self._settings = None
         self._ocr = None
+        self._core_cache = OrderedDict()
 
     def set_calibration(self, path: Path | None) -> None:
         self._calibration_path = path
@@ -88,9 +91,22 @@ class CollectionReader:
     def read_core(self, frame, message_gate, *, history_only=False):
         started = perf_counter()
         own = self.identify(frame).login
-        raw = observe_frame(frame, self._settings[0], self._ocr, self._settings[1],
-                            message_gate=lambda header: message_gate(replace(header, login=own)), history_only=history_only)
+        raw = observe_frame(frame, self._settings[0], self if self._ocr is not None else None, self._settings[1],
+                            message_gate=lambda header: message_gate(replace(header, login=own)),
+                            history_only=history_only, multi_feature=True)
         return replace(raw, login=own, recognition_ms=(perf_counter() - started) * 1000)
+
+    def read(self, pixels, box, *, single_line=False):
+        # A new capture is still required. Reuse OCR only for byte-identical crops.
+        image = np.ascontiguousarray(box.crop(pixels))
+        key = box, image.shape, single_line, blake2s(image, digest_size=16).digest()
+        if key not in self._core_cache:
+            self._core_cache[key] = self._ocr.read(pixels, box, single_line=single_line)
+            if len(self._core_cache) > 48:
+                self._core_cache.popitem(last=False)
+        else:
+            self._core_cache.move_to_end(key)
+        return self._core_cache[key]
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +163,9 @@ class ScanStatus:
     b2_scan_completed_at: datetime | None = None
     contact_count: int = 0
     unread_marker_count: int = 0
+    unowned_unread_count: int = 0
+    muted_excluded_count: int = 0
+    folded_excluded_count: int = 0
     reliable_unread_count: int = 0
     unreliable_unread_count: int = 0
     unreliable_reasons: tuple[str, ...] = ()
@@ -220,6 +239,8 @@ class _Target:
     @property
     def key(self) -> str:
         labels = "|".join(map(name_key, self.row.identity_labels))
+        if not self.row.name_reliable and self.row.geometry_reliable:
+            return f"GEOMETRY|{self.row.box.left}|{self.row.box.top}|{self.avatar}|{self.name}"
         return f"{self.name}|{self.avatar}|{self.row.peer_type}|{labels}"
 
     @property
@@ -246,9 +267,8 @@ def _merge_unread(previous: tuple, current: tuple) -> tuple:
 
 
 def _core_read_rank(analysis):
-    return (sum(item.unread == "CONFIRMED_UNREAD" for item in analysis.messages),
-            sum(item.quality == "RELIABLE" for item in analysis.messages),
-            analysis.latest != "UNKNOWN", len(analysis.messages))
+    return (sum(item.quality == "RELIABLE" for item in analysis.messages),
+            -len(analysis.gaps), analysis.latest != "UNKNOWN", len(analysis.messages))
 
 
 def unread_targets(observation: VisualObservation, scope: CollectionScope | None = None) -> tuple[_Target, ...]:
@@ -261,12 +281,17 @@ def unread_targets(observation: VisualObservation, scope: CollectionScope | None
         if not row.has_unread_indicator:
             continue
         name = name_key(row.display_name)
+        geometric_target = (row.geometry_reliable and row.status == "NAME_UNCERTAIN" and
+                            (row.activity_time_reliable or row.boundary_source == "GRAY_DIVIDERS") and
+                            row.badge_kind in ("NORMAL_NUMBER", "SMALL_RED") and
+                            not name.startswith(("折叠", "新的联系", "消息管理")))
         checks = (
             (row.kind not in ("CONTACT", "GROUP_CANDIDATE"), "未知或未核实的会话入口类型"),
-            (names[name] != 1 or not row.name_reliable, "联系人身份重复或姓名不可靠"),
-            (row.status != "CANDIDATE", "联系人行部分可见或状态不可靠"),
+            (not geometric_target and (names[name] != 1 or not row.name_reliable), "联系人身份重复或姓名不可靠"),
+            (row.status != "CANDIDATE" and not geometric_target, "联系人行部分可见或状态不可靠"),
             (scope is not None and not scope.muted and row.is_muted is None, "静音状态无法确认"),
-            (row.avatar is None and row.peer_type == "UNKNOWN", "缺少头像或身份标签的独立会话证据"),
+            (not geometric_target and row.avatar is None and row.peer_type == "UNKNOWN"
+             and not (row.geometry_reliable and row.activity_time_reliable), "缺少头像或身份标签的独立会话证据"),
             (scope is not None and row.kind == "CONTACT" and row.peer_type == "UNKNOWN"
              and not (row.preview or row.activity_time_reliable), "入口缺少普通会话的预览或活动证据"),
             (scope is not None and scope.personal != scope.group and row.kind == "CONTACT"
@@ -345,7 +370,14 @@ def _verify_transition(before: VisualObservation, after: VisualObservation, targ
 
 def _core_selection_evidence(before, after, target, refreshed):
     if _matches_target(after, target):
-        return "EXACT_VISUAL_IDENTITY", None
+        row = next(row for row in after.contacts if name_key(row.display_name) == target.name)
+        distance = avatar_distance(before, target.row, after, row)
+        if distance is not None and distance > 22:
+            return "AVATAR_CONFLICT", distance
+        if target.avatar:
+            return "EXACT_VISUAL_IDENTITY", distance
+    if not target.row.name_reliable and target.row.geometry_reliable:
+        return _core_geometry_continuity(before, after, target, refreshed)
     rows = [row for row in after.contacts if name_key(row.display_name) == target.name]
     if (len(rows) != 1 or not refreshed or not before.conversation.title_name_reliable
             or name_key(before.conversation.title) == target.name
@@ -359,9 +391,47 @@ def _core_selection_evidence(before, after, target, refreshed):
     if not _matches_target(after, target, avatar_corroborated=True):
         return "NAME_ROW_OR_PEER_EVIDENCE_CONFLICT", None
     distance = avatar_distance(before, target.row, after, row)
-    if distance is None or distance > 22:
-        return "AVATAR_EVIDENCE_NOT_CORROBORATED", distance
+    if distance is None:
+        return "CLICK_TITLE_ROW_BADGE_REFRESH_AVATAR_UNAVAILABLE", None
+    if distance > 22:
+        return "AVATAR_CONFLICT", distance
     return "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR", distance
+
+
+def _core_geometry_continuity(before, after, target, refreshed):
+    selected = [row for row in after.contacts if row.is_selected is True]
+    conv = after.conversation
+    title = name_key(conv.title)
+    if (len(selected) != 1 or not refreshed or not conv.title_name_reliable or not title
+            or not before.conversation.title_name_reliable or title == name_key(before.conversation.title)
+            or not target.row.badge or after.layout.get("C2") is None):
+        return "GEOMETRY_TRANSITION_UNVERIFIED", None
+    row = selected[0]
+    previous = target.row
+    partial = name_key(previous.display_name).rstrip(".…")
+    if (not row.geometry_reliable or row.has_unread_indicator or row.badge
+            or row.kind not in ("CONTACT", "GROUP_CANDIDATE")
+            or row.name_reliable and title != name_key(row.display_name)
+            or any(other is not row and other.name_reliable and title == name_key(other.display_name)
+                   for other in after.contacts)
+            or partial and not title.startswith(partial)
+            or target.row.peer_type != "UNKNOWN" and row.peer_type != "UNKNOWN"
+            and target.row.peer_type != row.peer_type
+            or conv.title_peer_type != "UNKNOWN" and row.peer_type != "UNKNOWN"
+            and conv.title_peer_type != row.peer_type
+            or not row.box.contains(previous.box.center)
+            or abs(row.box.center[1] - previous.box.center[1]) > previous.box.height * .20):
+        return "GEOMETRY_TITLE_OR_ROW_CONFLICT", None
+    # A common neighboring named row anchors the list against reordering.
+    neighbors = {name_key(r.display_name): r.box.center[1] for r in before.contacts if r.name_reliable
+                 and r != previous and abs(r.box.center[1] - previous.box.center[1]) <= previous.box.height * 1.55}
+    if not any(r is not row and r.name_reliable and name_key(r.display_name) in neighbors
+               and abs(neighbors[name_key(r.display_name)] - r.box.center[1]) <= previous.box.height * .20
+               for r in after.contacts):
+        return "GEOMETRY_NEIGHBORS_CHANGED", None
+    distance = avatar_distance(before, previous, after, row)
+    return ("AVATAR_CONFLICT", distance) if distance is not None and distance > 22 else (
+        "CLICK_GEOMETRY_TITLE_BADGE_REFRESH", distance)
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,7 +468,7 @@ class AccountPaused(NavigationPaused):
 class CollectionService:
     def __init__(self, profile: str | None, store: VisualStore, reader: CollectionReader, *,
                  capture=None, navigator=None, permit: CollectionPermit | None = None, window_probe=None,
-                 require_email: bool = False, isolated_store=None) -> None:
+                 require_email: bool = False, isolated_store=None, core_account=None) -> None:
         self.profile = profile
         self._auto_account = profile is None
         self._require_email = require_email and self._auto_account
@@ -413,6 +483,7 @@ class CollectionService:
         self.store = store
         self.read = reader
         self._isolate_core_reads = capture is None and isinstance(reader, CollectionReader)
+        self._core_account = core_account
         manager = WeComWindowManager()
         self.capture = capture if capture is not None else lambda: capture_visible_window(manager)
         self._window_probe = window_probe
@@ -560,11 +631,12 @@ class CollectionService:
         if isinstance(self.navigator, CollectionNavigation):
             self.navigator.mark_started()
         self._record("RUN", "DETECTION_STARTED", details={"scope": repr(self.scope),
-                     "flow": "CORE_READ_ONLY_RESULTS" if core else "EMAIL_DIAGNOSTIC" if email_test_only else "FORMAL_OR_LEGACY"})
+                     "flow": "CORE_ISOLATED_INCREMENTAL" if core else "EMAIL_DIAGNOSTIC" if email_test_only else "FORMAL_OR_LEGACY"})
         if core:
             core.clock = TestClock(self._timed_core_event)
             core.clock.begin(1, "定位、恢复、最大化并激活企业微信")
             if self._isolate_core_reads:
+                self._core_account = CoreAccount.load()
                 core.reader = CoreReadWorker(self.read._calibration_path, self.read._thresholds_path)
 
     def stop(self, *, source="control", final_reason="") -> None:
@@ -1243,18 +1315,26 @@ class CollectionService:
         observed = unread_targets(raw, self.scope)
         skipped = tuple(target for target in observed if target.skip_reason)
         targets = tuple(target for target in observed if not target.skip_reason)
-        marker_count = len(observed)
+        unowned = tuple(item for item in raw.b2_badges if not any(
+            target.row.badge and target.row.badge.contains(item.box.center) for target in observed))
+        marker_count = len(observed) + len(unowned)
         unreliable = tuple(target for target in targets if target.ambiguous)
         reliable_count = len(targets) - len(unreliable)
         categories = Counter(item.uncertainty for item in unreliable)
         policy_count = sum(item.scope_decision == "SKIPPED_BY_POLICY" for item in skipped)
         unsupported = len(skipped) - policy_count
         self._record_contact_decisions(raw, observed, blocked_reason)
+        for item in unowned:
+            self._record("SCOPE", "B2_BADGE_UNASSIGNED", details={"box": bounds(item.box), "kind": item.kind})
         reasons = tuple(dict.fromkeys(reason for target in unreliable for reason in target.blockers))
         completed = EventTime.now().wall
         conversation = raw.conversation
         self._set(b2_scan_attempt_at=attempted_at.wall, b2_scan_completed_at=completed, last_scan=completed,
                   contact_count=len(raw.contacts), unread_marker_count=marker_count,
+                  unowned_unread_count=len(unowned),
+                  muted_excluded_count=sum(item.row.is_muted is True and not self.scope.muted
+                                           for item in skipped if self.scope),
+                  folded_excluded_count=sum(item.row.kind == "FOLDED_CHAT_CONTAINER" for item in skipped),
                   reliable_unread_count=reliable_count, unreliable_unread_count=len(unreliable),
                   unreliable_reasons=reasons, candidates=reliable_count, navigation_block_reason="",
                   skipped_unread=len(skipped), policy_skipped_unread=policy_count, unsupported_unread=unsupported,
@@ -1263,7 +1343,7 @@ class CollectionService:
                   navigation_blocked_unread=reliable_count if blocked_reason else 0,
                   skipped_reasons=tuple(dict.fromkeys(t.skip_reason for t in skipped)),
                   scan_disposition="B2_SCANNED_UNREAD" if reliable_count else
-                  "B2_SCANNED_UNRELIABLE" if unreliable else
+                  "B2_SCANNED_UNRELIABLE" if unreliable or unowned else
                   "SKIPPED_BY_POLICY" if skipped else "B2_SCANNED_NO_UNREAD",
                   awaiting_navigation=len(self._queued), selection_method=conversation.selection_method,
                   selection_name=conversation.selected_name, selection_name_reliable=conversation.selected_name_reliable,
@@ -1301,13 +1381,17 @@ class CollectionService:
                 "observation_id": f"{self._status.scan_id}:{row.sequence}", "target_id": alias,
                 "row_index": row.sequence, "row_box": (row.box.left, row.box.top, row.box.right, row.box.bottom),
                 "conversation_kind": row.kind, "peer_type": row.peer_type, "kind_evidence": evidence,
-                "muted_state": mute, "muted_evidence": {"TRUE": "DIAGONAL_ICON_STROKE",
+                "muted_state": mute, "muted_evidence": row.mute_evidence or {"TRUE": "DIAGONAL_ICON_STROKE",
                     "FALSE": "NO_MARK_IN_ICON_REGION", "UNKNOWN": "INSUFFICIENT_ICON_EVIDENCE"}[mute],
+                "muted_score": round(row.mute_score, 3) if row.mute_score is not None else None,
                 "unread_present": row.has_unread_indicator,
                 "unread_kind": ("DIGIT" if count is not None else "DOT_OR_UNREADABLE_DIGIT")
                 if row.has_unread_indicator else "NONE",
                 "unread_count": count, "name_reliable": row.name_reliable,
-                "position_reliable": row.status == "CANDIDATE", "selected_state": row.is_selected,
+                "badge_box": bounds(row.badge), "badge_style": row.badge_kind,
+                "position_reliable": row.status == "CANDIDATE" or row.geometry_reliable, "selected_state": row.is_selected,
+                "time_anchor_reliable": row.activity_time_reliable, "avatar_detected": bool(row.avatar),
+                "boundary_source": row.boundary_source, "estimated_pitch": row.row_pitch,
                 "scope_decision": decision, "exclusion_reason": safe_reason(reason),
                 "navigation_eligible": decision == "ELIGIBLE",
             })
@@ -1780,7 +1864,7 @@ class CollectionService:
         except (OSError, cv2.error) as exc:
             self._core_event("PRIVATE_FAILURE_CROP_FAILED", reason=type(exc).__name__)
 
-    def _finish_core_target(self, task, raw, code, *, reason="", analysis=None):
+    def _finish_core_target(self, task, raw, code, *, reason="", analysis=None, allow_persistence=True):
         run = self._core
         if not self.active:
             return self._status
@@ -1796,9 +1880,15 @@ class CollectionService:
         self._core_event(code, task, result, reason=reason, read_risk=missing_read)
         self._core_event("NEXT_TARGET", task, result="AUTO_PASS", fresh_b2_required=True)
         if analysis and analysis.messages:
-            run.clock.begin(7, "将 OCR 正文加入实时采集结果")
-            run.accept_messages(task, analysis)
-            if any(item.task == task.id for item in run.view.messages):
+            run.clock.begin(7, "比对本机历史、保存新增并显示 OCR 正文")
+            analysis = self._core_persist(task, raw, analysis, allow=allow_persistence)
+            if not self.active:
+                return self._status
+            if self._core_account:
+                run.view = replace(run.view, messages=(*run.view.messages, *analysis.messages)[-500:])
+            else:
+                run.accept_messages(task, analysis)
+            if run.clock.phase and any(item.task == task.id for item in run.view.messages):
                 run.presentation = task.id
             else:
                 run.clock.complete("SKIPPED", "重复观察，界面已保留既有结果")
@@ -1814,6 +1904,39 @@ class CollectionService:
                          completeness=analysis.completeness if analysis else "")
         return self._set(status="RUNNING" if self.active else "STOPPED",
                          reason=reason or "已读取目标消息，下一轮重新扫描 B2")
+
+    def _core_persist(self, task, raw, analysis, *, allow):
+        run = self._core
+        at = task.read_at or raw.frame.captured_at
+        if not self._core_account or not task.verified or not allow:
+            if self._isolate_core_reads:
+                reason = "DEFAULT_ACCOUNT_UNAVAILABLE" if not self._core_account else "CAPTURE_EXPIRED_OR_UNVERIFIED"
+                self._core_event("CORE_DB_NOT_SAVED", task, "PARTIAL", reason=reason)
+            return replace(analysis, messages=attach_times(analysis.messages, at, recent=analysis.latest != "UNKNOWN"))
+        try:
+            result = save_visible(self.test_store, self._core_account, analysis, task.conversation_kind, at,
+                                  self._run_id, self._core_check)
+        except (TestDeadline, sqlite3.Error, OSError, ValueError) as exc:
+            self._core_event("CORE_DB_SAVE_FAILED", task, "FAILED", reason=type(exc).__name__)
+            self._core_state(save_failures=run.view.save_failures + 1)
+            if isinstance(exc, TestDeadline):
+                run.clock.complete("TIMEOUT", str(exc))
+            return replace(analysis, messages=tuple(replace(item, save_status="FAILED")
+                                                    for item in attach_times(analysis.messages, at, recent=False)))
+        except CancelledError:
+            return analysis
+        self._core_event("CORE_DB_COMMITTED", task, "AUTO_PASS", first=result.first, new=result.new,
+                         existing=result.existing, review=result.uncertain, history=result.historical,
+                         visible=len(result.messages), overlap=result.overlap, gap=result.gap,
+                         anchor_status=result.anchor_status, had_anchor=result.had_anchor,
+                         anchor_updated=result.anchor_updated)
+        self._core_state(first_saved=run.view.first_saved + result.first, new_saved=run.view.new_saved + result.new,
+                         existing=run.view.existing + result.existing, review_messages=run.view.review_messages + result.uncertain)
+        self._set(saved=self._status.saved + result.first + result.new, added=self._status.added + result.new,
+                  repeated=self._status.repeated + result.existing, uncertain=self._status.uncertain + result.uncertain,
+                  sqlite_result=f"隔离库已提交 · 首次 {result.first} · 新增 {result.new} · 待复核 {result.uncertain}",
+                  last_collected_at=EventTime.now() if result.first or result.new else self._status.last_collected_at)
+        return replace(analysis, messages=result.messages)
 
     def _timed_core_event(self, code, result, details):
         stage = f"TEST_STAGE_{details['stage_number']}" if "stage_number" in details else "TEST_RUN"
@@ -1865,7 +1988,8 @@ class CollectionService:
         identifier = uuid4().hex
         analysis = analyze_read(raw, identifier, raw.conversation.title if raw.conversation.title_name_reliable else "",
                                 None, "", verified=False, badge_cleared=False, refreshed=False)
-        displayed = tuple(replace(item, unread="INDEPENDENT_OCR") for item in analysis.messages)
+        displayed = tuple(replace(item, unread="INDEPENDENT_OCR") for item in attach_times(
+            analysis.messages, frame.captured_at, recent=False))
         run.independent_done = True
         run.independent_reason = ""
         run.clock.complete("PARTIAL" if analysis.gaps or not displayed else "AUTO_PASS",
@@ -1877,7 +2001,9 @@ class CollectionService:
             run.clock.begin(7, "展示独立 OCR 正文及未确认归属")
             run.presentation = identifier
         self._core_state(phase="INDEPENDENT_OCR", ocr_complete=True, completeness=analysis.completeness,
-                         messages=(*run.view.messages, *displayed)[-500:], risk="独立 OCR 测试 · 非已确认目标未读")
+                         messages=(*run.view.messages, *displayed)[-500:],
+                         independent_messages=run.view.independent_messages + len(displayed),
+                         risk="独立 OCR 测试 · 非已确认目标未读")
         return self._set(reason="已执行当前页面独立 OCR，未确认目标未读归属")
 
     def _core_blocked(self, reason, *, timeout=False):
@@ -1890,7 +2016,7 @@ class CollectionService:
             run.clock.end_target()
             return self._finish_core_target(task, task.before,
                                             "TARGET_PARTIAL" if task.best else "TARGET_FAILED",
-                                            reason=reason, analysis=task.best)
+                                            reason=reason, analysis=task.best, allow_persistence=not timeout)
         if number == 7:
             run.presentation = ""
             run.clock.end_target()
@@ -1982,7 +2108,8 @@ class CollectionService:
             evidence, distance = _core_selection_evidence(task.before, candidate, task.target, refreshed)
             task.match_evidence = evidence
             task.match_distance = round(distance, 2) if distance is not None else None
-            if evidence not in ("EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR"):
+            if evidence not in ("EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR",
+                                "CLICK_TITLE_ROW_BADGE_REFRESH_AVATAR_UNAVAILABLE", "CLICK_GEOMETRY_TITLE_BADGE_REFRESH"):
                 task.previous = None
                 return False
             phase = "WAITING_C2_REFRESH" if not refreshed else "WAITING_C2_STABILITY"
@@ -1993,7 +2120,8 @@ class CollectionService:
                     phase = "C2_WINDOW_OR_OVERLAY_UNVERIFIED"
                     task.previous = None
                     return False
-            row = next(row for row in candidate.contacts if name_key(row.display_name) == task.target.name)
+            row = next(row for row in candidate.contacts if row.is_selected is True) if evidence == "CLICK_GEOMETRY_TITLE_BADGE_REFRESH" else (
+                next(row for row in candidate.contacts if name_key(row.display_name) == task.target.name))
             cleared = not row.has_unread_indicator and row.badge is None
             if not task.verified and (refreshed or row.is_selected is True):
                 task.verified = True
@@ -2046,13 +2174,14 @@ class CollectionService:
                          details={"visual_only": True, "avatar_observed": bool(raw.login.avatar)})
         self._set(account_state="TEST_A1_OBSERVED" if a1_observed else "TEST_A1_UNAVAILABLE",
                   account_email="", account_id=None, account_choices=(),
-                  account_reason="A1 视觉观察 · 核心测试结果仅保留在内存" if a1_observed else
+                  account_reason="A1 视觉观察 · 确认会话使用本机隔离账号保存" if a1_observed else
                   "当前 A1 未读到可靠姓名 · 按已核对的企业微信窗口继续",
                   bound_pid=frame.capture.pid, bound_hwnd=frame.capture.hwnd, waiting_for_window=False)
         if task:
             return self._core_read_target(task, raw, ready, phase)
         if (raw.page != "MESSAGES_CANDIDATE" or raw.layout.get("B2") is None or raw.layout.get("C2") is None
-                or any(step.status in ("FAILED", "SKIPPED") for step in raw.ocr_areas if step.region.startswith("B2"))):
+                or any(step.status in ("FAILED", "SKIPPED") for step in raw.ocr_areas
+                       if step.region == "B2 联系人")):
             self._set(scan_disposition="B2_SCAN_FAILED", navigation_allowed=False)
             return self._core_blocked("消息页面或 B2 联系人 OCR 未确认")
         return self._core_scan(raw, attempted, current)
@@ -2092,7 +2221,8 @@ class CollectionService:
                              badge_cleared=cleared, before_count=row.unread_count if row.unread_count_reliable else None)
             read_signature = tuple((item.kind, item.text, item.time, item.direction, item.quality, item.unread)
                                    for item in analysis.messages)
-            if read_signature == task.previous_read:
+            repeat = read_signature == task.previous_read
+            if repeat:
                 self._core_state(repeated=run.view.repeated + len(read_signature))
             task.previous_read = read_signature
             self._core_state(latest=analysis.latest, completeness=analysis.completeness,
@@ -2100,8 +2230,12 @@ class CollectionService:
                                               for area in raw.ocr_areas) or bool(analysis.messages))
             if analysis.messages and (task.best is None or _core_read_rank(analysis) >= _core_read_rank(task.best)):
                 task.best = analysis
-            if confirmed and confirmed == row.unread_count:
+                task.read_at, task.conversation_kind = raw.frame.captured_at, verified.conversation.conversation_type
+            if analysis.messages and not analysis.gaps:
                 return self._finish_core_target(task, raw, "TARGET_COMPLETED", analysis=analysis)
+            if self._core_account and task.best and repeat:
+                return self._finish_core_target(task, raw, "TARGET_PARTIAL",
+                                                reason="C2 可见消息存在覆盖缺口", analysis=task.best)
             phase = "UNREAD_RANGE_UNCERTAIN" if analysis.messages else "C2_OCR_NO_MESSAGES"
         if task.polls >= MAX_READ_POLLS:
             if task.best:
@@ -2205,6 +2339,9 @@ class CollectionService:
         self._core_event("TARGET_SELECTED", task, "AUTO_PASS", row=target.row.sequence, row_box=bounds(target.row.box),
                          unread_count=target.unread_signature[0], badge_box=bounds(target.row.badge),
                          badge_kind="DIGIT" if target.row.unread_count_reliable else "DOT_OR_UNKNOWN_DIGIT",
+                         badge_style=target.row.badge_kind, name_reliable=target.row.name_reliable,
+                         time_anchor=target.row.activity_time_reliable, boundary=target.row.boundary_source,
+                         selection=target.row.selection_method, avatar_available=bool(target.row.avatar),
                          preview_reliable=target.row.preview_reliable, previous_title_reliable=raw.conversation.title_name_reliable,
                          discovered_at=task.discovered_at.isoformat(), selected_at=task.created_at.isoformat(),
                          foreground=current.foreground if current else None, window_box=raw.frame.capture.rect)
@@ -2276,13 +2413,16 @@ class CollectionService:
         names = Counter(name_key(row.display_name) for row in raw.contacts)
         for row in raw.contacts:
             name = name_key(row.display_name)
-            if (not row.has_unread_indicator or not row.name_reliable or names[name] != 1
-                    or row.status != "CANDIDATE" or row.kind not in ("CONTACT", "GROUP_CANDIDATE")
+            named = row.name_reliable and names[name] == 1 and row.status == "CANDIDATE"
+            geometric = row.geometry_reliable and row.status == "NAME_UNCERTAIN"
+            if (not row.has_unread_indicator or not (named or geometric)
+                    or row.kind not in ("CONTACT", "GROUP_CANDIDATE")
                     or self.scope.exclusion(replace(row, is_muted=None))):
                 rows.append(row)
                 continue
-            target = _Target(row, name, avatar_key(raw, row), ())
-            area = muted_icon_region(row.box, raw.frame.state.dpi / 96)
+            target = _Target(row, name if named else f"row-{row.sequence}", avatar_key(raw, row) if named else "", ())
+            locate_mute = mute_region if row.mute_evidence else muted_icon_region
+            area = locate_mute(row.box, raw.frame.state.dpi / 96)
             tile = area.crop(raw.frame.pixels)
             if min(tile.shape[:2]) < 4:
                 rows.append(row)
@@ -2295,7 +2435,7 @@ class CollectionService:
                 run.mute_recent[target.key] = (now, area.width, area.height, raw.frame.state.dpi, thumb, row.is_muted)
                 run.mute_trials.pop(target.key, None)
             elif row.is_muted is None:
-                if (target.avatar and previous and now - previous[0] <= 20
+                if (row.mute_evidence != "BELL_NUMBER_CONFLICT" and target.avatar and previous and now - previous[0] <= 20
                         and previous[1:4] == (area.width, area.height, raw.frame.state.dpi)
                         and np.max(np.abs(previous[4] - thumb)) <= 12):
                     row = replace(row, is_muted=previous[5])

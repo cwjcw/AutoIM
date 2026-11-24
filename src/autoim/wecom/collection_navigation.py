@@ -165,11 +165,13 @@ def _occlusion_detail(hwnd, root, xy, gui, process) -> str:
 def row_target(observation: VisualObservation, row: ContactObservation) -> tuple[int, int]:
     """Only an independently recognized and fully visible B2 row is targetable."""
     area = observation.layout.get("B2")
+    geometry_only = (row.geometry_reliable and row.status == "NAME_UNCERTAIN"
+                     and row.badge_kind in ("NORMAL_NUMBER", "SMALL_RED"))
     if (observation.page != "MESSAGES_CANDIDATE" or area is None or row not in observation.contacts
-            or row.status != "CANDIDATE" or not row.name_reliable or row.is_selected is True
+            or not (geometry_only or row.status == "CANDIDATE" and row.name_reliable) or row.is_selected is True
             or row.kind not in ("CONTACT", "GROUP_CANDIDATE")
-            or sum(r.name_reliable and r.display_name.casefold() == row.display_name.casefold()
-                   for r in observation.contacts) != 1
+            or not geometry_only and sum(r.name_reliable and r.display_name.casefold() == row.display_name.casefold()
+                                         for r in observation.contacts) != 1
             or not row.has_unread_indicator or row.badge is None):
         raise NavigationPaused("B2 未读联系人行缺少可靠的可操作边界", local=True)
     box = row.box

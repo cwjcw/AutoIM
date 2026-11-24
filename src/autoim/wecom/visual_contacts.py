@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 
 from autoim.wecom.visual_layout import Box, VisualThresholds, contours, near_background
+from autoim.wecom.visual_b2 import (activity_text, divider_rows, mute_evidence, structural_span,
+                                   typical_pitch, unread_badges)
 from autoim.wecom.visual_ocr import TextRecognizer, TextSpan, text_lines
 
 
@@ -26,7 +28,8 @@ class VisualName:
     issue: str = ""
 
 
-def parse_visual_name(raw: str, *, labels_from_title: tuple[str, ...] = ()) -> VisualName:
+def parse_visual_name(raw: str, *, labels_from_title: tuple[str, ...] = (),
+                      allow_short_organization=False) -> VisualName:
     """Separate only recognized PC identity labels from reliable name text."""
     name, *inline = raw.replace("＠", "@").split("@")
     labels = tuple(tag.strip() for tag in inline) + labels_from_title
@@ -40,7 +43,9 @@ def parse_visual_name(raw: str, *, labels_from_title: tuple[str, ...] = ()) -> V
         return VisualName(raw, labels, issue="个人微信与其他身份标签冲突")
     if personal:
         return VisualName(name.strip(), labels, "PERSONAL_WECHAT")
-    if (len(tags) == 1 and _ORGANIZATION_LABEL.search(tags[0]) and any(char.isalpha() for char in tags[0])
+    if (len(tags) == 1 and (_ORGANIZATION_LABEL.search(tags[0])
+            or allow_short_organization and re.fullmatch(r"[\u3400-\u9fff]{2,12}", "".join(tags[0].split())))
+            and any(char.isalpha() for char in tags[0])
             and not re.search(r"[|…]|\.\.\.", tags[0])):
         return VisualName(name.strip(), labels, "EXTERNAL_WECOM")
     return VisualName(raw, labels, issue="无法可靠分离身份标签")
@@ -76,6 +81,12 @@ class ContactObservation:
     selection_method: str = "UNKNOWN"
     selection_evidence: str = ""
     preview_reliable: bool = True
+    geometry_reliable: bool = False
+    boundary_source: str = ""
+    badge_kind: str = ""
+    mute_evidence: str = ""
+    mute_score: float | None = None
+    row_pitch: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,7 +380,8 @@ def _contact_kind(name: str) -> str:
 
 def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                     unit: float, thresholds: VisualThresholds,
-                    diagnostics: list[ContactTextDiagnostic] | None = None) -> tuple[ContactObservation, ...]:
+                    diagnostics: list[ContactTextDiagnostic] | None = None, *, multi_feature=False,
+                    badge_diagnostics=None, read_activity=None) -> tuple[ContactObservation, ...]:
     avatars = _avatars(pixels, region, unit)
     highlight = _highlight_row(pixels, region, unit)
     positioned: list[tuple[int, Box | None, str]] = []
@@ -390,18 +402,55 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
     normal_spacing = [int(value) for value in spacing if 33 * unit <= value <= 93 * unit]
     pitch = float(np.median(normal_spacing)) if normal_spacing else 62 * unit
     spans = reader.read(pixels, region)
+    lines, time_spans, badges = (), (), ()
+    time_offset = 0.
+    if multi_feature:
+        lines = divider_rows(pixels, region, unit)
+        right = Box(region.left + round(region.width * .68), region.top, region.right, region.bottom)
+        time_spans = tuple(s for s in (read_activity or reader.read)(pixels, right) if right.contains(s.box.center)
+                           and s.score >= max(.79, thresholds.text_score) and activity_text(s.text))
+        pitch = typical_pitch([s.box.center[1] for s in time_spans] if len(time_spans) >= 2 else centers,
+                              lines, highlight, unit)
+        offsets = [s.box.center[1] - min(centers, key=lambda y: abs(y-s.box.center[1])) for s in time_spans if centers]
+        offsets = [d for d in offsets if abs(d) <= pitch * .33]
+        time_offset = float(np.median(offsets)) if offsets else pitch * .16
+        for span in time_spans:
+            center = round(span.box.center[1] - time_offset)
+            span_bounds = structural_span(center, region, pitch, lines, highlight)
+            if span_bounds:
+                center = (span_bounds[0] + span_bounds[1]) // 2
+            if all(abs(center - y) >= .56 * pitch for y, _, _ in positioned):
+                positioned.append((center, None, "B2 右侧时间锚点"))
+        badges = unread_badges(pixels, region, unit, thresholds.badge_red_delta, avatars)
+        if badge_diagnostics is not None:
+            badge_diagnostics.extend(badges)
+        for badge_candidate in badges:
+            center = round(badge_candidate.box.center[1] + pitch * .32)
+            bracket = structural_span(center, region, pitch, lines, highlight)
+            if not bracket or any(abs(center - y) < .56 * pitch for y, _, _ in positioned):
+                continue
+            center = (bracket[0] + bracket[1]) // 2
+            if bracket[0] <= badge_candidate.box.top < bracket[0] + pitch * .43:
+                positioned.append((center, None, "B2 徽标反向定位与连续行边界"))
     positioned.extend(_text_row_seeds(positioned, _title_spans(spans, region, thresholds), pitch, region))
     positioned.sort(key=lambda item: item[0])
     centers = [y for y, _, _ in positioned]
     rows = []
+    sources = []
     for i, (y, _, _) in enumerate(positioned):
         top = max(region.top, round(y - pitch / 2))
         bottom = min(region.bottom, round(y + pitch / 2))
+        structural = structural_span(y, region, pitch, lines, highlight) if multi_feature else None
+        if structural and sum(structural[0] <= center < structural[1] for center in centers) == 1:
+            top, bottom, edge = structural
+        else:
+            edge = "NEIGHBOR_PITCH"
         if i:
             top = max(top, (y + centers[i - 1] + 1) // 2)
         if i + 1 < len(centers):
             bottom = min(bottom, (y + centers[i + 1] + 1) // 2)
         rows.append(Box(region.left, top, region.right, bottom))
+        sources.append(edge)
     blue_rows, subtle, fills = _row_selection(pixels, rows)
     selected = blue_rows[0] if len(blue_rows) == 1 else None
     method = "CONFLICTING_HIGHLIGHT" if len(blue_rows) > 1 else "BLUE_ROW_FILL"
@@ -430,19 +479,37 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
             elif not (sy < y and span.box.left >= row.left + round(row.width * .8)):
                 (name if sy < y else preview).append(span)
         activity = activities[0] if len(activities) == 1 else None
+        row_times = [item for item in time_spans if row.contains(item.box.center)
+                     and abs(item.box.center[1] - y - time_offset) <= pitch * .30]
+        time_anchor = row_times[0] if len(row_times) == 1 else None
+        if time_anchor:
+            activity = time_anchor
         badge = _badge(pixels, avatar, row, unit, thresholds) if avatar else None
+        badge_kind = ""
+        if multi_feature:
+            positioned_badges = [item for item in badges if row.contains(item.box.center)
+                                 and (badge and badge.contains(item.box.center)
+                                      or sources[i] != "NEIGHBOR_PITCH" and (avatar or time_anchor or "徽标反向" in source)
+                                      and item.box.top <= row.top + row.height * .38)]
+            if len(positioned_badges) == 1:
+                badge, badge_kind = positioned_badges[0].box, positioned_badges[0].kind
         count, reliable = _badge_number(pixels, badge, reader, thresholds) if badge else (None, False)
-        muted = _muted(pixels, row, unit)
+        mute_reason, mute_score = "", None
+        if multi_feature:
+            muted, mute_reason, mute_score = mute_evidence(pixels, row, unit, badge_kind)
+        else:
+            muted = _muted(pixels, row, unit)
         good_names = tuple(item for item in name if item.score >= thresholds.text_score)
         name_text = " ".join(text_lines(good_names))
         raw_name = " ".join(text_lines(tuple(name)))
-        parsed_name = parse_visual_name(name_text)
+        parsed_name = parse_visual_name(name_text, allow_short_organization=multi_feature)
         used.update(good_names)
         used.update(preview)
         if activity:
             used.add(activity)
         tolerance = max(2, round(2 * unit))
-        partial = (y - pitch / 2 < region.top - tolerance or y + pitch / 2 > region.bottom + tolerance
+        partial = ((sources[i] == "NEIGHBOR_PITCH"
+                   and (y - pitch / 2 < region.top - tolerance or y + pitch / 2 > region.bottom + tolerance))
                    or bool(avatar and (avatar.top <= region.top + 1 or avatar.bottom >= region.bottom - 1))
                    or any(item.box.top <= region.top or item.box.bottom >= region.bottom for item in good_names))
         reliable_name = (bool(name_text) and len(good_names) == len(name) and not parsed_name.issue
@@ -450,6 +517,12 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                          and all(item.box.top > region.top and item.box.bottom < region.bottom
                                  and item.box.right < region.right - tolerance for item in good_names))
         status = "PARTIALLY_VISIBLE" if partial else "CANDIDATE" if reliable_name else "NAME_UNCERTAIN"
+        kind = _contact_kind(parsed_name.display_name)
+        if multi_feature and kind == "FOLDED_CHAT_CONTAINER" and raw_name.strip() != "折叠的聊天":
+            kind = "CONTACT"
+        geometry = bool(multi_feature and not partial and .73 * pitch <= row.height <= 1.27 * pitch
+                        and (sources[i] != "NEIGHBOR_PITCH" and (time_anchor or badge or avatar)
+                             or time_anchor and avatar))
         evidence = [source]
         if partial:
             evidence.append("联系人行触及 B2 视口，字段可能截断")
@@ -467,9 +540,10 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                                           bool(badge), count, reliable, badge, muted,
                                           activity.text if activity else "",
                                           bool(activity and activity.score >= thresholds.text_score
-                                               and ACTIVITY_TIME.fullmatch(activity.text.strip())),
+                                               and (activity_text(activity.text) if multi_feature else
+                                                    ACTIVITY_TIME.fullmatch(activity.text.strip()))),
                                           i == selected if selected is not None else None,
-                                          status, tuple(evidence), reliable_name, _contact_kind(parsed_name.display_name),
+                                          status, tuple(evidence), reliable_name, kind,
                                           raw_name=raw_name, identity_labels=parsed_name.labels,
                                           peer_type=parsed_name.peer_type if reliable_name else "UNKNOWN",
                                           name_issue=parsed_name.issue,
@@ -477,7 +551,10 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                                           else "SUBTLE_ROW_FILL" if i == subtle else "UNKNOWN",
                                           selection_evidence=fills[i],
                                           preview_reliable=bool(preview) and
-                                          all(item.score >= thresholds.text_score for item in preview)))
+                                          all(item.score >= thresholds.text_score for item in preview),
+                                          geometry_reliable=geometry, boundary_source=sources[i] if multi_feature else "",
+                                          badge_kind=badge_kind, mute_evidence=mute_reason, mute_score=mute_score,
+                                          row_pitch=pitch if multi_feature else None))
     if diagnostics is not None:
         for span in spans:
             if span not in used:

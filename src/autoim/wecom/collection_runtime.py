@@ -19,7 +19,7 @@ from autoim import __version__
 from autoim.wecom.collection_test import PHASES
 from autoim.wecom.visual_store import database_path
 
-PC_VERSION = "PC-V3.5.2"
+PC_VERSION = "PC-V3.5.3"
 
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",

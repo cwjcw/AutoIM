@@ -237,6 +237,7 @@ android-agent/.wrapper-bootstrap/
 
 
 # Private AutoIM local data and diagnostic bundles
+/pic/
 /outputs/
 /logs/
 *.sqlite

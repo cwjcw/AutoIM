@@ -379,8 +379,9 @@ class VisualCollectionPanel(QWidget):
         self.core_task.setTextFormat(Qt.TextFormat.PlainText)
         self.core_task.setWordWrap(True)
         results.addWidget(self.core_task)
-        self.core_table = QTableWidget(0, 8)
-        self.core_table.setHorizontalHeaderLabels(("联系人", "序号", "方向", "可见时间", "类型", "内容", "OCR", "未读归属"))
+        self.core_table = QTableWidget(0, 11)
+        self.core_table.setHorizontalHeaderLabels(("联系人", "序号", "方向", "可见时间", "类型", "内容", "OCR",
+                                                  "未读归属", "时间来源", "采集状态", "保存状态"))
         self.core_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.core_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.core_table.verticalHeader().hide()
@@ -1023,12 +1024,13 @@ class VisualCollectionPanel(QWidget):
         self.copy_core_button.setEnabled(bool(messages))
         self.clear_core_button.setEnabled(bool(messages) and not self._in_flight)
         if core:
-            confirmed = sum(item.unread == "CONFIRMED_UNREAD" for item in messages)
-            uncertain = sum(item.unread in ("UNKNOWN", "UNREAD_CANDIDATE", "LATEST_VISIBLE", "ATTRIBUTION_UNCERTAIN", "INDEPENDENT_OCR")
-                            for item in messages)
             self.core_stats.setText(
-                f"已发现未读联系人 {core.discovered} · 等待 {core.waiting} · 实际点击 {core.clicks} · 已确认会话 {core.verified}\n"
-                f"展示消息 {len(messages)} · 确认未读 {confirmed} · 未确认归属 {uncertain} · 重复观察 {core.repeated} · "
+                f"本轮 B2 徽标 {self._status.unread_marker_count} · 未定位 {self._status.unowned_unread_count} · "
+                f"静音排除 {self._status.muted_excluded_count} · 折叠排除 {self._status.folded_excluded_count} · "
+                f"行待核 {self._status.other_unreliable_unread} · 静音待核 {self._status.unknown_muted_unread}\n"
+                f"累计可导航 {core.discovered} · 等待 {core.waiting} · 实际点击 {core.clicks} · 已确认会话 {core.verified}\n"
+                f"展示消息 {len(messages)} · 首次保存 {core.first_saved} · 新增保存 {core.new_saved} · 已有 {core.existing} · "
+                f"待复核 {core.review_messages} · 独立 OCR {core.independent_messages} · 保存失败 {core.save_failures}\n"
                 f"部分完成 {core.partial} · 失败 {core.failures} · 已点击且未完整读到 {core.read_unfinished}")
             self.core_task.setText(
                 f"{core.contact or '—'} · {core.phase} · 点击前未读 {core.before_count if core.before_count is not None else '—'} · "
@@ -1046,10 +1048,16 @@ class VisualCollectionPanel(QWidget):
         unread = {"CONFIRMED_UNREAD": "已确认未读", "UNREAD_CANDIDATE": "可能未读", "LATEST_VISIBLE": "最新可见",
                   "HISTORY_VISIBLE": "历史可见", "ATTRIBUTION_UNCERTAIN": "会话归属未确认", "UNKNOWN": "未读未确认",
                   "INDEPENDENT_OCR": "独立 OCR · 非已确认目标未读"}
+        time_source = {"GROUP_ANCHOR": "时间段锚点", "EXPLICIT": "独立时间", "UNKNOWN": "未知"}
+        collection = {"FIRST": "首次采集", "NEW": "新增", "EXISTING": "已有", "REVIEW": "待复核",
+                      "NOT_COMPARED": "未比对"}
+        saved = {"SAVED": "已保存", "EXISTING": "已有记录", "REVIEW": "待复核", "FAILED": "失败",
+                 "NOT_SAVED": "未保存"}
         for row, message in enumerate(messages):
             values = (message.contact, str(message.sequence), direction.get(message.direction, message.direction),
                       message.time or "—", message.kind, message.text or "—", message.quality,
-                      unread.get(message.unread, message.unread))
+                      unread.get(message.unread, message.unread), time_source[message.clock.time_source],
+                      collection[message.collection_status], saved[message.save_status])
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
@@ -1058,6 +1066,8 @@ class VisualCollectionPanel(QWidget):
             self.core_table.item(row, 6).setToolTip(
                 f"OCR {confidence} · {message.reason or '—'} · {message.box}"
                 f"\n发送人 {message.sender or '未确认'}")
+            self.core_table.item(row, 8).setToolTip(
+                f"{message.clock.anchor or '日期未确认'} · {message.clock.precision} · 段内序号 {message.clock_sequence}")
         if messages and self._service:
             self._service.confirm_core_displayed(messages)
 

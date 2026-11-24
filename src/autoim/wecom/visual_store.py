@@ -157,10 +157,10 @@ class VisualStore:
         self._weak_active: tuple[tuple, str] | None = None
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, timeout=4, before_commit=None):
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with closing(sqlite3.connect(self.path, timeout=4, isolation_level=None)) as db:
+            with closing(sqlite3.connect(self.path, timeout=timeout, isolation_level=None)) as db:
                 db.row_factory = sqlite3.Row
                 db.execute("PRAGMA foreign_keys=ON")
                 if not self._ready:
@@ -170,6 +170,8 @@ class VisualStore:
                     if not self._ready:
                         self._migrate(db)
                     yield db
+                    if before_commit:
+                        before_commit()
                     db.commit()
                 except BaseException:
                     db.rollback()
