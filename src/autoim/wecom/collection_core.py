@@ -298,6 +298,8 @@ class CoreRun:
     muted_crops: set = field(default_factory=set)
     evidence_raw: object | None = None
     evidence_frame: object | None = None
+    storage_ready: bool = False
+    storage_blocked: str = ""
     view: CoreView = CoreView()
 
     def accept_messages(self, task, analysis):

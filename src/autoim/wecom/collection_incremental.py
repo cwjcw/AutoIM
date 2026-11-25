@@ -4,8 +4,8 @@ import hashlib
 import json
 import sqlite3
 import codecs
-from dataclasses import dataclass, replace
-from datetime import datetime
+from dataclasses import dataclass, fields, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -85,6 +85,11 @@ class SaveVisible:
     anchor_updated: bool
     had_anchor: bool
     previous_anchor: str | None
+    receipt_replayed: bool = False
+    committed_at: str = ""
+
+    def summary(self):
+        return {field.name: getattr(self, field.name) for field in fields(self) if field.name != "messages"}
 
 
 def attach_times(messages, observed):
@@ -223,7 +228,15 @@ def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=Fa
     return defaults, 0, "NO_RELIABLE_ALIGNMENT"
 
 
-def save_visible(store, account, analysis, conversation_kind, captured_at, run_id, check):
+def _decided(messages, decisions):
+    return tuple(replace(item, collection_status=decision,
+                         save_status="SAVED" if decision in ("FIRST", "NEW") else
+                         "EXISTING" if decision == "EXISTING" else "REVIEW")
+                 for item, decision in zip(messages, decisions))
+
+
+def save_visible(store, account, analysis, conversation_kind, captured_at, run_id, check, *,
+                 batch_id="", batch_digest="", historical_recovery=False):
     messages = analysis.messages
     if (not messages or not messages[0].contact or any(
             item.contact != messages[0].contact or item.unread in ("INDEPENDENT_OCR", "ATTRIBUTION_UNCERTAIN")
@@ -233,7 +246,20 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
     messages = attach_times(messages, captured_at)
     at = captured_at.isoformat(timespec="milliseconds")
     check()
-    with store.transaction(timeout=0.7, before_commit=check) as db:
+    with store.transaction(timeout=0.7, before_commit=check, durable=bool(batch_id)) as db:
+        if batch_id:
+            db.execute("""CREATE TABLE IF NOT EXISTS core_commit_receipts (
+                batch_id TEXT PRIMARY KEY, digest TEXT NOT NULL, account_key TEXT NOT NULL, captured_at TEXT NOT NULL,
+                committed_at TEXT NOT NULL, decisions TEXT NOT NULL, summary TEXT NOT NULL)""")
+            prior = db.execute("SELECT * FROM core_commit_receipts WHERE batch_id=?", (batch_id,)).fetchone()
+            if prior:
+                if prior["account_key"] != account.profile or prior["digest"] != batch_digest:
+                    raise ValueError("PENDING_BATCH_RECEIPT_CONFLICT")
+                decisions = json.loads(prior["decisions"])
+                if len(decisions) != len(messages):
+                    raise ValueError("PENDING_BATCH_RECEIPT_INVALID")
+                summary = json.loads(prior["summary"])
+                return SaveVisible(_decided(messages, decisions), **{**summary, "receipt_replayed": True})
         db.execute("""CREATE TABLE IF NOT EXISTS core_message_times (
             message_id TEXT PRIMARY KEY REFERENCES messages(id), anchor TEXT, time_source TEXT NOT NULL,
             precision TEXT NOT NULL, group_sequence INTEGER NOT NULL, run_id TEXT NOT NULL)""")
@@ -269,6 +295,15 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
         last_anchor, had_gap = tuple(state) if state else (None, False)
         decisions, overlap, anchor_status = compare_visible(
             history, messages, last_anchor, gap=had_gap, latest=analysis.latest != "UNKNOWN" and not analysis.gaps)
+        # A delayed observation can confirm already-saved content. It cannot
+        # insert an older item after the latest position in an existing history.
+        previous_seen = db.execute("SELECT last_seen FROM conversations WHERE id=?", (cid,)).fetchone()[0]
+        delayed = bool((historical_recovery or batch_id) and _stamp(previous_seen)
+                       and _stamp(previous_seen) > captured_at)
+        if delayed:
+            if "FIRST" in decisions or "NEW" in decisions:
+                decisions = ["REVIEW" if item in ("FIRST", "NEW") else item for item in decisions]
+                anchor_status = "OLDER_CAPTURE_REQUIRES_REVIEW"
         position = db.execute("SELECT COALESCE(MAX(position),0) FROM messages WHERE conversation_id=?", (cid,)).fetchone()[0]
         new_anchors = []
         for item, decision in zip(messages, decisions):
@@ -311,13 +346,18 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
         if gap or not ordered:
             newest = last_anchor
             gap = True
-        db.execute("""INSERT INTO core_conversation_tail VALUES(?,?,?)
-            ON CONFLICT(conversation_id) DO UPDATE SET last_anchor=excluded.last_anchor,gap=excluded.gap""", (cid, newest, gap))
-        db.execute("UPDATE conversations SET last_seen=?,last_status=? WHERE id=?", (at, anchor_status, cid))
-    result = tuple(replace(item, collection_status=decision,
-                           save_status="SAVED" if decision in ("FIRST", "NEW") else
-                           "EXISTING" if decision == "EXISTING" else "REVIEW")
-                   for item, decision in zip(messages, decisions))
-    return SaveVisible(result, decisions.count("FIRST"), decisions.count("NEW"), decisions.count("EXISTING"),
-                       decisions.count("REVIEW"), historical, overlap, anchor_status, gap, newest != last_anchor,
-                       bool(last_anchor), last_anchor)
+        if not delayed:
+            db.execute("""INSERT INTO core_conversation_tail VALUES(?,?,?)
+                ON CONFLICT(conversation_id) DO UPDATE SET last_anchor=excluded.last_anchor,gap=excluded.gap""",
+                       (cid, newest, gap))
+            db.execute("UPDATE conversations SET last_seen=?,last_status=? WHERE id=?", (at, anchor_status, cid))
+        committed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        result = SaveVisible(_decided(messages, decisions), decisions.count("FIRST"), decisions.count("NEW"),
+                             decisions.count("EXISTING"), decisions.count("REVIEW"), historical, overlap,
+                             anchor_status, gap, newest != last_anchor, bool(last_anchor), last_anchor,
+                             committed_at=committed_at)
+        if batch_id:
+            db.execute("INSERT INTO core_commit_receipts VALUES (?,?,?,?,?,?,?)",
+                       (batch_id, batch_digest, account.profile, at, committed_at,
+                        json.dumps(decisions), json.dumps(result.summary())))
+    return result

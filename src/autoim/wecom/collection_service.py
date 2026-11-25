@@ -22,6 +22,7 @@ from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, Cor
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
 from autoim.wecom.collection_evidence import c2_evidence_regions, contact_scan, message_evidence, rect, title_evidence
 from autoim.wecom.collection_incremental import CoreAccount, DefaultAccountConflict, attach_times, save_visible
+from autoim.wecom.collection_pending import CoreDurability, PendingBatch, SavingBlocked, saving_reason
 from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, isolated_row, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
@@ -149,6 +150,10 @@ class ScanStatus:
     navigation_result: str = ""
     ocr_result: str = ""
     sqlite_result: str = ""
+    storage_state: str = ""
+    storage_pending: int = 0
+    storage_invalid: int = 0
+    storage_recovered: int = 0
     last_failure: str = ""
     failure_stage: str = ""
     failure_code: str = ""
@@ -485,7 +490,7 @@ class AccountPaused(NavigationPaused):
 class CollectionService:
     def __init__(self, profile: str | None, store: VisualStore, reader: CollectionReader, *,
                  capture=None, navigator=None, permit: CollectionPermit | None = None, window_probe=None,
-                 require_email: bool = False, isolated_store=None, core_account=None) -> None:
+                 require_email: bool = False, isolated_store=None, core_account=None, durability=None) -> None:
         self.profile = profile
         self._auto_account = profile is None
         self._require_email = require_email and self._auto_account
@@ -530,6 +535,11 @@ class CollectionService:
         self.runtime = None
         self.test_store = isolated_store or VisualStore(isolated_database_path())
         self._verify_isolated_database()
+        if durability and durability.store.path.resolve() != self.test_store.path.resolve():
+            raise ValueError("CORE_STORAGE_PATH_CONFLICT")
+        root = self.test_store.path.parent.parent if self._isolate_core_reads else None
+        self._durability = durability or (CoreDurability(self.test_store, root / "core-default-account.json",
+                                           root / "pending-collections" / "observations.sqlite3") if root else None)
         self._isolated_run: IsolatedRun | None = None
         self.mode = "test"
         self._prepare_pending = False
@@ -652,15 +662,8 @@ class CollectionService:
                      "flow": "CORE_ISOLATED_INCREMENTAL" if core else "EMAIL_DIAGNOSTIC" if email_test_only else "FORMAL_OR_LEGACY"})
         if core:
             core.clock = TestClock(self._timed_core_event)
-            core.clock.begin(1, "定位、恢复、最大化并激活企业微信")
+            core.clock.begin(1, "检查本机保存环境" if self._durability else "定位、恢复、最大化并激活企业微信")
             if self._isolate_core_reads:
-                self._core_account_status = CoreAccount.inspect()
-                self._core_account = self._core_account_status.account
-                self._core_event("CORE_DEFAULT_ACCOUNT_STATUS",
-                                 result="AUTO_PASS" if self._core_account else "PARTIAL",
-                                 reason=self._core_account_status.reason,
-                                 config_path=str(self._core_account_status.path),
-                                 encoding=self._core_account_status.encoding)
                 core.reader = CoreReadWorker(self.read._calibration_path, self.read._thresholds_path)
 
     def stop(self, *, source="control", final_reason="") -> None:
@@ -1915,7 +1918,7 @@ class CollectionService:
 
     def _finish_core_target(self, task, raw, code, *, reason="", analysis=None, allow_persistence=True):
         run = self._core
-        if not self.active:
+        if not self.active and not (self._durability and task.verified and analysis and analysis.messages):
             return self._status
         target = task.target
         run.handled.add(target.key)
@@ -1928,16 +1931,16 @@ class CollectionService:
         result = {"TARGET_COMPLETED": "AUTO_PASS", "TARGET_PARTIAL": "PARTIAL", "TARGET_FAILED": "FAILED"}[code]
         run.clock.complete(result, reason, clicked=bool(task.clicked_at), ocr_completed=bool(analysis))
         self._core_event(code, task, result, reason=reason, read_risk=missing_read)
-        self._core_event("NEXT_TARGET", task, result="AUTO_PASS", fresh_b2_required=True)
         if analysis and analysis.messages:
             run.clock.begin(7, "解析消息时间、比对本机历史、保存并展示")
             analysis = self._core_persist(task, raw, analysis, allow=allow_persistence)
-            if not self.active:
-                return self._status
             if self._core_account:
                 run.view = replace(run.view, messages=(*run.view.messages, *analysis.messages)[-500:])
             else:
                 run.accept_messages(task, analysis)
+            if not self.active:
+                self._core_state()
+                return self._status
             if run.clock.phase and any(item.task == task.id for item in run.view.messages):
                 run.presentation = task.id
             else:
@@ -1946,6 +1949,8 @@ class CollectionService:
             run.independent_reason = reason or "目标采集未完成"
         if not run.presentation:
             run.clock.end_target()
+        if not run.storage_blocked:
+            self._core_event("NEXT_TARGET", task, result="AUTO_PASS", fresh_b2_required=True)
         self._core_state(phase=code, failures=run.view.failures + (code == "TARGET_FAILED"),
                          partial=run.view.partial + (code == "TARGET_PARTIAL"),
                          read_unfinished=run.view.read_unfinished + missing_read,
@@ -1953,7 +1958,118 @@ class CollectionService:
                          latest=analysis.latest if analysis else "UNKNOWN",
                          completeness=analysis.completeness if analysis else "")
         return self._set(status="RUNNING" if self.active else "STOPPED",
-                         reason=reason or "已读取目标消息，下一轮重新扫描 B2")
+                         reason=run.storage_blocked or reason or "已读取目标消息，下一轮重新扫描 B2")
+
+    def _apply_pending_recovery(self, recovery):
+        returned = {item.id: item for _, result in recovery.results for item in result.messages}
+        saved = sum(result.first + result.new for _, result in recovery.results if not result.receipt_replayed)
+        for identifier, result in recovery.results:
+            self._core_event("CORE_BATCH_RECOVERED", result="AUTO_PASS", batch_id=identifier,
+                             age="ORIGINAL_CAPTURE_TIME", receipt_reused=result.receipt_replayed,
+                             first=0 if result.receipt_replayed else result.first,
+                             new=0 if result.receipt_replayed else result.new,
+                             existing=result.existing, review=result.uncertain, historical=result.historical,
+                             overlap=result.overlap, anchor_status=result.anchor_status, gap=result.gap)
+        if self._core and returned:
+            self._core_state(messages=tuple(returned.get(item.id, item) for item in self._core.view.messages))
+        reason = recovery.blocked
+        return self._set(storage_state=reason or ("PENDING_INVALID" if recovery.invalid else "READY"),
+                         storage_pending=recovery.pending, storage_invalid=recovery.invalid,
+                         storage_recovered=self._status.storage_recovered + saved)
+
+    def recover_pending(self, cancelled=lambda: False):
+        """Idle UI recovery has no capture or native input entry points."""
+        if (self.mode != "test" or not self._durability or self.active or cancelled()
+                or not self._lock.acquire(blocking=False)):
+            return self._status
+        def check():
+            if cancelled() or self.active:
+                raise CancelledError()
+        try:
+            _, _, recovery = self._durability.prepare(check)
+            return self._apply_pending_recovery(recovery)
+        except CancelledError:
+            return self._status
+        except (SavingBlocked, sqlite3.Error, OSError, ValueError) as error:
+            reason = saving_reason(error)
+            self._core_event("CORE_STORAGE_RECOVERY_BLOCKED", result="BLOCKED_BY_DEPENDENCY", reason=reason)
+            return self._storage_blocked_state(reason)
+        finally:
+            self._lock.release()
+
+    def _prepare_core_storage(self):
+        run = self._core
+        config_path = str(self._durability.account.path)
+        try:
+            account, source, recovery = self._durability.prepare(self._core_check)
+            self._apply_pending_recovery(recovery)
+            self._core_event("CORE_DEFAULT_ACCOUNT_STATUS", result="AUTO_PASS",
+                             reason="DEFAULT_ACCOUNT_LOADED", source=source, config_path=config_path)
+            if recovery.blocked:
+                raise SavingBlocked(recovery.blocked)
+            self._core_account = account
+            run.storage_ready = True
+            run.clock.progress("保存环境就绪，准备企业微信窗口")
+            self._core_event("CORE_STORAGE_READY", result="AUTO_PASS", invalid=recovery.invalid)
+            return True
+        except (SavingBlocked, sqlite3.Error, OSError, ValueError) as error:
+            reason = saving_reason(error)
+            self._stop_core_storage(reason)
+            return False
+
+    def _storage_blocked_state(self, reason):
+        try:
+            pending, invalid = self._durability.queue.counts()
+        except (sqlite3.Error, OSError):
+            return self._set(storage_state=reason)
+        return self._set(storage_state=reason, storage_pending=pending, storage_invalid=invalid)
+
+    def _stop_core_storage(self, reason):
+        self._core.storage_blocked = reason
+        self._core.clock.complete("BLOCKED_BY_DEPENDENCY", reason)
+        self._storage_blocked_state(reason)
+        self._core_event("CORE_STORAGE_BLOCKED", result="BLOCKED_BY_DEPENDENCY", reason=reason,
+                         config_path=str(self._durability.account.path), pending=self._status.storage_pending)
+        self._set(sqlite_result=reason, navigation_allowed=False, navigation_block_reason=reason)
+        self._core_state(phase="SAVE_ENVIRONMENT_BLOCKED", risk=reason, waiting=0)
+        self.stop(source="failure", final_reason=f"本机保存暂停 · {reason}")
+        return self._status
+
+    def _stage_core_observation(self, task, analysis, at, allow):
+        run, durable = self._core, self._durability
+        staged = False
+        try:
+            batch = PendingBatch.from_observation(
+                self._core_account, analysis, task.conversation_kind, at, task.match_evidence,
+                self._run_id, task.id, (task.before_evidence, task.c2_evidence))
+            durable.queue.stage(batch)
+            staged = True
+            self._set(storage_pending=self._status.storage_pending + 1, storage_state="STAGED")
+            self._core_event("CORE_BATCH_STAGED", task, "AUTO_PASS", batch_id=batch.batch_id,
+                             visible=len(analysis.messages))
+            if not allow or not self.active:
+                raise SavingBlocked("CAPTURE_STAGED_AFTER_STOP")
+
+            def verify():
+                self._core_check()
+                durable.account.check(self._core_account)
+
+            result, reason = durable.queue.process(durable.store, self._core_account, batch.batch_id, verify)
+            if result is None:
+                raise SavingBlocked(reason or "PENDING_COMMIT_NOT_CONFIRMED")
+            self._set(storage_pending=max(0, self._status.storage_pending - 1), storage_state="READY")
+            return result, analysis
+        except (CancelledError, TestDeadline, SavingBlocked, sqlite3.Error, OSError, ValueError) as error:
+            reason = saving_reason(error)
+            run.storage_blocked = reason
+            self._set(storage_state=reason, sqlite_result=reason)
+            self._core_state(save_failures=run.view.save_failures + 1)
+            status = "STAGED" if staged else "FAILED"
+            event = self._core_event("CORE_DB_SAVE_FAILED", task, "FAILED", reason=reason, staged=staged)
+            observations = tuple(replace(item, save_status=status) for item in attach_times(analysis.messages, at))
+            self._keep_core_database(task, task.before, observations,
+                                     {"committed": False, "reason": reason, "staged": staged}, event)
+            return None, replace(analysis, messages=observations)
 
     def _core_persist(self, task, raw, analysis, *, allow):
         run = self._core
@@ -1966,7 +2082,8 @@ class CollectionService:
             self._keep_core_database(task, raw, review, {"committed": False, "reason": reason}, event)
             self._core_state(review_messages=run.view.review_messages + len(review))
             return replace(analysis, messages=review)
-        if not self._core_account or not task.verified or not allow:
+        durable = bool(self._durability and task.verified and self._core_account)
+        if not durable and (not self._core_account or not task.verified or not allow):
             timed = attach_times(analysis.messages, at)
             if self._isolate_core_reads:
                 status = self._core_account_status
@@ -1980,8 +2097,13 @@ class CollectionService:
                                                             "config_path": str(status.path) if status else ""}, event)
             return replace(analysis, messages=timed)
         try:
-            result = save_visible(self.test_store, self._core_account, analysis, task.conversation_kind, at,
-                                  self._run_id, self._core_check)
+            if durable:
+                result, analysis = self._stage_core_observation(task, analysis, at, allow)
+                if result is None:
+                    return analysis
+            else:
+                result = save_visible(self.test_store, self._core_account, analysis, task.conversation_kind, at,
+                                      self._run_id, self._core_check)
         except (TestDeadline, sqlite3.Error, OSError, ValueError) as exc:
             reason = str(exc) if isinstance(exc, DefaultAccountConflict) else type(exc).__name__
             event = self._core_event("CORE_DB_SAVE_FAILED", task, "FAILED", reason=reason)
@@ -1995,7 +2117,8 @@ class CollectionService:
             return analysis
         details = dict(first=result.first, new=result.new, existing=result.existing, review=result.uncertain,
                        history=result.historical, visible=len(result.messages), overlap=result.overlap, gap=result.gap,
-                       anchor_status=result.anchor_status, had_anchor=result.had_anchor, anchor_updated=result.anchor_updated)
+                       anchor_status=result.anchor_status, had_anchor=result.had_anchor, anchor_updated=result.anchor_updated,
+                       receipt_reused=result.receipt_replayed, committed_at=result.committed_at)
         event = self._core_event("CORE_DB_COMMITTED", task, "AUTO_PASS", **details)
         self._keep_core_database(task, raw, result.messages, {**details, "committed": True,
                                                               "previous_anchor": result.previous_anchor}, event)
@@ -2046,13 +2169,15 @@ class CollectionService:
     def _core_read_frame(self, frame, operation):
         run = self._core
         self._core_check()
+        keep_completed = self._durability is not None and operation == "body"
         if run.reader:
-            raw = run.reader.request(operation, self._core_check, self._cancel)
+            raw = run.reader.request(operation, self._core_check, self._cancel, keep_completed=keep_completed)
         elif isinstance(self.read, CollectionReader):
             raw = self.read.read_core(frame, lambda _: operation != "header", history_only=operation == "independent")
         else:
             raw = self.read(frame)
-        self._core_check()
+        if not keep_completed:
+            self._core_check()
         return raw
 
     def _core_independent_read(self, frame):
@@ -2116,7 +2241,11 @@ class CollectionService:
         clock = run.clock
         try:
             self._core_check()
+            if run.storage_blocked and not run.presentation:
+                return self._stop_core_storage(run.storage_blocked)
             if clock.phase and clock.phase.number == 1:
+                if self._durability and not run.storage_ready and not self._prepare_core_storage():
+                    return self._status
                 blocked = None
                 if self._prepare_pending:
                     self._prepare_pending = False
@@ -2237,7 +2366,7 @@ class CollectionService:
         ocr_at = EventTime.now()
         self._set(scan_ocr_completed_at=ocr_at.wall, match=raw.conversation.match_status,
                   account_name=raw.login.name, account_at=ocr_at)
-        if not self.active:
+        if not self.active and not (self._durability and ready and task and task.verified):
             return self._status
         self._validate_read_frame(raw.frame, frame)
         run.evidence_raw = raw
@@ -2331,12 +2460,16 @@ class CollectionService:
                 task.best = analysis
                 task.read_at, task.conversation_kind = raw.frame.captured_at, verified.conversation.conversation_type
                 task.c2_evidence = shot
+            if not self.active and task.best:
+                return self._finish_core_target(task, raw, "TARGET_PARTIAL",
+                                                reason="停止时已取得可靠会话观察", analysis=task.best,
+                                                allow_persistence=False)
             if analysis.messages and not analysis.gaps:
                 return self._finish_core_target(task, raw, "TARGET_COMPLETED", analysis=analysis)
             retryable = any(gap["reason"] in ("C2_OCR_FAILED", "C2_OCR_SKIPPED", "BODY_OCR_UNCERTAIN",
                                               "BODY_OCR_BELOW_CORE_THRESHOLD") for gap in analysis.gaps)
             if task.best and any(item.quality == "RELIABLE" for item in task.best.messages) and (
-                    not retryable or task.body_reads >= 2):
+                    self._durability or not retryable or task.body_reads >= 2):
                 return self._finish_core_target(task, raw, "TARGET_PARTIAL",
                                                 reason="C2 可见消息存在覆盖缺口", analysis=task.best)
             phase = "C2_RECOVERABLE_GAP" if retryable else "C2_OCR_NO_RELIABLE_MESSAGES"
@@ -2462,6 +2595,11 @@ class CollectionService:
                          foreground=current.foreground if current else None, window_box=raw.frame.capture.rect)
         try:
             self._core_check()
+            if self._durability:
+                try:
+                    self._durability.before_click(self._core_account, self._core_check)
+                except (SavingBlocked, sqlite3.Error, OSError, ValueError) as error:
+                    return self._stop_core_storage(saving_reason(error))
             point = row_target(raw, target.row, allow_duplicate=True)
             if isinstance(self.navigator, CollectionNavigation):
                 self.navigator.verify_normal_message(raw)

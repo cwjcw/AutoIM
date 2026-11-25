@@ -60,7 +60,7 @@ class CoreReadWorker:
             child.close()
         self.process, self.connection = process, pipe
 
-    def request(self, operation, deadline, cancel):
+    def request(self, operation, deadline, cancel, *, keep_completed=False):
         try:
             deadline()
             if cancel.is_set():
@@ -75,9 +75,10 @@ class CoreReadWorker:
                 if not self.process.is_alive():
                     raise OcrUnavailable("只读采集子进程异常退出")
             kind, result = self.connection.recv()
-            deadline()
-            if cancel.is_set():
-                raise CancelledError()
+            if not keep_completed or kind != "OK":
+                deadline()
+                if cancel.is_set():
+                    raise CancelledError()
         except (OSError, EOFError) as error:
             self.close()
             raise OcrUnavailable("只读采集子进程连接中断") from error

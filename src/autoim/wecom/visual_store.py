@@ -152,7 +152,7 @@ class VisualStore:
         self._weak_active: tuple[tuple, str] | None = None
 
     @contextmanager
-    def transaction(self, *, timeout=4, before_commit=None):
+    def transaction(self, *, timeout=4, before_commit=None, durable=False):
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with closing(sqlite3.connect(self.path, timeout=timeout, isolation_level=None)) as db:
@@ -160,6 +160,8 @@ class VisualStore:
                 db.execute("PRAGMA foreign_keys=ON")
                 if not self._ready:
                     db.execute("PRAGMA journal_mode=WAL")
+                if durable:
+                    db.execute("PRAGMA synchronous=FULL")
                 db.execute("BEGIN IMMEDIATE")
                 try:
                     if not self._ready:

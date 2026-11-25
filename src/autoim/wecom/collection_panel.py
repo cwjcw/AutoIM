@@ -255,6 +255,12 @@ class VisualCollectionPanel(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._tick)
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.timeout.connect(self._recover_storage)
+        self._recovery_delays = iter(())
+        self._recovering = False
+        self._closing = False
         self._pulse = QTimer(self)
         self._pulse.setInterval(400)
         self._pulse.timeout.connect(self._refresh_progress)
@@ -434,6 +440,26 @@ class VisualCollectionPanel(QWidget):
         self._controls()
         for button in self.diagnostic_buttons:
             button.setEnabled(True)
+        self._schedule_recovery(reset=True)
+
+    def _schedule_recovery(self, *, reset=False):
+        if self._closing or self._stop_requested or self.mode_select.currentData() != "test":
+            return
+        if reset:
+            self._recovery_delays = iter((800, 2500, 6000, 12000))
+        delay = next(self._recovery_delays, None)
+        if delay is not None:
+            self._recovery_timer.start(delay)
+
+    def _recover_storage(self):
+        if self._closing or self._stop_requested or self.mode_select.currentData() != "test":
+            return
+        if self.busy:
+            self._schedule_recovery()
+            return
+        service = self._get_service()
+        self._recovering = True
+        self._submit(lambda: service.recover_pending(lambda: self._closing or self._stop_requested), browse=False)
 
     def _save_mode(self):
         if self.settings is not None:
@@ -631,7 +657,9 @@ class VisualCollectionPanel(QWidget):
                     "failure": safe_reason(state.last_failure), "failure_stage": state.failure_stage,
                     "failure_code": state.failure_code, "failure_time": state.failure_at,
                     "stop_reason": state.stop_reason, "contacts": state.contact_count,
-                    "unread": state.unread_marker_count}
+                    "unread": state.unread_marker_count, "storage_state": state.storage_state,
+                    "storage_pending": state.storage_pending, "storage_invalid": state.storage_invalid,
+                    "storage_recovered": state.storage_recovered}
         if state.core:
             core = state.core
             snapshot["core"] = {"phase": core.phase, "clicks": core.clicks, "verified": core.verified,
@@ -655,6 +683,8 @@ class VisualCollectionPanel(QWidget):
         self._set_shortcut(shortcut)
 
     def close_hotkey(self):
+        self._closing = True
+        self._recovery_timer.stop()
         if self._hotkey is not None:
             self._hotkey.close()
 
@@ -772,6 +802,7 @@ class VisualCollectionPanel(QWidget):
             if not advanced:
                 self._authorized = True
         service = self._get_service()
+        self._recovery_timer.stop()
         if core or self.settings is not None:
             service.scope = CollectionScope(**{key: self.scope_checks[key].isChecked()
                                                for key in ("personal", "group", "muted")})
@@ -807,6 +838,7 @@ class VisualCollectionPanel(QWidget):
             self._exception_dialog.close()
         self._stop_requested = True
         self._timer.stop()
+        self._recovery_timer.stop()
         self._pulse.stop()
         if self._service:
             was_active = self._service.active
@@ -916,6 +948,8 @@ class VisualCollectionPanel(QWidget):
 
     def _finished(self, data):
         self._in_flight = False
+        recovery = self._recovering
+        self._recovering = False
         if self.runtime and self._service:
             self._service.end_worker()
         result, jobs = data
@@ -944,9 +978,13 @@ class VisualCollectionPanel(QWidget):
                 self._timer.start(delay)
         else:
             self._pulse.stop()
+            retryable = result.storage_pending or result.storage_state.startswith(("SQLITE_BUSY", "SQLITE_LOCKED"))
+            if retryable and (recovery or result.stop_reason in ("failure", "timeout")):
+                self._schedule_recovery(reset=not recovery)
 
     def _failed(self, _message):
         self._in_flight = False
+        self._recovering = False
         if self.runtime and self._service:
             self._service.end_worker()
         reason = "窗口、OCR 或 SQLite 操作失败，请查看已保存的任务证据"
@@ -1005,17 +1043,21 @@ class VisualCollectionPanel(QWidget):
         self.account_label.setText(f"{account} · {result.account_reason or '等待识别'}")
         committed = result.last_collected_at
         mode = "自动采集模式" if self._service and self._service.active else "人工操作模式"
+        storage = (f"保存环境 {result.storage_state} · 待补存 {result.storage_pending} 批 · "
+                   f"已补存 {result.storage_recovered} 条 · 损坏证据 {result.storage_invalid} 批"
+                   if result.storage_state else "")
         if result.core:
             self.compact_status.setText(
                 f"核心测试 · {result.status} · {result.reason}\n"
                 f"当前 B2 未读标记 {result.unread_marker_count if result.b2_scan_completed_at else '—'} · "
-                "实际读取结果保留在本轮内存")
+                f"{storage or '正在检查本机保存环境'}")
         else:
             self.compact_status.setText(
                 f"{mode} · {result.status} · {result.reason}\n"
                 f"发现未读 {result.unread_marker_count if result.b2_scan_completed_at else '—'} · "
                 f"等待采集 {result.queued} · 已完成任务 {result.completed} · 采集异常 {result.errors}\n"
-                f"已保存消息 {result.saved} · 新增消息 {result.added} · 最近成功采集 {committed.iso() if committed else '—'}")
+                f"已保存消息 {result.saved} · 新增消息 {result.added} · 最近成功采集 {committed.iso() if committed else '—'}"
+                + (f"\n{storage}" if storage else ""))
         candidates = str(result.candidates) if result.b2_scan_completed_at else "—"
         self.summary.setText(
             f"{result.status} · {result.reason}\n"
@@ -1023,6 +1065,7 @@ class VisualCollectionPanel(QWidget):
             f"未读候选 {candidates} · 等待 {result.queued} · "
             f"完成 {result.completed} · 失败/异常 {result.errors} · B2 页 {result.pages}\n"
             f"数据库已保存 {result.saved} · 新增 {result.added} · 重复观察 {result.repeated} · 未确认 {result.uncertain}\n"
+            + (f"{storage}\n" if storage else "")
             + "\n".join(_collection_lines(result))
             + f"\n桌面通知 {self._notifications[-1] if self._notifications else '—'}\n"
             + "\n".join(_window_lines(result)))
@@ -1059,7 +1102,8 @@ class VisualCollectionPanel(QWidget):
         time_source = {"GROUP_ANCHOR": "时间段锚点", "EXPLICIT": "独立时间", "UNKNOWN": "未知"}
         collection = {"FIRST": "首次采集", "NEW": "新增", "EXISTING": "已有", "REVIEW": "待复核",
                       "NOT_COMPARED": "未比对"}
-        saved = {"SAVED": "已保存", "EXISTING": "已有记录", "REVIEW": "待复核", "FAILED": "失败",
+        saved = {"SAVED": "已保存", "EXISTING": "已有记录", "REVIEW": "待复核", "FAILED": "保存失败",
+                 "STAGED": "已暂存，待补存",
                  "NOT_SAVED": "未保存"}
         for row, message in enumerate(messages):
             values = (message.contact, str(message.sequence), direction.get(message.direction, message.direction),
