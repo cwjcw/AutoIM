@@ -121,9 +121,9 @@ class VisualEvidenceTests(TestCase):
         self.assertEqual(_core_geometry_continuity(before, replace(after, contacts=(selected,)), target, True)[0],
                          "GEOMETRY_NEIGHBORS_CHANGED")
 
-    def test_message_group_time_keeps_precision_and_rejects_ambiguous_date(self):
+    def test_message_group_time_anchors_bare_clock_to_capture_date(self):
         self.assertEqual(parse_message_time("昨天　08：15", NOW).anchor, "2026-11-23T08:15+08:00")
-        self.assertEqual(parse_message_time("08:15", NOW).precision, "CLOCK_WITHOUT_DATE")
+        self.assertEqual(parse_message_time("08:15", NOW).anchor, "2026-11-24T08:15+08:00")
         self.assertEqual(parse_message_time("昨天　08：15", NOW).time_source, "GROUP_ANCHOR")
         self.assertIsNone(parse_message_time("15分钟前", NOW).anchor)
         self.assertIsNone(parse_message_time("今天 21:00", NOW).anchor)

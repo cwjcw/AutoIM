@@ -109,11 +109,15 @@ class CoreMessage:
     collection_status: str = "NOT_COMPARED"
     save_status: str = "NOT_SAVED"
     file: object | None = None
+    method: str = "BUBBLE_FIRST"
+    ocr_boxes: tuple = ()
 
     def diagnostic(self):
         return dict(observation_id=self.id, sequence=self.sequence, direction=self.direction,
                     kind=self.kind, character_count=len(self.text), confidence=self.confidence,
                     box=bounds(self.box), time_evidence=bool(self.time), sender_evidence=bool(self.sender),
+                    ocr_boxes=self.ocr_boxes, method=self.method,
+                    recovered=self.method in ("OCR_REVERSE", "MERGED_EVIDENCE"),
                     clipped=self.quality == "CLIPPED", quality=self.quality, parser_status=self.parser_status,
                     unread=self.unread,
                     reason=self.reason)
@@ -147,7 +151,8 @@ def _read_message(item, task, contact):
         quality, reason = "PARTIAL", "FILE_METADATA_INCOMPLETE"
     return CoreMessage(uuid4().hex[:12], task, contact, item.sequence, item.direction, item.kind, text,
                        item.time_evidence, item.sender_name, confidence, item.box, quality, "UNKNOWN", reason, item.status,
-                       clock_source=item.time_source, file=item.file)
+                       clock_source=item.time_source, file=item.file, method=item.method,
+                       ocr_boxes=tuple(bounds(span.box) for span in item.ocr_spans))
 
 
 def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared, refreshed):
@@ -251,7 +256,6 @@ class CoreTask:
     previous: np.ndarray | None = None
     previous_box: Box | None = None
     best: CoreAnalysis | None = None
-    previous_read: tuple | None = None
     verified: bool = False
     changed: bool = False
     cursor_moved: bool = False
@@ -263,6 +267,7 @@ class CoreTask:
     scan_id: str = ""
     before_evidence: str = ""
     c2_evidence: str = ""
+    body_reads: int = 0
 
 
 @dataclass(slots=True)

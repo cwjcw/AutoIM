@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.util import find_spec
+from math import atan2, degrees
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +19,7 @@ class TextSpan:
     text: str
     box: Box
     score: float
+    angle: float | None = None
 
 
 class TextRecognizer(Protocol):
@@ -85,14 +87,18 @@ class LocalTextRecognizer:
             if not text:
                 continue
             bounds = box
+            angle = None
             if not single_line and result.boxes is not None:
                 points = np.asarray(result.boxes[index]) / scale
+                if len(points) >= 2:
+                    dx, dy = points[1] - points[0]
+                    angle = round(degrees(atan2(dy, dx)), 2)
                 bounds = Box(box.left + max(0, int(points[:, 0].min())),
                              box.top + max(0, int(points[:, 1].min())),
                              box.left + min(box.width, int(np.ceil(points[:, 0].max()))),
                              box.top + min(box.height, int(np.ceil(points[:, 1].max()))))
             if bounds.width and bounds.height:
-                spans.append(TextSpan(text, bounds, float(score)))
+                spans.append(TextSpan(text, bounds, float(score), angle))
         return tuple(sorted(spans, key=lambda span: (span.box.top, span.box.left)))
 
 

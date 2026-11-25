@@ -17,7 +17,8 @@ import numpy as np
 from autoim.wecom.visual_store import name_key
 
 KINDS = {"b2", "before", "after", "c2", "database", "failure"}
-REGIONS = {"b2", "b2-edge", "c1", "c2"}
+PRIVATE_RASTERS = ("c2-mask-foreground", "c2-mask-morphology")
+REGIONS = {"b2", "b2-edge", "c1", "c2", *PRIVATE_RASTERS}
 
 
 class EvidenceExportError(OSError):
@@ -35,7 +36,8 @@ def rect(box):
 
 
 def span_info(span, *, name_fragment=False):
-    return {"box": rect(span.box), "score": round(span.score, 4), "text": span.text, "name_fragment": name_fragment}
+    return {"box": rect(span.box), "score": round(span.score, 4), "text": span.text,
+            "name_fragment": name_fragment, "angle": span.angle}
 
 
 def contact_scan(raw, targets, scan, blocked):
@@ -130,17 +132,26 @@ def message_evidence(raw, messages, *, body=True):
                 "key": name_key(item.contact), "text": item.text if body else "", "time": item.time,
                 "time_anchor": item.clock.anchor, "time_source": item.clock.time_source,
                 "time_precision": item.clock.precision, "group_sequence": item.clock_sequence,
+                "normalized_time": item.clock.normalized, "time_correction": item.clock.correction,
+                "time_issue": item.clock.issue, "year_inferred": item.clock.year_inferred,
+                "time_format": item.clock.format, "date_anchor": item.clock.local_date,
                 "collection_status": item.collection_status, "save_status": item.save_status} for item in messages]
-    boxes = [(rect(item.box), f"M{item.sequence} {item.direction} {item.quality}") for item in messages]
+    boxes = [(rect(item.box), f"M{item.sequence} {item.direction} {item.method}") for item in messages]
     boxes.extend((rect(item.span.box), item.kind) for item in raw.message_ocr)
     ocr = [{**span_info(item.span), "kind": item.kind, "container": item.container_number,
             "nearest": item.nearest_container, "reason": item.reason,
             "possible_message": item.possible_message} for item in raw.message_ocr]
     containers = [{ "box": rect(item.container.box), "direction": item.direction,
-                    "clipped": item.container.clipped, "reason": item.reason} for item in raw.candidates]
+                    "clipped": item.container.clipped, "reason": item.reason,
+                    "method": item.container.method, "source": item.container.source} for item in raw.candidates]
     boxes.extend((item["box"], "CONTAINER " + item["direction"]) for item in containers)
     return {"messages": records, "ocr": ocr, "containers": containers,
             "completeness": raw.message_completeness}, boxes
+
+
+def c2_evidence_regions(raw, marks):
+    box = raw.layout.get("C2")
+    return [("c2", box, marks), *((name, box, (), mask) for name, mask in zip(PRIVATE_RASTERS, raw.c2_masks))]
 
 
 def _dump(value):
@@ -206,7 +217,7 @@ class EvidenceArchive:
             self._trim(folder)
             self.sizes[detection] = 0
         record["regions"] = []
-        for kind, box, marks in regions:
+        for kind, box, marks, *rasters in regions:
             if kind not in REGIONS:
                 raise EvidenceExportError("未知证据图像区域")
             info = {"kind": kind, "box": rect(box), "files": {}, "missing": ""}
@@ -216,9 +227,15 @@ class EvidenceArchive:
                 info["missing"] = "CAPTURE_OR_COORDINATES_UNAVAILABLE"
                 continue
             try:
-                crop = box.crop(pixels)
-                files = {"original": _png(crop), "annotated": _png(_draw(crop, rect(box), marks, masked=False)),
-                         "masked": _png(_draw(crop, rect(box), marks, masked=True))}
+                crop = rasters[0] if rasters else box.crop(pixels)
+                if crop.shape[:2] != (box.height, box.width):
+                    info["missing"] = "CAPTURE_OR_COORDINATES_UNAVAILABLE"
+                    continue
+                if kind in PRIVATE_RASTERS:
+                    files = {"original": _png(crop)}
+                else:
+                    files = {"original": _png(crop), "annotated": _png(_draw(crop, rect(box), marks, masked=False)),
+                             "masked": _png(_draw(crop, rect(box), marks, masked=True))}
                 size = sum(map(len, files.values()))
                 if self.sizes[detection] + size > self.RUN_LIMIT:
                     info["missing"] = "LOCAL_EVIDENCE_LIMIT"
@@ -277,7 +294,7 @@ class _Anonymize:
     def clean(self, value, key=""):
         if isinstance(value, dict):
             masked = {name: self.clean(item, name) for name, item in value.items()
-                      if name not in ("time_anchor", "previous_anchor")}
+                      if name not in ("time_anchor", "previous_anchor", "normalized_time", "date_anchor")}
             if "box" in value and "text" in value:
                 masked["characters"] = len(value["text"])
                 if value.get("name_fragment"):
@@ -299,6 +316,8 @@ class _Anonymize:
             return ""
         if key == "time":
             return "已读取" if value else ""
+        if key == "config_path":
+            return "本机 AutoIM 默认账号配置" if value else ""
         return value
 
 
@@ -310,7 +329,8 @@ def _html(report, contacts, records, manifest, events):
             "<tr>" + "".join(f"<td>{e(value)}</td>" for value in row) + "</tr>" for row in values) + "</tbody></table>"
     counts = [event for event in events if event["code"] in ("TEST_STARTED", "TEST_COMPLETED", "TEST_SUMMARY",
                                "DETECTION_FINISHED", "STAGE_STARTED", "STAGE_COMPLETED", "STAGE_TIMEOUT",
-                               "CONTACT_CLICKED", "RESULT_DISPLAYED", "CORE_DB_COMMITTED", "CORE_DB_NOT_SAVED", "CORE_DB_SAVE_FAILED")]
+                               "CONTACT_CLICKED", "RESULT_DISPLAYED", "CORE_DEFAULT_ACCOUNT_STATUS",
+                               "CORE_DB_COMMITTED", "CORE_DB_NOT_SAVED", "CORE_DB_SAVE_FAILED")]
     issues = [event for event in events if event["result"] in ("FAILED", "BLOCKED_BY_DEPENDENCY")
               or event["code"] in ("STAGE_RETRY", "STAGE_TIMEOUT")]
     images = "".join(f'<figure><figcaption>{e(item["detection"])} / {e(item["kind"])} / {e(item["id"])}</figcaption>' +
@@ -339,7 +359,8 @@ def _html(report, contacts, records, manifest, events):
                           for x in records if x["kind"] in ("before", "after", "failure")])
     body += "<h2>消息与数据库</h2>" + table(("任务", "阶段", "证据", "结果"),
                          [(x["task"], x["kind"], x["id"], x["data"].get("database") or
-                           [{k:v for k,v in item.items() if k in ("sequence","kind","quality","time_source",
+                           [{k:v for k,v in item.items() if k in ("sequence","kind","quality","time_source","method",
+                                                                 "time_precision","time_issue","time_format",
                                                                  "collection_status","save_status","character_count")}
                             for item in x["data"].get("messages", ())]) for x in records])
     body += "<h2>异常与缺失</h2>" + table(("时间", "阶段", "任务", "事件", "结果", "关联证据", "细节"),
@@ -390,10 +411,15 @@ def write_evidence(archive, store, events, report, *, full):
             data = {"kind": region["kind"], "box": region["box"], "included": {}, "sha256": {},
                     "missing": region["missing"]}
             item["regions"].append(data)
+            if region["kind"] in PRIVATE_RASTERS and not full:
+                data["withheld"] = True
+                continue
             if region["missing"]:
                 item.update(status="DIAGNOSTIC_EVIDENCE_MISSING", reason=region["missing"])
                 continue
-            for role in (("original", "annotated") if full else ("masked",)):
+            roles = ("original",) if region["kind"] in PRIVATE_RASTERS else (
+                ("original", "annotated") if full else ("masked",))
+            for role in roles:
                 entry = region["files"].get(role)
                 expected = f'{identifier}-{region["kind"]}-{role}.png'
                 if not entry or entry["file"] != expected:

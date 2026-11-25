@@ -133,6 +133,7 @@ class VisualObservation:
     board_scrollbar: Box | None = None
     login: LoginEvidence = LoginEvidence()
     verified_target: ContactObservation | None = None
+    c2_masks: tuple = ()
 
 
 def _group_senders(messages: tuple[VisibleMessageObservation, ...], dispositions: tuple[OcrDisposition, ...],
@@ -427,7 +428,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                                    recognition_ms=(perf_counter() - started) * 1000)
         if not message_gate(header):
             return header
-    messages = context = candidates = ()
+    messages = context = candidates = c2_masks = ()
     anchors = (None, None)
     dispositions = ()
     completeness = "VISIBLE_MESSAGES_UNVERIFIED"
@@ -440,7 +441,8 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
             trace.observations.append(OcrAreaObservation(trace.region, c2, "SKIPPED",
                                                         reason="缺少消息页证据"))
         analysis = analyze_messages(pixels, c2, containers, spans, unit, calibration, thresholds,
-                                    page_verified=corroborated or explicit)
+                                    page_verified=corroborated or explicit, capture_masks=multi_feature)
+        c2_masks = analysis.masks
         messages, context, anchors, dispositions = (analysis.messages, analysis.context,
                                                      analysis.anchors, analysis.dispositions)
         if conversation.conversation_type == "GROUP":
@@ -491,7 +493,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
         ocr_status=ocr_status, ocr_reason=ocr_reason, ocr_areas=tuple(trace.observations),
         recognition_ms=(perf_counter() - started) * 1000, anchors=anchors, message_ocr=dispositions,
         contact_text_diagnostics=tuple(contact_diagnostics), message_completeness=completeness,
-        board_scrollbar=detect_scroll_thumb(pixels, board, unit) if board else None)
+        board_scrollbar=detect_scroll_thumb(pixels, board, unit) if board else None, c2_masks=c2_masks)
 
 
 def read_visible_conversation(calibration_path: Path | None,

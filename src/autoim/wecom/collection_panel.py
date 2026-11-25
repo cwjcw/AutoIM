@@ -380,9 +380,9 @@ class VisualCollectionPanel(QWidget):
         self.core_task.setTextFormat(Qt.TextFormat.PlainText)
         self.core_task.setWordWrap(True)
         results.addWidget(self.core_task)
-        self.core_table = QTableWidget(0, 11)
-        self.core_table.setHorizontalHeaderLabels(("联系人", "序号", "方向", "可见时间", "类型", "内容", "OCR",
-                                                  "未读归属", "时间来源", "采集状态", "保存状态"))
+        self.core_table = QTableWidget(0, 12)
+        self.core_table.setHorizontalHeaderLabels(("联系人", "序号", "方向", "原始时间", "类型", "内容", "OCR",
+                                                  "未读归属", "时间来源", "采集状态", "保存状态", "标准化时间"))
         self.core_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.core_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.core_table.verticalHeader().hide()
@@ -1065,7 +1065,8 @@ class VisualCollectionPanel(QWidget):
             values = (message.contact, str(message.sequence), direction.get(message.direction, message.direction),
                       message.time or "—", message.kind, message.text or "—", message.quality,
                       unread.get(message.unread, message.unread), time_source[message.clock.time_source],
-                      collection[message.collection_status], saved[message.save_status])
+                      collection[message.collection_status], saved[message.save_status],
+                      message.clock.anchor or message.clock.local_date or "—")
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
@@ -1076,6 +1077,10 @@ class VisualCollectionPanel(QWidget):
                 f"\n发送人 {message.sender or '未确认'}")
             self.core_table.item(row, 8).setToolTip(
                 f"{message.clock.anchor or '日期未确认'} · {message.clock.precision} · 段内序号 {message.clock_sequence}")
+            self.core_table.item(row, 11).setToolTip(
+                f"{message.clock.normalized or '—'} · {message.clock.precision} · "
+                f"{'年份推断' if message.clock.year_inferred else '—'} · "
+                f"{message.clock.issue or ' / '.join(message.clock.correction) or '—'}")
         if messages and self._service:
             self._service.confirm_core_displayed(messages)
 

@@ -332,18 +332,45 @@ class CoreFlowTests(unittest.TestCase):
         self.assertEqual(result.core.verified, 1)
         self.assertEqual(result.core.messages[0].unread, "CONFIRMED_UNREAD")
 
-    def test_core_retries_ocr_without_reclick_and_preserves_reliable_body_on_incomplete_page(self):
+    def test_core_preserves_stable_partial_results_without_reclick_or_repeat_ocr(self):
         self.start()
         self.poll()
         unknown = bubble(view(), "", y=425, kind="UNKNOWN", status="UNCLASSIFIED")
         partial = sample(1, tone=120)
         partial = replace(partial, messages=(*partial.messages, unknown), message_completeness="VISIBLE_MESSAGES_INCOMPLETE")
-        result = self.poll(partial, count=MAX_READ_POLLS)
+        result = self.poll(partial, count=2)
         self.navigator.select.assert_called_once()
         self.assertEqual([item.quality for item in result.core.messages], ["RELIABLE", "UNKNOWN_TYPE"])
         self.assertEqual(result.core.messages[0].text, BODY)
         self.assertEqual(result.core.completeness, "VISIBLE_MESSAGES_INCOMPLETE")
         self.assertEqual((result.core.phase, result.core.read_unfinished), ("TARGET_PARTIAL", 1))
+        self.assertEqual(sum(event["code"] == "MESSAGE_OCR_COMPLETED" for event in self.events()), 1)
+
+    def test_unknown_unread_number_commits_reliable_view_after_one_body_read(self):
+        self.service._core_account = CoreAccount("合成采集账号", "core@example.test")
+        before = sample(unread={1: (1, False)})
+        rows = list(before.contacts)
+        rows[1] = replace(rows[1], unread_count=None, unread_count_reliable=False)
+        self.start()
+        self.assertEqual(self.poll(replace(before, contacts=tuple(rows))).core.clicks, 1)
+        current = sample(1, tone=119)
+        current = replace(current, messages=(bubble(current, "合成旧消息", y=268), *current.messages))
+        state = self.poll(current, count=2)
+        self.assertEqual((state.core.first_saved, state.core.verified), (2, 1))
+        self.assertTrue(all(item.unread != "CONFIRMED_UNREAD" for item in state.core.messages))
+        reads = [event["details"]["body_reads"] for event in self.events() if event["code"] == "MESSAGE_OCR_COMPLETED"]
+        self.assertEqual(reads, [1])
+
+    def test_invalid_local_account_still_displays_c2_with_save_failure(self):
+        self.start()
+        self.service._isolate_core_reads = True
+        self.service._core_account_status = CoreAccount.inspect(self.root / "missing.json")
+        self.poll()
+        state = self.poll(sample(1, tone=109), count=2)
+        self.assertEqual(state.core.messages[0].text, BODY)
+        self.assertEqual((state.core.messages[0].save_status, state.core.save_failures), ("FAILED", 1))
+        self.assertEqual(state.sqlite_result, "DEFAULT_ACCOUNT_FILE_MISSING")
+        self.assertFalse(self.isolated.path.exists())
 
     def test_window_recreation_and_changed_a1_both_stop_navigation(self):
         self.start()

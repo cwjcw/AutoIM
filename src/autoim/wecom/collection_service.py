@@ -20,8 +20,8 @@ from autoim.calibration import CalibrationStore
 from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
-from autoim.wecom.collection_evidence import contact_scan, message_evidence, rect, title_evidence
-from autoim.wecom.collection_incremental import CoreAccount, attach_times, save_visible
+from autoim.wecom.collection_evidence import c2_evidence_regions, contact_scan, message_evidence, rect, title_evidence
+from autoim.wecom.collection_incremental import CoreAccount, DefaultAccountConflict, attach_times, save_visible
 from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, isolated_row, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
@@ -501,6 +501,7 @@ class CollectionService:
         self.read = reader
         self._isolate_core_reads = capture is None and isinstance(reader, CollectionReader)
         self._core_account = core_account
+        self._core_account_status = None
         manager = WeComWindowManager()
         self.capture = capture if capture is not None else lambda: capture_visible_window(manager)
         self._window_probe = window_probe
@@ -653,7 +654,13 @@ class CollectionService:
             core.clock = TestClock(self._timed_core_event)
             core.clock.begin(1, "定位、恢复、最大化并激活企业微信")
             if self._isolate_core_reads:
-                self._core_account = CoreAccount.load()
+                self._core_account_status = CoreAccount.inspect()
+                self._core_account = self._core_account_status.account
+                self._core_event("CORE_DEFAULT_ACCOUNT_STATUS",
+                                 result="AUTO_PASS" if self._core_account else "PARTIAL",
+                                 reason=self._core_account_status.reason,
+                                 config_path=str(self._core_account_status.path),
+                                 encoding=self._core_account_status.encoding)
                 core.reader = CoreReadWorker(self.read._calibration_path, self.read._thresholds_path)
 
     def stop(self, *, source="control", final_reason="") -> None:
@@ -1923,7 +1930,7 @@ class CollectionService:
         self._core_event(code, task, result, reason=reason, read_risk=missing_read)
         self._core_event("NEXT_TARGET", task, result="AUTO_PASS", fresh_b2_required=True)
         if analysis and analysis.messages:
-            run.clock.begin(7, "比对本机历史、保存新增并显示 OCR 正文")
+            run.clock.begin(7, "解析消息时间、比对本机历史、保存并展示")
             analysis = self._core_persist(task, raw, analysis, allow=allow_persistence)
             if not self.active:
                 return self._status
@@ -1955,26 +1962,33 @@ class CollectionService:
             reason = "DUPLICATE_FULL_NAME_HISTORY_AMBIGUOUS"
             event = self._core_event("CORE_DB_NOT_SAVED", task, "PARTIAL", reason=reason)
             review = tuple(replace(item, collection_status="REVIEW", save_status="REVIEW")
-                           for item in attach_times(analysis.messages, at, recent=False))
+                           for item in attach_times(analysis.messages, at))
             self._keep_core_database(task, raw, review, {"committed": False, "reason": reason}, event)
             self._core_state(review_messages=run.view.review_messages + len(review))
             return replace(analysis, messages=review)
         if not self._core_account or not task.verified or not allow:
+            timed = attach_times(analysis.messages, at)
             if self._isolate_core_reads:
-                reason = "DEFAULT_ACCOUNT_UNAVAILABLE" if not self._core_account else "CAPTURE_EXPIRED_OR_UNVERIFIED"
+                status = self._core_account_status
+                reason = (status.reason if status and not status.account else "DEFAULT_ACCOUNT_READ_FAILED"
+                          ) if not self._core_account else "CAPTURE_EXPIRED_OR_UNVERIFIED"
+                timed = tuple(replace(item, save_status="FAILED") for item in timed)
+                self._core_state(save_failures=run.view.save_failures + 1)
+                self._set(sqlite_result=reason)
                 event = self._core_event("CORE_DB_NOT_SAVED", task, "PARTIAL", reason=reason)
-                self._keep_core_database(task, raw, analysis.messages, {"committed": False, "reason": reason}, event)
-            return replace(analysis, messages=attach_times(analysis.messages, at, recent=analysis.latest != "UNKNOWN"))
+                self._keep_core_database(task, raw, timed, {"committed": False, "reason": reason,
+                                                            "config_path": str(status.path) if status else ""}, event)
+            return replace(analysis, messages=timed)
         try:
             result = save_visible(self.test_store, self._core_account, analysis, task.conversation_kind, at,
                                   self._run_id, self._core_check)
         except (TestDeadline, sqlite3.Error, OSError, ValueError) as exc:
-            reason = type(exc).__name__
+            reason = str(exc) if isinstance(exc, DefaultAccountConflict) else type(exc).__name__
             event = self._core_event("CORE_DB_SAVE_FAILED", task, "FAILED", reason=reason)
             self._core_state(save_failures=run.view.save_failures + 1)
             if isinstance(exc, TestDeadline):
                 run.clock.complete("TIMEOUT", str(exc))
-            failed = tuple(replace(item, save_status="FAILED") for item in attach_times(analysis.messages, at, recent=False))
+            failed = tuple(replace(item, save_status="FAILED") for item in attach_times(analysis.messages, at))
             self._keep_core_database(task, raw, failed, {"committed": False, "reason": reason}, event)
             return replace(analysis, messages=failed)
         except CancelledError:
@@ -2053,7 +2067,7 @@ class CollectionService:
         analysis = analyze_read(raw, identifier, raw.conversation.title if raw.conversation.title_name_reliable else "",
                                 None, "", verified=False, badge_cleared=False, refreshed=False)
         displayed = tuple(replace(item, unread="INDEPENDENT_OCR") for item in attach_times(
-            analysis.messages, frame.captured_at, recent=False))
+            analysis.messages, frame.captured_at))
         run.independent_done = True
         run.independent_reason = ""
         run.clock.complete("PARTIAL" if analysis.gaps or not displayed else "AUTO_PASS",
@@ -2064,7 +2078,7 @@ class CollectionService:
                                           messages=[item.diagnostic() for item in displayed], gaps=analysis.gaps))
         data, marks = message_evidence(raw, displayed)
         self._keep_core_evidence("c2", raw, {**data, "conversation_verified": False},
-                                 [("c2", raw.layout.get("C2"), marks)], task_id=identifier, source_event=event)
+                                 c2_evidence_regions(raw, marks), task_id=identifier, source_event=event)
         if displayed:
             run.clock.begin(7, "展示独立 OCR 正文及未确认归属")
             run.presentation = identifier
@@ -2218,7 +2232,7 @@ class CollectionService:
 
         raw = self._core_read_frame(frame, "header")
         if allow_c2(raw) and (run.reader or isinstance(self.read, CollectionReader)):
-            run.clock.progress("正在识别 C2 消息正文")
+            run.clock.progress("读取 C2 正文并复核遗漏气泡")
             raw = self._core_read_frame(frame, "body")
         ocr_at = EventTime.now()
         self._set(scan_ocr_completed_at=ocr_at.wall, match=raw.conversation.match_status,
@@ -2283,6 +2297,7 @@ class CollectionService:
                                      [("b2", raw.layout.get("B2"), selection), ("c1", raw.layout.get("C1"), title_marks),
                                       ("c2", raw.layout.get("C2"), [])], task=task, source_event=event)
         if ready:
+            task.body_reads += 1
             verified, cleared = ready
             if cleared:
                 run.cleared.add(task.target.key)
@@ -2295,23 +2310,20 @@ class CollectionService:
                              captured_at=raw.frame.captured_at.isoformat(), poll=task.polls)
             self._core_event("LATEST_POSITION_CHECKED", task,
                              "PARTIAL" if analysis.latest == "UNKNOWN" else "AUTO_PASS", method=analysis.latest)
+            timed = attach_times(analysis.messages, raw.frame.captured_at)
             event = self._core_event("MESSAGE_OCR_COMPLETED", task, "PARTIAL" if analysis.gaps or not analysis.messages else "AUTO_PASS",
-                             messages=[item.diagnostic() for item in analysis.messages],
+                             messages=[{**item.diagnostic(), "time_format": item.clock.format,
+                                        "time_issue": item.clock.issue, "time_precision": item.clock.precision,
+                                        "time_correction": item.clock.correction, "year_inferred": item.clock.year_inferred}
+                                       for item in timed],
                              completeness=analysis.completeness, gaps=analysis.gaps,
-                             recognition_ms=round(raw.recognition_ms))
-            data, marks = message_evidence(raw, attach_times(analysis.messages, raw.frame.captured_at,
-                                                             recent=analysis.latest != "UNKNOWN"))
+                             body_reads=task.body_reads, recognition_ms=round(raw.recognition_ms))
+            data, marks = message_evidence(raw, timed)
             shot = self._keep_core_evidence("c2", raw, {**data, "conversation_verified": True, "gaps": analysis.gaps},
-                                            [("c2", raw.layout.get("C2"), marks)], task=task, source_event=event)
+                                            c2_evidence_regions(raw, marks), task=task, source_event=event)
             confirmed = sum(item.unread == "CONFIRMED_UNREAD" for item in analysis.messages)
             self._core_event("UNREAD_RANGE_CHECKED", task, "AUTO_PASS" if confirmed else "PARTIAL", unread_confirmed=confirmed,
                              badge_cleared=cleared, before_count=row.unread_count if row.unread_count_reliable else None)
-            read_signature = tuple((item.kind, item.text, item.time, item.direction, item.quality, item.unread)
-                                   for item in analysis.messages)
-            repeat = read_signature == task.previous_read
-            if repeat:
-                self._core_state(repeated=run.view.repeated + len(read_signature))
-            task.previous_read = read_signature
             self._core_state(latest=analysis.latest, completeness=analysis.completeness,
                              ocr_complete=any(area.region.startswith("C2") and area.status in ("TEXT_FOUND", "NO_TEXT")
                                               for area in raw.ocr_areas) or bool(analysis.messages))
@@ -2321,10 +2333,13 @@ class CollectionService:
                 task.c2_evidence = shot
             if analysis.messages and not analysis.gaps:
                 return self._finish_core_target(task, raw, "TARGET_COMPLETED", analysis=analysis)
-            if self._core_account and task.best and repeat:
+            retryable = any(gap["reason"] in ("C2_OCR_FAILED", "C2_OCR_SKIPPED", "BODY_OCR_UNCERTAIN",
+                                              "BODY_OCR_BELOW_CORE_THRESHOLD") for gap in analysis.gaps)
+            if task.best and any(item.quality == "RELIABLE" for item in task.best.messages) and (
+                    not retryable or task.body_reads >= 2):
                 return self._finish_core_target(task, raw, "TARGET_PARTIAL",
                                                 reason="C2 可见消息存在覆盖缺口", analysis=task.best)
-            phase = "UNREAD_RANGE_UNCERTAIN" if analysis.messages else "C2_OCR_NO_MESSAGES"
+            phase = "C2_RECOVERABLE_GAP" if retryable else "C2_OCR_NO_RELIABLE_MESSAGES"
         if task.polls >= MAX_READ_POLLS:
             if task.best:
                 return self._finish_core_target(task, raw, "TARGET_PARTIAL", reason=phase, analysis=task.best)

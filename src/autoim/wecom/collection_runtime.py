@@ -20,7 +20,7 @@ from autoim.wecom.collection_evidence import EvidenceArchive, EvidenceJob, write
 from autoim.wecom.collection_test import PHASES
 from autoim.wecom.visual_store import database_path
 
-PC_VERSION = "PC-V3.5.3.1"
+PC_VERSION = "PC-V3.5.3.2"
 
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",
@@ -420,6 +420,8 @@ class CollectionRuntime:
             with TemporaryFile() as readable, TemporaryFile() as structured:
                 selected = []
                 for event in self.events(scope, detection):
+                    if not full_visual and "config_path" in event["details"]:
+                        event = {**event, "details": {**event["details"], "config_path": "本机 AutoIM 默认账号配置"}}
                     if event["detection"]:
                         selected.append(event)
                     readable.write((_human(event) + "\n").encode("utf-8"))

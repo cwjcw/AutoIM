@@ -13,7 +13,7 @@ from autoim.vision import NormalizedRect
 from autoim.wecom.visual_files import FileCardObservation, parse_file_card, quiet_card_bounds
 from autoim.wecom.visual_layout import Box, VisualThresholds, near_background
 from autoim.wecom.visual_ocr import TextSpan, text_lines
-from autoim.wecom.visual_time import TIME_LABEL, normalized_time
+from autoim.wecom.visual_time import is_time_label
 _SYSTEM = re.compile(r"撤回了[一1]条消息|加入了群聊|退出了群聊|移出了群聊|以下是新消息|开启了会话内容存档|你们已成为好友")
 _IMAGE_PLACEHOLDER = re.compile(r"\[图片\]|【图片】|图片加载中[.…]*|图片未加载|图片已过期")
 _COMPLEX_CARD = re.compile(r"引用|聊天记录|小程序|转发")
@@ -35,6 +35,7 @@ class VisibleMessageObservation:
     file: FileCardObservation | None = None
     sender_name: str = ""
     time_source: str = "GROUP_ANCHOR"
+    method: str = "BUBBLE_FIRST"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,7 @@ class Container:
     source: str = "C2 前景轮廓"
     needs_text: bool = False
     quiet_outline: bool = False
+    method: str = "BUBBLE_FIRST"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,7 @@ class MessageAnalysis:
     dispositions: tuple[OcrDisposition, ...]
     anchors: tuple[int | None, int | None]
     containers: tuple[Container, ...] = ()
+    masks: tuple[np.ndarray, ...] = ()
 
     @property
     def context(self) -> tuple[TextSpan, ...]:
@@ -280,14 +283,132 @@ def _file_candidates(containers: tuple[Container, ...], spans: tuple[TextSpan, .
     return files
 
 
+def _fill_between(span, box, pixels, background, unit):
+    """Verify a bubble-colored band above and below the OCR body, outside the glyphs."""
+    if not (box.left + 3 * unit <= span.left and span.right <= box.right - 3 * unit
+            and box.top + 3 * unit <= span.top and span.bottom <= box.bottom - 3 * unit):
+        return False
+    margin = max(1, round(2 * unit))
+    left, right = span.left, span.right
+    top = pixels[box.top + margin:span.top, left:right]
+    bottom = pixels[span.bottom:box.bottom - margin, left:right]
+    if not top.size or not bottom.size:
+        return False
+    fill_a, fill_b = (np.median(area.reshape(-1, 3), axis=0) for area in (top, bottom))
+    delta = background - (fill_a + fill_b) / 2
+    gray = 5 <= np.min(delta) <= np.max(delta) <= 65 and np.ptp(delta) <= 20
+    color = (fill_a[0] - fill_a[2]) - (background[0] - background[2]) >= 7 and delta[2] >= 6
+    if not (gray or color) or np.max(np.abs(fill_a - fill_b)) > 6:
+        return False
+    return all(float(np.mean(np.max(np.abs(area - fill), axis=2) <= 6)) >= .62
+               for area, fill in ((top, fill_a), (bottom, fill_b)))
+
+
+def _local_fill_boxes(pixels, span, region, background, unit):
+    side = round(52 * unit)
+    vertical = round(28 * unit)
+    area = Box(max(region.left, span.left - side), max(region.top, span.top - vertical),
+               min(region.right, span.right + side), min(region.bottom, span.bottom + vertical))
+    crop = area.crop(pixels)
+    # Use the most common color next to the text; text ink cannot dominate
+    # the sampled strips, and the page background never qualifies as fill.
+    strip = max(2, round(7 * unit))
+    palette = np.concatenate((pixels[max(area.top, span.top - strip):span.top, span.left:span.right],
+                              pixels[span.bottom:min(area.bottom, span.bottom + strip), span.left:span.right]))
+    if not palette.size:
+        return ()
+    color = np.median(palette.reshape(-1, 3), axis=0)
+    if np.max(np.abs(color - background)) < 6:
+        return ()
+    mask = cv2.inRange(crop, tuple(color - 6), tuple(color + 6)) != 0
+    candidates, _ = _container_contours(mask.astype(np.uint8), area, unit)
+    margin = max(2, round(2 * unit))
+    return tuple(item for item in candidates if not item.clipped and item.box.left >= area.left + margin
+                 and item.box.right <= area.right - margin)
+
+
+def _watermark_like(span, crop, background, repeats):
+    if not ((span.angle is not None and 8 <= abs(span.angle) <= 55) or repeats >= 2):
+        return False
+    delta = background - crop.astype(np.float32)
+    # Pale, sparse ink only. Dark text and a confirmed filled bubble never
+    # enter this filter, regardless of the text or its repetition.
+    return bool(crop.size and np.percentile(np.max(np.abs(delta), axis=2), 92) <= 43
+                and .012 <= np.mean(np.max(np.abs(delta), axis=2) >= 7) <= .38)
+
+
+def _recover_bubbles(pixels, region, containers, spans, contextual, unit, thresholds, capture_masks):
+    crop = region.crop(pixels)
+    background = np.median(crop[::5, ::5], axis=(0, 1))
+    raw = (~near_background(crop, thresholds.foreground_delta)).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, round(4 * unit) | 1),) * 2)
+    opened = cv2.morphologyEx(raw, cv2.MORPH_OPEN, kernel)
+    candidates, _ = _container_contours(opened, region, unit)
+    orphaned = [span for span in spans if span not in contextual and span.score >= max(.81, thresholds.text_score)
+                and region.contains(span.box.center)
+                and not any(not item.quiet_outline and _association_score(span.box, item.box, unit) is not None
+                            for item in containers)]
+    anchors = content_anchors(tuple(item for item in containers if not item.quiet_outline and
+                                   any(_association_score(span.box, item.box, unit) is not None for span in spans
+                                       if span not in contextual)), region, pixels.shape[1], {}, thresholds)
+    recovered, watermarks = [], set()
+    for span in orphaned[:48]:
+        # Determine direction from the recovered rectangle, never from ink alone.
+        # If no established lane exists, require a normal margin from the viewport.
+        trials = candidates
+        for attempt in range(2):
+            matched = []
+            for item in trials:
+                box = item.box
+                near_left = 9 * unit <= box.left - region.left <= 88 * unit
+                near_right = 9 * unit <= region.right - box.right <= 88 * unit
+                direction = direction_evidence(box, region, anchors, thresholds)[0]
+                if (item.clipped or not _in_message_lane(box, region, thresholds)
+                        or not (direction != "UNKNOWN" or near_left != near_right)
+                        or _association_score(span.box, box, unit) is None
+                        or not _fill_between(span.box, box, pixels, background, unit)):
+                    continue
+                if not any(_overlaps(box, old.box) for old in (*containers, *recovered)):
+                    matched.append(item)
+            if len(matched) == 1:
+                recovered.append(replace(matched[0], source=("C2 形态去细笔画与正文反向复核" if not attempt
+                                                            else "C2 正文旁局部连续填充"),
+                                         method="MERGED_EVIDENCE" if not attempt else "OCR_REVERSE"))
+                break
+            if matched or attempt or not _in_message_lane(span.box, region, thresholds):
+                break
+            trials = _local_fill_boxes(pixels, span.box, region, background, unit)
+        if (not any(_association_score(span.box, item.box, unit) is not None for item in recovered)
+                and _watermark_like(span, span.box.crop(pixels), background,
+                                    sum(other.text == span.text for other in orphaned))):
+            watermarks.add(span)
+    if not capture_masks:
+        return (*containers, *recovered), watermarks, ()
+    close = max(2, round(2 * unit))
+    processed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, np.ones((close, close), np.uint8))
+    return (*containers, *recovered), watermarks, (raw * 255, processed * 255)
+
+
+def _emoji_only(value):
+    return bool(value) and all(char.isspace() or ord(char) in (0x200D, 0xFE0F)
+                               or 0x1F000 <= ord(char) <= 0x1FAFF or 0x2600 <= ord(char) <= 0x27BF
+                               for char in value)
+
+
 def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Container, ...],
                      spans: tuple[TextSpan, ...], unit: float,
                      calibration: Mapping[str, NormalizedRect],
-                     thresholds: VisualThresholds, *, page_verified: bool = True) -> MessageAnalysis:
+                     thresholds: VisualThresholds, *, page_verified: bool = True, capture_masks=False) -> MessageAnalysis:
     center = region.center[0]
     time_like = {span for span in spans if span.score >= thresholds.text_score
                  and abs(span.box.center[0] - center) <= region.width * .12
-                 and TIME_LABEL.fullmatch(normalized_time(span.text))}
+                 and is_time_label(span.text)}
+    centered_system = {span for span in spans if span.score >= thresholds.text_score
+                       and abs(span.box.center[0] - center) <= region.width * .12 and _SYSTEM.search(span.text)}
+    watermarks, masks = set(), ()
+    if page_verified and spans:
+        containers, watermarks, masks = _recover_bubbles(pixels, region, containers, spans,
+                                                        time_like | centered_system, unit, thresholds, capture_masks)
     attachment_spans = tuple(span for span in spans if span not in time_like)
     preliminary = _file_candidates(containers, attachment_spans, unit, thresholds.text_score) if page_verified else {}
     # Strong outer bounds own inner icon contours. Competing card-sized boxes
@@ -322,6 +443,9 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             if _SYSTEM.search(span.text):
                 dispositions.append(OcrDisposition(span, "SYSTEM", None, nearest, "居中系统提示"))
                 continue
+        if span in watermarks and not side_supported:
+            dispositions.append(OcrDisposition(span, "WATERMARK", None, nearest, "浅色稀疏笔画且缺少气泡填充"))
+            continue
         if not page_verified:
             reason = "消息页证据不足"
         elif not ranked:
@@ -375,7 +499,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             kind = "COMPLEX_CANDIDATE"
             evidence.append("疑似引用、转发或其他复杂卡片，正文边界未确认")
         elif not weak and text:
-            kind = "TEXT"
+            kind = "EMOJI" if _emoji_only(text) else "TEXT"
         if item.clipped:
             direction = "UNKNOWN"
             if file is None:
@@ -384,7 +508,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             evidence.append("容器接触视口边缘，文字可能截断")
         elif kind == "UNKNOWN" and weak:
             status = "OCR_UNCERTAIN"
-        elif direction == "UNKNOWN" or kind not in ("TEXT", "IMAGE", "FILE"):
+        elif direction == "UNKNOWN" or kind not in ("TEXT", "IMAGE", "FILE", "EMOJI"):
             status = "UNCLASSIFIED"
         else:
             status = "CANDIDATE"
@@ -397,7 +521,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             display_text = file.file_name or "\n".join(file.name_rows)
         results.append(VisibleMessageObservation(len(results) + 1, box, direction, kind,
                                                  display_text, time, left_dist, right_dist,
-                                                 status, tuple(evidence), matching, file=file))
+                                                 status, tuple(evidence), matching, file=file, method=item.method))
         for pos in positions:
             span = dispositions[pos].span
             if file is not None:
@@ -405,13 +529,13 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                 dispositions[pos] = OcrDisposition(span, "MEDIA", index, index, reason)
             elif kind == "IMAGE":
                 dispositions[pos] = OcrDisposition(span, "MEDIA", index, index, "已与媒体整体卡片关联")
-            elif kind == "TEXT":
+            elif kind in ("TEXT", "EMOJI"):
                 dispositions[pos] = OcrDisposition(span, "MESSAGE", index, index, "与唯一正文容器关联")
             else:
                 reason = ("容器触及视口，正文可能截断" if item.clipped else
                           "OCR 置信度不足或容器类型未确认")
                 dispositions[pos] = OcrDisposition(span, "UNASSIGNED", None, index, reason, True)
-    return MessageAnalysis(tuple(results), tuple(dispositions), anchors, containers)
+    return MessageAnalysis(tuple(results), tuple(dispositions), anchors, containers, masks)
 
 
 def classify_messages(pixels: np.ndarray, region: Box, containers: tuple[Container, ...],
