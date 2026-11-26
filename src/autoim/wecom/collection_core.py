@@ -304,6 +304,7 @@ class CoreRun:
     independent_done: bool = False
     finish_after_independent: bool = False
     selection_waits: int = 0
+    badge_reviewed: bool = False
     mute_trials: Counter = field(default_factory=Counter)
     mute_recent: dict = field(default_factory=dict)
     muted_crops: set = field(default_factory=set)

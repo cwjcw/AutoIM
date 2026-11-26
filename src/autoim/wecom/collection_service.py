@@ -283,7 +283,8 @@ def _core_read_rank(analysis):
 def unread_targets(observation: VisualObservation, scope: CollectionScope | None = None, *,
                    allow_duplicate=False) -> tuple[_Target, ...]:
     """B2 is the source, including muted rows and undifferentiated red dots."""
-    if observation.page != "MESSAGES_CANDIDATE" or observation.layout.get("B2") is None:
+    if (observation.page != "MESSAGES_CANDIDATE"
+            or observation.layout.b2_boundary_uncertain(observation.frame.visual_unit)):
         return ()
     names = Counter(name_key(row.display_name) for row in observation.contacts if row.name_reliable and row.display_name)
     targets = []
@@ -1365,7 +1366,11 @@ class CollectionService:
         self._record_contact_decisions(raw, observed, blocked_reason)
         for item in unowned:
             self._record("SCOPE", "B2_BADGE_UNASSIGNED", details={"box": bounds(item.box), "kind": item.kind})
-        reasons = tuple(dict.fromkeys(reason for target in unreliable for reason in target.blockers))
+        boundary_uncertain = raw.layout.b2_boundary_uncertain(raw.frame.visual_unit)
+        reasons = tuple(dict.fromkeys(
+            (*(reason for target in unreliable for reason in target.blockers),
+             *(("红色徽标缺少唯一联系人行证据",) if unowned else ()),
+             *(("搜索工具栏与 B2 上边界缺少一致证据",) if boundary_uncertain else ()))))
         completed = EventTime.now().wall
         conversation = raw.conversation
         self._set(b2_scan_attempt_at=attempted_at.wall, b2_scan_completed_at=completed, last_scan=completed,
@@ -1382,7 +1387,7 @@ class CollectionService:
                   navigation_blocked_unread=reliable_count if blocked_reason else 0,
                   skipped_reasons=tuple(dict.fromkeys(t.skip_reason for t in skipped)),
                   scan_disposition="B2_SCANNED_UNREAD" if reliable_count else
-                  "B2_SCANNED_UNRELIABLE" if unreliable or unowned else
+                  "B2_SCANNED_UNRELIABLE" if unreliable or unowned or boundary_uncertain else
                   "SKIPPED_BY_POLICY" if skipped else "B2_SCANNED_NO_UNREAD",
                   awaiting_navigation=len(self._queued), selection_method=conversation.selection_method,
                   selection_name=conversation.selected_name, selection_name_reliable=conversation.selected_name_reliable,
@@ -2156,6 +2161,7 @@ class CollectionService:
                     crop_screen=raster.region, tooltip=bounds(box), mapping=raw.frame.coordinates.snapshot,
                     started_at=hover_started.isoformat(), finished_at=EventTime.now().wall.isoformat(),
                     move_and_wait_ms=raster.move_ms, local_ocr_ms=ocr_ms,
+                    direction=raster.direction, visual_scale=raster.scale, hover_wait_ms=raster.wait_ms,
                     time_precision=result.precision if result else "", fallback=not result or bool(result.issue))
                 if result:
                     updated[index] = replace(item, hover=result)
@@ -2666,6 +2672,12 @@ class CollectionService:
                                        self._status.scan_id, foreground_block)
             box, header = raw.layout.get("B2"), raw.layout.get("C1")
             regions = [("b2", box, marks)]
+            toolbar = raw.layout.toolbar
+            if toolbar:
+                regions.append(("b1", toolbar.area, [
+                    (rect(control), label) for control, label in
+                    ((toolbar.search, "SEARCH"), (toolbar.icon, "ICON"), (toolbar.add, "PLUS"),
+                     (box and Box(box.left, box.top, box.right, box.top + 1), "B2 START")) if control]))
             if box and header and box.top - header.bottom >= round(18 * raw.frame.state.dpi / 96):
                 start = max(header.bottom, box.top - round(100 * raw.frame.state.dpi / 96))
                 regions.append(("b2-edge", Box(box.left, start, box.right, box.top + 2),
@@ -2715,9 +2727,21 @@ class CollectionService:
                 reason = "正在限次复核未知静音状态"
                 clock.progress(reason, retry=True)
                 return self._set(reason=reason)
-            reason = ("当前可见范围没有未读" if not self._status.unread_marker_count
+            uncertain = (self._status.unowned_unread_count
+                         or raw.layout.b2_boundary_uncertain(raw.frame.visual_unit))
+            if uncertain and not run.badge_reviewed:
+                run.badge_reviewed = True
+                reason = "B2 边界或徽标归属待复核，重新截图并识别"
+                self._record("B2", "B2_COVERAGE_RECHECK", "PARTIAL",
+                             details={"scan": self._status.scan_id,
+                                      "unowned": self._status.unowned_unread_count,
+                                      "boundary": raw.layout.b2_boundary_uncertain(raw.frame.visual_unit)})
+                clock.progress(reason, retry=True)
+                return self._set(reason=reason)
+            reason = ("B2 覆盖或未读徽标归属无法确认" if uncertain else
+                      "当前可见范围没有未读" if not self._status.unread_marker_count
                       else "可见未读已处理或因范围、视觉证据不足而跳过")
-            clock.complete("PARTIAL" if self._status.unreliable_unread_count else "SKIPPED", reason)
+            clock.complete("PARTIAL" if uncertain or self._status.unreliable_unread_count else "SKIPPED", reason)
             if not run.independent_done and not run.view.messages:
                 run.independent_reason = reason
                 run.finish_after_independent = True

@@ -11,7 +11,7 @@ import numpy as np
 
 from autoim.vision import NormalizedRect
 from autoim.wecom.visual_files import FileCardObservation, parse_file_card, quiet_card_bounds
-from autoim.wecom.visual_layout import Box, VisualThresholds, near_background
+from autoim.wecom.visual_layout import Box, VisualThresholds, contours, near_background
 from autoim.wecom.visual_ocr import TextSpan, text_lines
 from autoim.wecom.visual_time import is_time_label
 _SYSTEM = re.compile(r"撤回了[一1]条消息|加入了群聊|退出了群聊|移出了群聊|以下是新消息|开启了会话内容存档|你们已成为好友")
@@ -57,6 +57,7 @@ class OcrDisposition:
     nearest_container: int | None
     reason: str
     possible_message: bool = False
+    reverse_evidence: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,7 +286,18 @@ def _file_candidates(containers: tuple[Container, ...], spans: tuple[TextSpan, .
     return files
 
 
-def _fill_between(span, box, pixels, background, unit):
+def _bubble_surround(pixels, box, region, unit):
+    gap, reach = max(1, round(3 * unit)), max(3, round(13 * unit))
+    rim = Box(max(region.left + gap, box.left - reach), max(region.top, box.top - reach),
+              min(region.right - gap, box.right + reach), min(region.bottom, box.bottom + reach))
+    outside = (pixels[box.top:box.bottom, rim.left:max(rim.left, box.left-gap)],
+               pixels[box.top:box.bottom, min(rim.right, box.right+gap):rim.right],
+               pixels[rim.top:max(rim.top, box.top-gap), box.left:box.right],
+               pixels[min(rim.bottom, box.bottom+gap):rim.bottom, box.left:box.right])
+    return [np.median(side.reshape(-1, 3), axis=0) for side in outside if side.size]
+
+
+def _fill_between(span, box, pixels, region, unit):
     """Verify a bubble-colored band above and below the OCR body, outside the glyphs."""
     if not (box.left + 3 * unit <= span.left and span.right <= box.right - 3 * unit
             and box.top + 3 * unit <= span.top and span.bottom <= box.bottom - 3 * unit):
@@ -297,16 +309,20 @@ def _fill_between(span, box, pixels, background, unit):
     if not top.size or not bottom.size:
         return False
     fill_a, fill_b = (np.median(area.reshape(-1, 3), axis=0) for area in (top, bottom))
-    delta = background - (fill_a + fill_b) / 2
-    gray = 5 <= np.min(delta) <= np.max(delta) <= 65 and np.ptp(delta) <= 20
-    color = (fill_a[0] - fill_a[2]) - (background[0] - background[2]) >= 7 and delta[2] >= 6
-    if not (gray or color) or np.max(np.abs(fill_a - fill_b)) > 6:
+    fill = (fill_a + fill_b) / 2
+    support = 0
+    for background in _bubble_surround(pixels, box, region, unit):
+        delta = background - fill
+        gray = 5 <= np.min(delta) <= np.max(delta) <= 65 and np.ptp(delta) <= 22
+        color = (fill[0] - fill[2]) - (background[0] - background[2]) >= 7 and delta[2] >= 6
+        support += bool(gray or color)
+    if support < 2 or np.max(np.abs(fill_a - fill_b)) > 6:
         return False
     return all(float(np.mean(np.max(np.abs(area - fill), axis=2) <= 6)) >= .62
                for area, fill in ((top, fill_a), (bottom, fill_b)))
 
 
-def _local_fill_boxes(pixels, span, region, background, unit):
+def _local_fill_boxes(pixels, span, region, unit):
     side = round(52 * unit)
     vertical = round(28 * unit)
     area = Box(max(region.left, span.left - side), max(region.top, span.top - vertical),
@@ -320,8 +336,6 @@ def _local_fill_boxes(pixels, span, region, background, unit):
     if not palette.size:
         return ()
     color = np.median(palette.reshape(-1, 3), axis=0)
-    if np.max(np.abs(color - background)) < 6:
-        return ()
     mask = cv2.inRange(crop, tuple(color - 6), tuple(color + 6)) != 0
     candidates, _ = _container_contours(mask.astype(np.uint8), area, unit)
     margin = max(2, round(2 * unit))
@@ -353,11 +367,12 @@ def _recover_bubbles(pixels, region, containers, spans, contextual, unit, thresh
     anchors = content_anchors(tuple(item for item in containers if not item.quiet_outline and
                                    any(_association_score(span.box, item.box, unit) is not None for span in spans
                                        if span not in contextual)), region, pixels.shape[1], {}, thresholds)
-    recovered, watermarks = [], set()
+    recovered, watermarks, reviews = [], set(), {}
     for span in orphaned[:48]:
         # Determine direction from the recovered rectangle, never from ink alone.
         # If no established lane exists, require a normal margin from the viewport.
         trials = candidates
+        reviews[span] = "反向核对未找到具有独立填充和消息列证据的唯一边界"
         for attempt in range(2):
             matched = []
             for item in trials:
@@ -368,27 +383,30 @@ def _recover_bubbles(pixels, region, containers, spans, contextual, unit, thresh
                 if (item.clipped or not _in_message_lane(box, region, thresholds)
                         or not (direction != "UNKNOWN" or near_left != near_right)
                         or _association_score(span.box, box, unit) is None
-                        or not _fill_between(span.box, box, pixels, background, unit)):
+                        or not _fill_between(span.box, box, pixels, region, unit)):
                     continue
                 if not any(_overlaps(box, old.box) for old in (*containers, *recovered)):
                     matched.append(item)
             if len(matched) == 1:
+                reviews[span] = "正文与反向恢复的完整边界匹配"
                 recovered.append(replace(matched[0], source=("C2 形态去细笔画与正文反向复核" if not attempt
                                                             else "C2 正文旁局部连续填充"),
                                          method="MERGED_EVIDENCE" if not attempt else "OCR_REVERSE"))
                 break
             if matched or attempt or not _in_message_lane(span.box, region, thresholds):
+                if matched:
+                    reviews[span] = "反向核对存在多个符合填充和位置要求的边界"
                 break
-            trials = _local_fill_boxes(pixels, span.box, region, background, unit)
+            trials = _local_fill_boxes(pixels, span.box, region, unit)
         if (not any(_association_score(span.box, item.box, unit) is not None for item in recovered)
                 and _watermark_like(span, span.box.crop(pixels), background,
                                     sum(other.text == span.text for other in orphaned))):
             watermarks.add(span)
     if not capture_masks:
-        return (*containers, *recovered), watermarks, ()
+        return (*containers, *recovered), watermarks, (), reviews
     close = max(2, round(2 * unit))
     processed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, np.ones((close, close), np.uint8))
-    return (*containers, *recovered), watermarks, (raw * 255, processed * 255)
+    return (*containers, *recovered), watermarks, (raw * 255, processed * 255), reviews
 
 
 def _emoji_only(value):
@@ -423,6 +441,33 @@ def _top_fragment(pixels, span, region, unit, thresholds):
     return contrast >= 8 and fill >= .44
 
 
+def _large_top_fragment(pixels, region, unit, thresholds):
+    crop = region.crop(pixels)
+    seam = max(2, round(4 * unit))
+    if crop.shape[0] <= seam * 4:
+        return ()
+    near_edge = crop[seam:seam * 2:2, ::4]
+    colors, counts = np.unique(near_edge.reshape(-1, 3), axis=0, return_counts=True)
+    hits = []
+    for index in np.argsort(counts)[-4:]:
+        if counts[index] < near_edge.shape[0] * near_edge.shape[1] * .14:
+            continue
+        fill = colors[index].astype(np.float32)
+        mask = cv2.inRange(crop, tuple(map(float, fill - 5)), tuple(map(float, fill + 5)))
+        for box in contours(mask):
+            area = box.offset(region.left, region.top)
+            if (box.top > seam or box.height < max(45 * unit, region.height * .10)
+                    or box.bottom >= region.height - seam
+                    or not region.width * .22 <= box.width <= region.width * .91
+                    or not _in_message_lane(area, region, thresholds)
+                    or np.count_nonzero(box.crop(mask)) < box.width * box.height * .65):
+                continue
+            if sum(np.max(np.abs(color - fill)) >= 10
+                   for color in _bubble_surround(pixels, area, region, unit)) >= 2:
+                hits.append(area)
+    return tuple(dict.fromkeys(hits))
+
+
 def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Container, ...],
                      spans: tuple[TextSpan, ...], unit: float,
                      calibration: Mapping[str, NormalizedRect],
@@ -433,10 +478,15 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                  and is_time_label(span.text)}
     centered_system = {span for span in spans if span.score >= thresholds.text_score
                        and abs(span.box.center[0] - center) <= region.width * .12 and _SYSTEM.search(span.text)}
-    watermarks, masks = set(), ()
+    watermarks, masks, reviews = set(), (), {}
+    clipped_top = _large_top_fragment(pixels, region, unit, thresholds) if page_verified and spans else ()
+    clipped_spans = {span for span in spans if any(
+        area.left <= span.box.left and span.box.right <= area.right
+        and span.box.top >= region.top and span.box.bottom <= area.bottom for area in clipped_top)}
+    containers = tuple(item for item in containers if not any(_overlaps(item.box, area) for area in clipped_top))
     if page_verified and spans:
-        containers, watermarks, masks = _recover_bubbles(pixels, region, containers, spans,
-                                                        time_like | centered_system, unit, thresholds, capture_masks)
+        containers, watermarks, masks, reviews = _recover_bubbles(pixels, region, containers, spans,
+                                                        time_like | centered_system | clipped_spans, unit, thresholds, capture_masks)
     attachment_spans = tuple(span for span in spans if span not in time_like)
     preliminary = _file_candidates(containers, attachment_spans, unit, thresholds.text_score) if page_verified else {}
     # Strong outer bounds own inner icon contours. Competing card-sized boxes
@@ -471,6 +521,10 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             if _SYSTEM.search(span.text):
                 dispositions.append(OcrDisposition(span, "SYSTEM", None, nearest, "居中系统提示"))
                 continue
+        if span in clipped_spans:
+            dispositions.append(OcrDisposition(span, "TOP_VIEWPORT_CLIPPED", None, nearest,
+                                               "正文落在与顶部视口相交的连续填充内", False))
+            continue
         if span in watermarks and not side_supported:
             dispositions.append(OcrDisposition(span, "WATERMARK", None, nearest, "浅色稀疏笔画且缺少气泡填充"))
             continue
@@ -592,7 +646,13 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                 reason = ("容器触及视口，正文可能截断" if item.clipped else
                           "OCR 置信度不足或容器类型未确认")
                 dispositions[pos] = OcrDisposition(span, "UNASSIGNED", None, index, reason, True)
-    return MessageAnalysis(tuple(results), tuple(dispositions), anchors, containers, masks, tuple(diagnostics))
+    for area in clipped_top:
+        containers += (Container(area, True, "C2 顶部连续填充与侧缘"),)
+        diagnostics.append({"width": area.width, "height": area.height, "classification": "TOP_VIEWPORT_CLIPPED",
+                            "reason": "TOP_CONTINUOUS_FILL_AND_SIDE_EDGES"})
+    return MessageAnalysis(tuple(results), tuple(replace(item, reverse_evidence=reviews[item.span])
+                           if item.span in reviews else item for item in dispositions),
+                           anchors, containers, masks, tuple(diagnostics))
 
 
 def classify_messages(pixels: np.ndarray, region: Box, containers: tuple[Container, ...],

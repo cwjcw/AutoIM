@@ -75,6 +75,17 @@ class RuntimeTests(unittest.TestCase):
             self.runtime.export(target, "all", "selected", {})
         self.assertTrue(target.is_file())
 
+    def test_startup_only_zip_explicitly_reports_no_detection(self):
+        self.runtime.emit("test", "", "WINDOW", "APPLICATION_STARTED", "AUTO_PASS")
+        target = self.root / "startup.zip"
+        summary = self.runtime.export(target, "session", "", {})
+        self.assertEqual((summary["includes_detection"], summary["detection_count"],
+                          summary["latest_detection_at"], summary["visual_evidence_count"]),
+                         (False, 0, None, 0))
+        self.assertGreaterEqual(summary["event_count"], 1)
+        with zipfile.ZipFile(target) as bundle:
+            self.assertEqual(json.loads(bundle.read("diagnostic.json"))["export"], summary)
+
     def test_rotation_retention_and_restart(self):
         runtime = CollectionRuntime(self.root / "rotating", max_bytes=900, backups=20, revision="synthetic")
         self.addCleanup(runtime.close)

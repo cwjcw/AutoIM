@@ -196,28 +196,28 @@ def _badge(pixels: np.ndarray, avatar: Box, row: Box, unit: float,
 
 
 def recover_b2_start(layout, pixels, unit, thresholds, *, read_text=None):
-    """Recover a complete first row hidden by an automatic B1 seam."""
+    """Review a legacy boundary when the toolbar could not confirm it."""
     b1, b2, c1 = (layout.get(part) for part in ("B1", "B2", "C1"))
-    if (not b1 or not b2 or not c1 or b2.top <= c1.bottom + 20 * unit
+    if ((layout.toolbar and layout.toolbar.bottom) or not b1 or not b2 or not c1 or b2.top <= c1.bottom + 20 * unit
             or any("人工" in part.evidence for part in layout.regions if part.name in ("B1", "B2"))):
         return layout
     search = Box(b2.left, c1.bottom, b2.right, b2.bottom)
     avatars = _avatars(pixels, search, unit)
     if len(avatars) < 3 or avatars[0].top >= b2.top or avatars[1].top < b2.top:
-        return layout
+        return replace(layout, b2_edge_review="旧边界的备选证据缺少跨分界的头像序列")
     first, second = avatars[:2]
     pitch = second.center[1] - first.center[1]
     subsequent = [b.center[1] - a.center[1] for a, b in zip(avatars[1:4], avatars[2:5])]
     if (pitch < first.height or pitch > first.height * 2.2
             or not any(abs(step - pitch) <= pitch * .20 for step in subsequent)):
-        return layout
+        return replace(layout, b2_edge_review="旧边界的备选头像间距不连续")
     start = round(first.center[1] - pitch / 2)
     if start < c1.bottom - round(5 * unit):
-        return layout
+        return replace(layout, b2_edge_review="旧边界估计的首行与相邻工具栏冲突")
     start = max(c1.bottom, start)
     early = Box(b2.left, start, b2.right, round((first.center[1] + second.center[1]) / 2))
     if early.bottom <= early.top or early.height < pitch * .85 or first.top <= early.top + 1:
-        return layout
+        return replace(layout, b2_edge_review="旧边界估计的首行尺寸或头像边缘不完整")
     reason = "首行头像、红色未读徽标与后续行距交叉确认"
     if not _badge(pixels, first, early, unit, thresholds):
         if start - c1.bottom <= .12 * pitch:
@@ -225,7 +225,7 @@ def recover_b2_start(layout, pixels, unit, thresholds, *, read_text=None):
             early = replace(early, top=start)
         dividers = divider_rows(pixels, search, unit)
         if not read_text or not any(abs(y - early.bottom) <= .12 * pitch for y in dividers):
-            return layout
+            return replace(layout, b2_edge_review="首行没有徽标，缺少末端分隔线或局部 OCR")
         spans = [span for span in read_text(pixels, early) if span.score >= thresholds.text_score
                  and early.contains(span.box.center) and span.box.top > early.top and span.box.bottom < early.bottom]
         split = early.left + early.width * .65
@@ -234,11 +234,11 @@ def recover_b2_start(layout, pixels, unit, thresholds, *, read_text=None):
         preview = any(first.right < span.box.left < split and span.box.center[1] >= first.center[1] for span in spans)
         time = any(span.box.left >= split and activity_text(span.text) for span in spans)
         if not (name and not parse_visual_name(" ".join(span.text for span in name)).issue and preview and time):
-            return layout
+            return replace(layout, b2_edge_review="首行局部 OCR 缺少一致的名称、预览和活动时间")
         reason = "首行头像、完整名称、预览、活动时间和连续分隔线交叉确认"
     height, width = pixels.shape[:2]
     adjusted = {"B1": replace(b1, bottom=start), "B2": replace(b2, top=start)}
-    return replace(layout, regions=tuple(
+    return replace(layout, b2_edge_review=f"异常边缘复核 {b2.top} → {start} · {reason}", regions=tuple(
         replace(item, box=adjusted[item.name], normalized=adjusted[item.name].relative(width, height),
                 evidence=reason)
         if item.name in adjusted else item for item in layout.regions))
@@ -429,8 +429,17 @@ def _contact_kind(name: str) -> str:
 def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                     unit: float, thresholds: VisualThresholds,
                     diagnostics: list[ContactTextDiagnostic] | None = None, *, multi_feature=False,
-                    badge_diagnostics=None, read_activity=None) -> tuple[ContactObservation, ...]:
+                    badge_diagnostics=None, badge_rejections=None, read_activity=None) -> tuple[ContactObservation, ...]:
+    badges = unread_badges(pixels, region, unit, thresholds.badge_red_delta,
+                          rejected=badge_rejections) if multi_feature else ()
     avatars = _avatars(pixels, region, unit)
+    avatar_art = tuple(item for item in badges if any(
+        avatar.left < item.box.left and item.box.right < avatar.right
+        and avatar.top < item.box.top and item.box.bottom < avatar.bottom for avatar in avatars))
+    if badge_rejections is not None:
+        badge_rejections.extend(replace(item, kind="NON_BADGE", reason="紧凑红区完全位于头像内")
+                                for item in avatar_art)
+    badges = tuple(item for item in badges if item not in avatar_art)
     highlight = _highlight_row(pixels, region, unit)
     positioned: list[tuple[int, Box | None, str]] = []
     for avatar in avatars:
@@ -450,7 +459,7 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
     normal_spacing = [int(value) for value in spacing if 33 * unit <= value <= 93 * unit]
     pitch = float(np.median(normal_spacing)) if normal_spacing else 62 * unit
     spans = reader.read(pixels, region)
-    lines, time_spans, badges = (), (), ()
+    lines, time_spans = (), ()
     time_offset = 0.
     if multi_feature:
         lines = divider_rows(pixels, region, unit)
@@ -469,13 +478,13 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                 center = (span_bounds[0] + span_bounds[1]) // 2
             if all(abs(center - y) >= .56 * pitch for y, _, _ in positioned):
                 positioned.append((center, None, "B2 右侧时间锚点"))
-        badges = unread_badges(pixels, region, unit, thresholds.badge_red_delta, avatars)
         if badge_diagnostics is not None:
             badge_diagnostics.extend(badges)
         for badge_candidate in badges:
             center = round(badge_candidate.box.center[1] + pitch * .32)
             bracket = structural_span(center, region, pitch, lines, highlight)
-            if not bracket or any(abs(center - y) < .56 * pitch for y, _, _ in positioned):
+            if (badge_candidate.edge or not bracket
+                    or any(abs(center - y) < .56 * pitch for y, _, _ in positioned)):
                 continue
             center = (bracket[0] + bracket[1]) // 2
             if bracket[0] <= badge_candidate.box.top < bracket[0] + pitch * .43:
@@ -510,6 +519,8 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
             else:
                 selected, method = None, "CONFLICTING_HIGHLIGHT"
     results = []
+    badge_lane = float(np.median([avatar.right for avatar in avatars])) if avatars else None
+    review_budget = 2
     used = set()
     for i, (row, (y, avatar, source)) in enumerate(zip(rows, positioned)):
         text_left = (min(avatar.right + max(2, round(3 * unit)), row.left + round(row.width * .26))
@@ -541,11 +552,25 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
         badge_kind = ""
         if multi_feature:
             positioned_badges = [item for item in badges if row.contains(item.box.center)
-                                 and (badge and badge.contains(item.box.center)
-                                      or sources[i] != "NEIGHBOR_PITCH" and (avatar or time_anchor or "徽标反向" in source)
-                                      and item.box.top <= row.top + row.height * .38)]
+                                 and not item.edge and item.box.top <= row.top + row.height * .38
+                                 and (badge and badge.contains(item.box.center) or
+                                      avatar and abs(item.box.center[0] - avatar.right) <= avatar.width * .19
+                                      and abs(item.box.center[1] - avatar.top) <= avatar.height * .24
+                                      and (item.box.right > avatar.right or item.box.top < avatar.top)
+                                      or not avatar and sources[i] != "NEIGHBOR_PITCH" and time_anchor
+                                      and badge_lane is not None
+                                      and abs(item.box.center[0] - badge_lane) <= 8 * unit
+                                      or not avatar and sources[i] == "GRAY_DIVIDERS" and "徽标反向" in source
+                                      and item.kind == "NORMAL_NUMBER")]
+            badge = None
             if len(positioned_badges) == 1:
                 badge, badge_kind = positioned_badges[0].box, positioned_badges[0].kind
+                if not picked and review_budget:
+                    review_budget -= 1
+                    local = Box(text_left, row.top, right_column, min(row.bottom, y))
+                    if local.width > 0 and local.height > 0:
+                        picked, rejected = name_line(tuple(item for item in reader.read(pixels, local)
+                            if local.contains(item.box.center) and item.score >= thresholds.text_score))
         count, reliable = _badge_number(pixels, badge, reader, thresholds) if badge else (None, False)
         mute_reason, mute_score = "", None
         if multi_feature:

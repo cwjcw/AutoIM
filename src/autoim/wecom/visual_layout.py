@@ -90,17 +90,39 @@ class UiRegion:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchToolbar:
+    area: Box
+    search: Box | None = None
+    add: Box | None = None
+    icon: Box | None = None
+    bottom: int | None = None
+    reason: str = ""
+    rejected: tuple[Box, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class LayoutObservation:
     regions: tuple[UiRegion, ...]
     status: str
     reason: str = ""
     failures: tuple[tuple[str, str], ...] = ()
+    toolbar: SearchToolbar | None = None
+    b2_edge_review: str = ""
 
     def region(self, name: str) -> Box:
         return next(region.box for region in self.regions if region.name == name)
 
     def get(self, name: str) -> Box | None:
         return next((region.box for region in self.regions if region.name == name), None)
+
+    def b2_boundary_uncertain(self, unit: float) -> bool:
+        b2, title = self.get("B2"), self.get("C1")
+        if b2 is None:
+            return True
+        note = next(part.evidence for part in self.regions if part.name == "B2")
+        if "人工" in note or note.startswith("首行") or self.toolbar and self.toolbar.bottom == b2.top:
+            return False
+        return bool(self.toolbar and self.toolbar.search or title and b2.top - title.bottom > 20 * unit)
 
 
 LEAF_REGIONS = {"A": "A 功能区", "B1": "B1 搜索工具栏", "B2": "B2 联系人列表",
@@ -136,12 +158,88 @@ def _find_seam(pixels: np.ndarray, start: float, end: float, vertical: bool,
     return first + int(np.median(contenders)), f"持续边缘覆盖 {strongest:.0%}"
 
 
+def _search_toolbar(pixels: np.ndarray, column: Box, title: int | None, unit: float) -> SearchToolbar:
+    # Search the upper B column before proposing B1. A contact divider can
+    # run across B but cannot supply a rounded horizontal control or glyph.
+    area = Box(column.left, column.top, column.right, min(column.bottom, column.top + round(140 * unit)))
+    tile = area.crop(pixels)
+    if tile.size == 0:
+        return SearchToolbar(area, reason="搜索区域为空")
+    edge = max(2, round(5 * unit))
+    background = np.median(tile[:, edge:edge*2], axis=1).astype(np.int16)
+    delta = tile.astype(np.int16) - background[:, None, :]
+    shade = np.max(np.abs(delta), axis=2)
+    neutral = (shade >= 4) & (shade <= 52) & (np.ptp(delta, axis=2) <= 16)
+    close = max(2, round(3 * unit))
+    filled = cv2.morphologyEx(neutral.astype(np.uint8), cv2.MORPH_CLOSE,
+                              np.ones((close, close), np.uint8))
+    candidates = []
+    rejected = []
+    for box in contours(filled):
+        if not (box.left < area.width * .24 and box.right < area.width - edge
+                and box.top >= round(4 * unit) and box.bottom < area.height
+                and 19 * unit <= box.height <= 52 * unit
+                and box.width >= area.width * .44 and box.width >= box.height * 3.1):
+            continue
+        shape = box.crop(filled)
+        h, w = shape.shape
+        corner = max(2, round(3 * unit))
+        if shape.mean() < .78 or (shape[:corner, :corner].mean() >= .91
+                                  and shape[:corner, -corner:].mean() >= .91):
+            rejected.append(box.offset(area.left, area.top))
+            continue
+        gray = cv2.cvtColor(box.crop(tile), cv2.COLOR_BGR2GRAY)
+        fill = float(np.median(gray[:, w//2:]))
+        ink = (gray.astype(np.int16) <= fill - 24)
+        icons = [item.offset(box.left + area.left, box.top + area.top) for item in contours(ink[:, :round(29 * unit)])
+                 if 4 * unit <= item.width <= 16 * unit and 4 * unit <= item.height <= 17 * unit
+                 and item.left >= round(4 * unit) and .20 * h <= item.center[1] <= .80 * h]
+        search = box.offset(area.left, area.top)
+        if len(icons) != 1:
+            rejected.append(search)
+            continue
+        candidates.append((search, icons[0]))
+    if len(candidates) != 1:
+        return SearchToolbar(area, reason="搜索框形状与放大镜无唯一候选",
+                             rejected=tuple(rejected + [box for box, _ in candidates]))
+    search, icon = candidates[0]
+    strip = Box(search.right, search.top, area.right - edge, search.bottom)
+    gray = cv2.cvtColor(strip.crop(pixels), cv2.COLOR_BGR2GRAY)
+    add = None
+    if gray.size:
+        ink = gray.astype(np.int16) <= np.median(gray) - 27
+        for mark in contours(ink):
+            if (5 * unit <= mark.height <= 18 * unit and .7 <= mark.width / mark.height <= 1.45
+                    and abs(mark.center[1] + strip.top - search.center[1]) <= .25 * search.height):
+                cross = mark.crop(ink)
+                mid_y, mid_x = mark.height // 2, mark.width // 2
+                if (cross[max(0, mid_y-1):mid_y+2].any(axis=0).mean() >= .75
+                        and cross[:, max(0, mid_x-1):mid_x+2].any(axis=1).mean() >= .75):
+                    add = mark.offset(strip.left, strip.top)
+                    break
+    low, high = search.bottom + round(3 * unit), search.bottom + round(.95 * search.height)
+    if title is not None and low <= title <= high:
+        return SearchToolbar(area, search, add, icon, title, "搜索框、放大镜与相邻 C1 工具栏下沿", tuple(rejected))
+    # A separator is corroboration only inside the space immediately after
+    # the control, never a substitute for the search control itself.
+    band_bottom = min(high + 1, area.bottom)
+    if add and low + 2 < band_bottom:
+        band = Box(area.left, low, area.right, band_bottom)
+        seam, _ = _find_seam(band.crop(pixels), .04, .96, False, VisualThresholds(seam_delta=5))
+        if seam is not None:
+            return SearchToolbar(area, search, add, icon, low + seam,
+                                 "搜索框、放大镜、加号及紧邻工具栏下沿", tuple(rejected))
+    return SearchToolbar(area, search, add, icon, reason="搜索控件已识别，工具栏下沿缺少交叉证据",
+                         rejected=tuple(rejected))
+
+
 def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
-                  known: Mapping[str, Box]) -> tuple[dict[str, Box], dict[str, str], dict[str, str]]:
+                  known: Mapping[str, Box], unit: float):
     height, width = pixels.shape[:2]
     regions: dict[str, Box] = {}
     evidence: dict[str, str] = {}
     failures: dict[str, str] = {}
+    toolbar = None
     a, a_note = _find_seam(pixels, .025, .24, True, thresholds)
     if "A" in known:
         a, a_note = known["A"].right, "A 人工边界"
@@ -163,11 +261,14 @@ def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
     if a is not None and b is not None and b - a >= width * .07:
         regions["B"] = Box(a, 0, b, height)
         evidence["B"] = f"{a_note} / {b_note}"
+        toolbar = _search_toolbar(pixels, regions["B"], title, unit)
         y, note = _find_seam(regions["B"].crop(pixels), .025, .19, False, thresholds)
         if "B1" in known:
             y, note = known["B1"].bottom, "沿用 B1 人工下边界"
         elif "B2" in known:
             y, note = known["B2"].top, "沿用 B2 人工上边界"
+        elif toolbar.bottom is not None:
+            y, note = toolbar.bottom, toolbar.reason
         elif y is None and title is not None:
             expected = title / height
             y, adjacent = _find_seam(regions["B"].crop(pixels), max(.025, expected - .018),
@@ -183,7 +284,7 @@ def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
         failures["B"] = f"联系人列缺少横向分界 · {a_note} / {b_note}"
     if b is None or (a is not None and b <= a):
         failures["C"] = f"B/C 垂直分界不明确 · {b_note}"
-        return regions, evidence, failures
+        return regions, evidence, failures, toolbar
     # An expanded side panel has its own persistent vertical boundary and
     # does not continue the composer seam across that boundary.
     d, d_note = _find_seam(pixels, max(.65, b / width + .24), .92, True, thresholds)
@@ -220,7 +321,7 @@ def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
         evidence["C2"] = f"{title_note} / {top_note}"
     else:
         failures["C2"] = "历史区缺少可隔离标题和草稿的上下边界"
-    return regions, evidence, failures
+    return regions, evidence, failures, toolbar
 
 
 def _calibrated_regions(calibration: Mapping[str, NormalizedRect], width: int,
@@ -246,7 +347,7 @@ def _calibrated_regions(calibration: Mapping[str, NormalizedRect], width: int,
 
 
 def detect_layout(pixels: np.ndarray, calibration: Mapping[str, NormalizedRect],
-                  thresholds: VisualThresholds) -> LayoutObservation:
+                  thresholds: VisualThresholds, unit: float | None = None) -> LayoutObservation:
     height, width = pixels.shape[:2]
     manual = {}
     rejected = {}
@@ -281,7 +382,7 @@ def detect_layout(pixels: np.ndarray, calibration: Mapping[str, NormalizedRect],
                 or (name.startswith("B") and b_right > c_left)):
             manual.pop(name)
             rejected[name] = "人工区域与相邻主列重叠"
-    regions, evidence, failures = _auto_regions(pixels, thresholds, manual)
+    regions, evidence, failures, toolbar = _auto_regions(pixels, thresholds, manual, unit or max(.65, height / 820))
     for name in rejected:
         regions.pop(name, None)
     regions.update(manual)
@@ -318,7 +419,7 @@ def detect_layout(pixels: np.ndarray, calibration: Mapping[str, NormalizedRect],
     missing = tuple((name, rejected.get(name, failures.get(name, "缺少可验证的父区域边界")))
                     for name in REGION_NAMES if name not in regions)
     return LayoutObservation(observations, "LAYOUT_UNCERTAIN" if missing else "CANDIDATE",
-                             "未确认区域可单独标定。" if missing else "", missing)
+                             "未确认区域可单独标定。" if missing else "", missing, toolbar)
 
 
 def contours(mask: np.ndarray) -> list[Box]:

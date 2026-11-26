@@ -658,6 +658,14 @@ class VisualCollectionPanel(QWidget):
         choice, accepted = QInputDialog.getItem(self, "导出诊断 ZIP", "日志范围", list(scopes), 0, False)
         if not accepted:
             return
+        scope = scopes[choice]
+        if scope == "detection" and not self._last_detection:
+            fallback = QMessageBox.question(self, "本次检测暂无记录", "尚未开始检测。是否改为导出本次应用启动诊断？",
+                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                            QMessageBox.StandardButton.No)
+            if fallback != QMessageBox.StandardButton.Yes:
+                return
+            scope = "session"
         modes = ["普通诊断（脱敏）", "包含完整视觉证据（可能含真实联系人和聊天内容）"]
         export_mode, accepted = QInputDialog.getItem(self, "导出诊断 ZIP", "导出内容", modes, 0, False)
         if not accepted:
@@ -682,9 +690,11 @@ class VisualCollectionPanel(QWidget):
                                 "messages": len(core.messages), "failures": core.failures,
                                 "blockers": core.blockers, "hover_failures": core.hover_failures,
                                 "partial": core.partial, "read_unfinished": core.read_unfinished}
-        self.run_worker(lambda: self.runtime.export(Path(filename), scopes[choice], detection, snapshot,
+        self.run_worker(lambda: self.runtime.export(Path(filename), scope, detection, snapshot,
                                                     full_visual=export_mode == modes[1]),
-                        on_result=lambda _: self.hotkey_status.setText("诊断 ZIP 已导出"),
+                        on_result=lambda summary: self.hotkey_status.setText(
+                            f"诊断 ZIP 已导出 · 检测 {summary['detection_count']} 次 · "
+                            f"事件 {summary['event_count']} 条 · 视觉证据 {summary['visual_evidence_count']} 份"),
                         on_error=lambda error: self.hotkey_status.setText(
                             error.split(": ", 1)[-1] if error.startswith("EvidenceExportError:")
                             else "导出失败，请检查目标路径和本地证据"))

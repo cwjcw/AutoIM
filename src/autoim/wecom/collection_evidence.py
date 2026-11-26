@@ -18,7 +18,7 @@ from autoim.wecom.visual_store import name_key
 
 KINDS = {"b2", "before", "after", "c2", "database", "failure", "capture_failure", "hover"}
 PRIVATE_RASTERS = ("c2-mask-foreground", "c2-mask-morphology")
-REGIONS = {"b2", "b2-edge", "c1", "c2", "capture", "hover-before", "hover-after", *PRIVATE_RASTERS}
+REGIONS = {"b1", "b2", "b2-edge", "c1", "c2", "capture", "hover-before", "hover-after", *PRIVATE_RASTERS}
 
 
 class EvidenceExportError(OSError):
@@ -98,13 +98,30 @@ def contact_scan(raw, targets, scan, blocked):
         if activity:
             boxes.append((rect(activity.box), f"R{row.sequence} TIME"))
         boxes.extend(([row.box.left, y, row.box.right, y + 1], "DIVIDER") for y in row.divider_y)
-    unassigned = [{"box": rect(badge.box), "kind": badge.kind} for badge in raw.b2_badges
+    unassigned = [{"box": rect(badge.box), "kind": badge.kind, "edge": badge.edge,
+                   "reason": "视口边缘徽标" if badge.edge else "没有通过几何核验的唯一联系人行"} for badge in raw.b2_badges
                   if not any(row.badge and row.badge.contains(badge.box.center) for row in raw.contacts)]
     boxes.extend((item["box"], "UNASSIGNED BADGE") for item in unassigned)
     unread = raw.global_unread
+    toolbar = raw.layout.toolbar
+    layout = {"column": rect(raw.layout.get("B")), "b1": rect(raw.layout.get("B1")), "b2": rect(raw.layout.get("B2")),
+              "first_row": rows[0]["box"] if rows else None, "last_row": rows[-1]["box"] if rows else None,
+              "boundary_uncertain": raw.layout.b2_boundary_uncertain(raw.frame.visual_unit),
+              "boundary_evidence": next((region.evidence for region in raw.layout.regions if region.name == "B2"), ""),
+              "search_area": rect(toolbar.area) if toolbar else None, "search": rect(toolbar.search) if toolbar else None,
+              "search_icon": rect(toolbar.icon) if toolbar else None, "add": rect(toolbar.add) if toolbar else None,
+              "search_text_ocr": "SKIPPED_PIXEL_ANCHORS",
+              "toolbar_evidence": toolbar.reason if toolbar else "",
+              "edge_review": raw.layout.b2_edge_review,
+              "rejected_controls": [rect(item) for item in toolbar.rejected] if toolbar else []}
     return {"scan": scan, "rows": rows, "unassigned_badges": unassigned,
+            "layout": layout,
+            "rejected_badges": [{"box": rect(item.box), "reason": item.reason} for item in raw.b2_badge_rejections],
             "statistics": {"global_unread": unread.global_unread_count if unread.global_unread_count_reliable else None,
                            "contacts": len(rows), "b2_badges": sum(r["badge"] is not None for r in rows) + len(unassigned),
+                           "independent_badges": len(raw.b2_badges),
+                           "edge_badges": sum(item.edge for item in raw.b2_badges),
+                           "rejected_badges": len(raw.b2_badge_rejections),
                            "ordinary_unread_rows": sum(r["badge"] is not None and r["muted"] is False
                                                        and r["kind"] in ("CONTACT", "GROUP_CANDIDATE") for r in rows),
                            "ordinary_unread_messages_confirmed": sum(r["unread_count"] or 0 for r in rows
@@ -142,6 +159,7 @@ def message_evidence(raw, messages, *, body=True):
     boxes.extend((rect(item.span.box), item.kind) for item in raw.message_ocr)
     ocr = [{**span_info(item.span), "kind": item.kind, "container": item.container_number,
             "nearest": item.nearest_container, "reason": item.reason,
+            "reverse_evidence": item.reverse_evidence,
             "possible_message": item.possible_message} for item in raw.message_ocr]
     containers = [{ "box": rect(item.container.box), "direction": item.direction,
                     "clipped": item.container.clipped, "reason": item.reason,
@@ -483,3 +501,4 @@ def write_evidence(archive, store, events, report, *, full):
         archive.writestr(name, data)
     archive.writestr("evidence-manifest.json", _dump({"mode": "FULL_PRIVATE" if full else "REDACTED",
                      "documents": {file: sha256(data).hexdigest() for file, data in docs.items()}, "evidence": manifest}))
+    return sum(item["status"] == "AVAILABLE" for item in manifest)

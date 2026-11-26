@@ -135,6 +135,7 @@ class VisualObservation:
     login: LoginEvidence = LoginEvidence()
     verified_target: ContactObservation | None = None
     c2_masks: tuple = ()
+    b2_badge_rejections: tuple = ()
 
 
 def _group_senders(messages: tuple[VisibleMessageObservation, ...], dispositions: tuple[OcrDisposition, ...],
@@ -356,10 +357,12 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                   contacts_only=False, message_gate=None, history_only=False, multi_feature=False) -> VisualObservation:
     started = perf_counter()
     pixels = frame.pixels
-    layout = detect_layout(pixels, calibration, thresholds)
     unit = frame.visual_unit
+    layout = detect_layout(pixels, calibration, thresholds, unit)
     a, b1, b2, c1, c2, c3 = (layout.get(name) for name in ("A", "B1", "B2", "C1", "C2", "C3"))
-    search, add = _toolbar_controls(pixels, b1) if b1 else (None, None)
+    legacy_search, legacy_add = _toolbar_controls(pixels, b1) if b1 else (None, None)
+    search = (layout.toolbar.search if layout.toolbar else None) or legacy_search
+    add = (layout.toolbar.add if layout.toolbar else None) or legacy_add
     hover = next((item.name for item in layout.regions if item.name not in ("B", "C")
                   and frame.mouse and item.box.contains(frame.mouse)), "")
     warnings = [layout.reason] if layout.reason else []
@@ -372,11 +375,12 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
             ocr_status, ocr_reason = "FAILED", str(exc)
             warnings.append(ocr_reason)
     trace = _ObservedReader(reader)
-    if (multi_feature or message_gate is not None) and not history_only:
+    if (multi_feature or message_gate is not None) and not history_only and not (layout.toolbar and layout.toolbar.bottom):
         layout = recover_b2_start(layout, pixels, unit, thresholds,
                                   read_text=lambda image, area: trace.read_region("B2 边界核对", image, area))
         b1, b2 = layout.get("B1"), layout.get("B2")
-        search, add = _toolbar_controls(pixels, b1) if b1 else (None, None)
+        if not search and b1:
+            search, add = _toolbar_controls(pixels, b1)
     title_spans = ()
     if c1 and not contacts_only:
         trace.region = "C1 标题"
@@ -386,15 +390,17 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     unread = detect_global_unread(pixels, a, trace, thresholds) if a else GlobalUnreadObservation()
     trace.region = "B2 联系人"
     contact_diagnostics: list[ContactTextDiagnostic] = []
-    b2_badges = []
+    b2_badges, b2_badge_rejections = [], []
     contacts = detect_contacts(pixels, b2, trace, unit, thresholds, contact_diagnostics,
                                multi_feature=multi_feature, badge_diagnostics=b2_badges,
+                               badge_rejections=b2_badge_rejections,
                                read_activity=lambda pixels, box: trace.read_region("B2 活动时间", pixels, box)
                                ) if b2 and not history_only else ()
     if contacts_only:
         page = "MESSAGES_CANDIDATE" if b2 and (unread.entry or (search and add and contacts)) else "UNKNOWN"
         return VisualObservation(frame, layout, "CONTACTS_ONLY", page=page, contacts=contacts,
-                                 search_box=search, add_button=add, global_unread=unread,
+                                 search_box=search, add_button=add, global_unread=unread, b2_badges=tuple(b2_badges),
+                                 b2_badge_rejections=tuple(b2_badge_rejections),
                                  ocr_areas=tuple(trace.observations), ocr_status=ocr_status,
                                  recognition_ms=(perf_counter() - started) * 1000)
     contacts, selection_issue = _corroborate_selection(title_spans, contacts, thresholds, frame.mouse, multi_feature=multi_feature)
@@ -427,6 +433,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
         header = VisualObservation(frame, layout, "HEADER_ONLY",
                                    page="MESSAGES_CANDIDATE" if corroborated or list_verified else "UNKNOWN",
                                    contacts=contacts, conversation=conversation, composer=composer, b2_badges=tuple(b2_badges),
+                                   b2_badge_rejections=tuple(b2_badge_rejections),
                                    search_box=search, add_button=add, global_unread=unread,
                                    ocr_areas=tuple(trace.observations), ocr_status=ocr_status,
                                    recognition_ms=(perf_counter() - started) * 1000)
@@ -457,7 +464,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
         for container, candidate in zip(analysis.containers, analysis.candidate_evidence, strict=True):
             _, left, right = direction_evidence(container.box, c2, anchors, thresholds)
             item = by_box.get(container.box)
-            reason = (candidate["reason"] if candidate["classification"] == "BACKGROUND_NOISE" else
+            reason = (candidate["reason"] if candidate["classification"] in ("BACKGROUND_NOISE", "TOP_VIEWPORT_CLIPPED") else
                       item.status if item else
                       "颜色轮廓近似头像，缺少可归属 OCR 证据" if container.needs_text else
                       "未通过消息分类或页面校验")
@@ -491,6 +498,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     return VisualObservation(
         frame, layout, status, page="MESSAGES_CANDIDATE" if corroborated else "UNKNOWN",
         contacts=contacts, conversation=replace(conversation, completeness=completeness), b2_badges=tuple(b2_badges),
+        b2_badge_rejections=tuple(b2_badge_rejections),
         messages=messages, context_text=context, search_box=search, add_button=add, composer=composer,
         list_scrollbar=detect_scroll_thumb(pixels, b2, unit) if b2 else None,
         history_scrollbar=detect_scroll_thumb(pixels, c2, unit) if c2 else None,

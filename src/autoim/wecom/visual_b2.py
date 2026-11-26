@@ -35,32 +35,36 @@ def activity_text(value):
 class B2Badge:
     box: Box
     kind: str
+    edge: bool = False
+    reason: str = ""
 
 
-def unread_badges(pixels, region, unit, red_delta, avatars=()):
-    lane = Box(region.left + round(region.width * .07), region.top,
-               region.left + round(region.width * .30), region.bottom)
-    tile = lane.crop(pixels).astype(np.int16)
+def unread_badges(pixels, region, unit, red_delta, avatars=(), *, rejected=None):
+    tile = region.crop(pixels).astype(np.int16)
     b, g, r = tile.transpose(2, 0, 1)
     mask = ((r >= 203) & (r - np.maximum(b, g) >= max(60, red_delta))
             & (b >= 32) & (g >= 35) & (np.abs(b - g) <= 32))
-    badge_x = float(np.median([avatar.right for avatar in avatars])) if avatars else None
-    x_margin = max(6 * unit, float(np.median([avatar.width for avatar in avatars])) * .13) if avatars else 0
+    badge_x = np.median([avatar.right for avatar in avatars]) if avatars else None
+    x_margin = max(6 * unit, np.median([avatar.width for avatar in avatars]) * .13) if avatars else 0
     results = []
     for item in contours(mask):
         if (not 5 * unit <= item.height <= 24 * unit or not .70 <= item.width / item.height <= 2.6
                 or not .49 <= float(item.crop(mask).mean())
-                or item.left == 0 or item.right == lane.width):
+                or item.left == 0 or item.right == region.width):
             continue
-        area = item.offset(lane.left, lane.top)
-        if badge_x is not None and abs(area.center[0] - badge_x) > x_margin:
+        area = item.offset(region.left, region.top)
+        if (not region.width * .07 <= item.center[0] <= region.width * .30
+                or badge_x is not None and abs(area.center[0] - badge_x) > x_margin):
+            if rejected is not None and len(rejected) < 32:
+                rejected.append(B2Badge(area, "NON_BADGE", reason="紧凑红区位于徽标列之外"))
             continue
         margin = max(1, item.height // 5)
         close = area.crop(pixels)[margin:-margin, margin:-margin]
         white = close.size and float(np.mean(np.min(close, axis=2) >= 220)) >= .035
         kind = "NORMAL_NUMBER" if item.height >= 15 * unit and white else (
             "SMALL_RED" if item.height <= 13.5 * unit else "UNKNOWN_RED")
-        results.append(B2Badge(area, kind))
+        edge = area.top - region.top <= 2 * unit or region.bottom - area.bottom <= 2 * unit
+        results.append(B2Badge(area, kind, edge))
     return tuple(sorted(results, key=lambda item: item.box.top))
 
 

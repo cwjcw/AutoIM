@@ -453,6 +453,19 @@ class CoreFlowTests(unittest.TestCase):
         self.assertFalse(self.formal.path.exists())
         self.assertFalse(self.isolated.path.exists())
 
+    def test_unassigned_badge_requests_one_recheck_without_clicking(self):
+        from autoim.wecom.visual_b2 import B2Badge
+
+        self.start()
+        raw = sample()
+        badge = B2Badge(Box(raw.contacts[0].box.left + 12, raw.contacts[0].box.top + 2,
+                            raw.contacts[0].box.left + 25, raw.contacts[0].box.top + 15), "NORMAL_NUMBER")
+        second = self.poll(replace(raw, b2_badges=(badge,)), count=2)
+        self.assertEqual((second.scan_disposition, second.unowned_unread_count), ("B2_SCANNED_UNRELIABLE", 1))
+        self.assertIn("B2 覆盖", second.reason)
+        self.assertEqual(sum(event["code"] == "B2_COVERAGE_RECHECK" for event in self.events()), 1)
+        self.navigator.select.assert_not_called()
+
     def test_muted_unknown_has_two_samples_then_independent_c2(self):
         self.start()
         raw = sample(unread={1: (1, False)})

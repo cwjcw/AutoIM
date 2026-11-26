@@ -689,7 +689,9 @@ class CollectionNavigation:
                 or not history.contains((box.left, box.top))
                 or not history.contains((box.right - 1, box.bottom - 1))):
             raise NavigationPaused("HOVER_MESSAGE_GEOMETRY_UNVERIFIED")
-        region = hover_region(mapping, history, box, point)
+        unit = frame.visual_unit
+        region = hover_region(mapping, history, box, point, unit)
+        bubble = mapping.image_rect_to_screen((box.left, box.top, box.right, box.bottom))
         l, t, r, b = region
         if not (r - l >= 80 and b - t >= 50):
             raise NavigationPaused("HOVER_CROP_TOO_SMALL")
@@ -751,13 +753,17 @@ class CollectionNavigation:
             return pixels
 
         move(neutral)
-        wait(.18)
+        wait(.24)
         before = capture()
         move(point)
+        reached = monotonic()
         raster = None
-        for delay in (.62, .52):
+        for delay in (.26, .34, .38, .34):
             wait(delay)
-            raster = HoverRaster(region, cursor, before, capture(), round((monotonic() - started) * 1000))
+            after = capture()
+            finished = monotonic()
+            raster = HoverRaster(region, cursor, before, after, round((finished - started) * 1000),
+                                 bubble, unit, item.direction, round((finished - reached) * 1000))
             if changed_pixels(raster) is not None:
                 break
         return raster
@@ -796,11 +802,12 @@ class CollectionNavigation:
             if observation.login.name and not observation.login.unchanged(fresh.pixels):
                 raise NavigationPaused("操作前 A1 登录账号区域已变化")
             thresholds = VisualThresholds()
-            automatic_layout = detect_layout(fresh.pixels, {}, thresholds)
-            if fresh_capture:
+            automatic_layout = detect_layout(fresh.pixels, {}, thresholds, fresh.visual_unit)
+            if fresh_capture and not (automatic_layout.toolbar and automatic_layout.toolbar.bottom):
                 automatic_layout = recover_b2_start(automatic_layout, fresh.pixels, fresh.visual_unit, thresholds)
             automatic_b2 = automatic_layout.get("B2")
-            if automatic_b2 is None or not automatic_b2.contains(point):
+            if (automatic_b2 is None or not automatic_b2.contains(point)
+                    or automatic_layout.b2_boundary_uncertain(fresh.visual_unit)):
                 raise NavigationPaused("自动分区无法独立确认该位置属于 B2")
             regions = (target,) if fresh_capture else tuple(observation.layout.get(name) for name in ("B1", "B2", "C1"))
             for region in regions:

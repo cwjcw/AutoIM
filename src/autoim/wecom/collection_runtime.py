@@ -436,7 +436,9 @@ class CollectionRuntime:
         try:
             with TemporaryFile() as readable, TemporaryFile() as structured:
                 selected = []
+                event_count = 0
                 for event in self.events(scope, detection):
+                    event_count += 1
                     if not full_visual and "config_path" in event["details"]:
                         event = {**event, "details": {**event["details"], "config_path": "本机 AutoIM 默认账号配置"}}
                     if event["detection"]:
@@ -455,8 +457,6 @@ class CollectionRuntime:
                                           "release": platform.release(), "python": platform.python_version(),
                                           "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision,
                                           "execution": self.execution, "export_git": exported}))
-                        archive.writestr("diagnostic.json", json.dumps({**snapshot, "execution": self.execution, "export_git": exported},
-                                                                    ensure_ascii=False, indent=2))
                         recorded = ({}, {}, {}, {})
                         for event in selected:
                             self._track(event, *recorded)
@@ -468,7 +468,15 @@ class CollectionRuntime:
                                   "git": event.get("git", "unknown"), "execution": event.get("execution")}
                             for run, event in versions.items()}
                         archive.writestr("flow-report.json", json.dumps(report, ensure_ascii=False, indent=2))
-                        write_evidence(archive, self.evidence, selected, report, full=full_visual)
+                        visual_count = write_evidence(archive, self.evidence, selected, report, full=full_visual)
+                        summary = {"scope": scope, "includes_detection": bool(versions),
+                                   "detection_count": len(versions),
+                                   "latest_detection_at": max((event["time"] for event in versions.values()), default=None),
+                                   "version": PC_VERSION, "event_count": event_count,
+                                   "visual_evidence_count": visual_count, "full_visual": full_visual}
+                        archive.writestr("diagnostic.json", json.dumps({**snapshot, "execution": self.execution,
+                                         "export_git": exported, "export": summary}, ensure_ascii=False, indent=2))
+                return summary
         except BaseException:
             if created:
                 path.unlink(missing_ok=True)
