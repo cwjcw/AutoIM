@@ -12,6 +12,8 @@ from time import perf_counter
 import numpy as np
 
 from autoim.vision import WindowCapture
+from autoim.windows_dpi import physical_coordinates
+from autoim.wecom.window_coordinates import CoordinateError, WindowCoordinates, build_coordinates, cursor_position
 from autoim.wecom.window_manager import WeComWindowInfo, WeComWindowManager, WindowResolutionError
 from autoim.wecom.window_state import WindowHealth, probe_window, window_diagnostic
 
@@ -21,6 +23,9 @@ class CaptureError(RuntimeError):
         super().__init__(f"{code} · {detail}")
         self.code = code
         self.diagnostics: CaptureDiagnostics | None = None
+        self.frame: VisualFrame | None = None
+        self.image: np.ndarray | None = None
+        self.probe_size: tuple[int, int] | None = None
 
     def __str__(self) -> str:
         message = super().__str__()
@@ -64,10 +69,15 @@ class VisualFrame:
     state: WindowState
     mouse: tuple[int, int] | None = None
     diagnostics: CaptureDiagnostics = CaptureDiagnostics()
+    coordinates: WindowCoordinates | None = None
 
     @property
     def pixels(self) -> np.ndarray:
         return self.capture.image
+
+    @property
+    def visual_unit(self):
+        return self.coordinates.visual_unit if self.coordinates else max(.65, min(self.state.dpi / 96, 3.0))
 
 
 def _client_mouse(hwnd: int) -> tuple[int, int] | None:
@@ -104,6 +114,12 @@ _MAX_CAPTURE_PIXELS = 20_000_000
 
 
 def _render_client(hwnd: int, width: int, height: int, *, flags=1) -> np.ndarray:
+    print_window = ctypes.windll.user32.PrintWindow
+    print_window.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    return _read_bitmap(width, height, lambda hdc: print_window(hwnd, hdc, flags))
+
+
+def _read_bitmap(width, height, draw):
     gdi = ctypes.windll.gdi32
     create_dib = gdi.CreateDIBSection
     create_dib.argtypes = [wintypes.HDC, ctypes.POINTER(_BitmapHeader), wintypes.UINT,
@@ -115,8 +131,6 @@ def _render_client(hwnd: int, width: int, height: int, *, flags=1) -> np.ndarray
     gdi.CreateCompatibleDC.restype = wintypes.HDC
     gdi.DeleteDC.argtypes = [wintypes.HDC]
     gdi.DeleteObject.argtypes = [wintypes.HANDLE]
-    print_window = ctypes.windll.user32.PrintWindow
-    print_window.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
     header = _BitmapHeader(ctypes.sizeof(_BitmapHeader), width, -height, 1, 32, 0)
     bits = ctypes.c_void_p()
     hdc = gdi.CreateCompatibleDC(None)
@@ -134,7 +148,7 @@ def _render_client(hwnd: int, width: int, height: int, *, flags=1) -> np.ndarray
         buffer = np.ctypeslib.as_array((ctypes.c_uint32 * (width * height)).from_address(bits.value))
         b, g, r = _UNPAINTED
         buffer.fill(b | g << 8 | r << 16)
-        if not print_window(hwnd, hdc, flags):
+        if not draw(hdc):
             raise CaptureError("CAPTURE_FAILED", "企业微信未返回客户区图像。")
         gdi.GdiFlush()
         data = ctypes.string_at(bits, width * height * 4)
@@ -145,6 +159,26 @@ def _render_client(hwnd: int, width: int, height: int, *, flags=1) -> np.ndarray
         if bitmap:
             gdi.DeleteObject(bitmap)
         gdi.DeleteDC(hdc)
+
+
+@physical_coordinates
+def capture_screen_region(region):
+    """Read the caller-verified local physical crop for a transient tooltip."""
+    from autoim.windows_dpi import win_api
+
+    left, top, right, bottom = region
+    width, height = right - left, bottom - top
+    if not 1 <= width <= 720 or not 1 <= height <= 450:
+        raise CaptureError("HOVER_CROP_INVALID", "悬停截图范围无效")
+    source = win_api("user32", "GetDC", (wintypes.HWND,), wintypes.HDC)(None)
+    if not source:
+        raise CaptureError("HOVER_CROP_UNAVAILABLE", "无法读取局部可见屏幕")
+    try:
+        draw = win_api("gdi32", "BitBlt", (wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                       ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD), wintypes.BOOL)
+        return _read_bitmap(width, height, lambda target: draw(target, 0, 0, width, height, source, left, top, 0x00CC0020))
+    finally:
+        win_api("user32", "ReleaseDC", (wintypes.HWND, wintypes.HDC), ctypes.c_int)(None, source)
 
 
 def _identity(info: WeComWindowInfo) -> tuple:
@@ -161,6 +195,7 @@ def _render_complete_client(hwnd: int, width: int, height: int, *, render=_rende
     """Find the client paint extent in a sentinel-filled DIB with a guard band."""
     limit = math.sqrt(_MAX_CAPTURE_PIXELS / (width * height))
     previous_size = None
+    last_pixels = None
     for scale in (1.20, 1.56, 2.03, 2.64, 3.44):
         scale = min(scale, limit)
         probe_width, probe_height = int(width * scale), int(height * scale)
@@ -168,7 +203,7 @@ def _render_complete_client(hwnd: int, width: int, height: int, *, render=_rende
         if size == previous_size or size[0] * size[1] > _MAX_CAPTURE_PIXELS:
             break
         previous_size = size
-        pixels = render(hwnd, *size)
+        pixels = last_pixels = render(hwnd, *size)
         painted = np.any(pixels != _UNPAINTED, axis=2)
         rows = np.flatnonzero(painted.any(axis=1))
         columns = np.flatnonzero(painted.any(axis=0))
@@ -178,13 +213,17 @@ def _render_complete_client(hwnd: int, width: int, height: int, *, render=_rende
         if probe_width - actual_width < 6 or probe_height - actual_height < 6:
             continue
         scale_x, scale_y = actual_width / width, actual_height / height
-        if (rows[0] > 4 or columns[0] > 4 or min(scale_x, scale_y) < .98
+        if (rows[0] != 0 or columns[0] != 0 or min(scale_x, scale_y) < .98
                 or abs(scale_x - scale_y) > .025 * max(scale_x, scale_y)):
-            raise CaptureError("CAPTURE_INCOMPLETE",
-                               f"缓冲区 {size} 仅绘制 {actual_width}×{actual_height}，与客户区 {width}×{height} 不一致。")
+            error = CaptureError("CAPTURE_INCOMPLETE",
+                                 f"缓冲区 {size} 仅绘制 {actual_width}×{actual_height}，与客户区 {width}×{height} 不一致。")
+            error.image, error.probe_size = pixels[:actual_height, :actual_width].copy(), size
+            raise error
         return RenderedClient(pixels[:actual_height, :actual_width].copy(), size)
-    raise CaptureError("CAPTURE_INCOMPLETE",
-                       f"探测缓冲区 {previous_size} 的右或下边缘仍被绘制，未确认画面边界。")
+    error = CaptureError("CAPTURE_INCOMPLETE",
+                         f"探测缓冲区 {previous_size} 的右或下边缘仍被绘制，未确认画面边界。")
+    error.image, error.probe_size = last_pixels, previous_size
+    raise error
 
 
 def _coverage(pixels: np.ndarray) -> tuple[str, str]:
@@ -197,7 +236,9 @@ def _coverage(pixels: np.ndarray) -> tuple[str, str]:
     height, width = sample.shape[:2]
     right = black[:, -max(3, width // 25):].mean()
     bottom = black[-max(3, height // 25):].mean()
-    core = black[:max(1, height * 3 // 4), :max(1, width * 3 // 4)].mean()
+    left = black[:, :max(3, width // 25)].mean()
+    top = black[:max(3, height // 25), :].mean()
+    core = black[height//8:max(1, height * 7 // 8), width//8:max(1, width * 7 // 8)].mean()
     untouched = sentinel.mean()
     summary = f"未绘制像素 {untouched:.2%} · 右缘近黑 {right:.2%} · 底缘近黑 {bottom:.2%}"
     if (untouched >= .01
@@ -206,16 +247,17 @@ def _coverage(pixels: np.ndarray) -> tuple[str, str]:
         return "CAPTURE_INCOMPLETE", summary
     if not np.any(np.ptp(sample[::4, ::4], axis=(0, 1)) > 5):
         return "CAPTURE_FAILED", f"截图缺少可用图像变化 · {summary}"
-    if max(right, bottom) > .98 and core < .50:
-        return "CAPTURE_INCOMPLETE", f"右侧或底部存在宽黑边 · {summary}"
+    if max(left, top, right, bottom) > .98 and core < .50:
+        return "CAPTURE_INCOMPLETE", f"窗口图像存在宽黑边 · {summary}"
     return "", summary
 
 
+@physical_coordinates
 def capture_visible_window(manager: WeComWindowManager | None = None, *,
                            inspect=None, render=_render_complete_client, probe=probe_window) -> VisualFrame:
     started = perf_counter()
     manager = manager or WeComWindowManager()
-    target = state = pixels = probe_size = health = None
+    target = state = pixels = probe_size = health = captured_at = None
 
     def details(coverage: str = "") -> CaptureDiagnostics:
         sample = health.last if health else None
@@ -231,6 +273,11 @@ def capture_visible_window(manager: WeComWindowManager | None = None, *,
     def failure(code: str, message: str, coverage: str = "") -> CaptureError:
         error = CaptureError(code, message)
         error.diagnostics = details(coverage)
+        if state and target and isinstance(pixels, np.ndarray) and pixels.ndim == 3:
+            h, w = pixels.shape[:2]
+            error.frame = VisualFrame(WindowCapture(target.pid, target.hwnd, target.title, target.class_name,
+                                                   target.rect, w, h, pixels, state.dpi / 96),
+                                      captured_at or datetime.now().astimezone(), state, diagnostics=error.diagnostics)
         return error
 
     if inspect is None:
@@ -252,8 +299,8 @@ def capture_visible_window(manager: WeComWindowManager | None = None, *,
             raise failure("WINDOW_CHANGED", "读取窗口状态时窗口已失效。") from exc
     if state.minimized:
         raise failure("WINDOW_MINIMIZED", "请手动恢复并最大化企业微信。")
-    if not state.maximized:
-        raise failure("NOT_MAXIMIZED", "请手动最大化企业微信后重试。")
+    if not state.maximized and (health is None or health.capture_blocker):
+        raise failure("NOT_MAXIMIZED", "窗口过小或无法核对客户区。")
     if target.rect is None or state.dpi < 1 or min(state.width, state.height) < 160:
         raise failure("WINDOW_CHANGED", "窗口矩形、客户区或 DPI 无效。")
     if state.width * state.height > _MAX_CAPTURE_PIXELS:
@@ -272,7 +319,7 @@ def capture_visible_window(manager: WeComWindowManager | None = None, *,
     try:
         if inspect is None:
             health = probe(manager)
-            if health.capture_blocker or health.identity != before.identity:
+            if health.capture_blocker or health.identity != before.identity or health.geometry_key != before.geometry_key:
                 raise ValueError("window state or process changed")
             current = health.window
             current_state = _capture_state(health)
@@ -282,13 +329,13 @@ def capture_visible_window(manager: WeComWindowManager | None = None, *,
         if (_identity(current) != _identity(target)
                 or (current_state.width, current_state.height, current_state.dpi)
                 != (state.width, state.height, state.dpi)
-                or current_state.minimized or not current_state.maximized):
+                or current_state.minimized or current_state.maximized != state.maximized):
             raise ValueError("window changed")
     except Exception as exc:
         raise failure("WINDOW_CHANGED", "截图期间窗口身份、大小、位置、DPI 或状态发生变化。") from exc
     if isinstance(render_error, CaptureError):
-        render_error.diagnostics = details()
-        raise render_error
+        pixels, probe_size = render_error.image, render_error.probe_size
+        raise failure(render_error.code, str(render_error)) from render_error
     if render_error is not None:
         raise failure("CAPTURE_FAILED", "Windows 未能渲染企业微信客户区。") from render_error
     if (not isinstance(pixels, np.ndarray) or pixels.ndim != 3 or pixels.shape[2] != 3
@@ -300,11 +347,26 @@ def capture_visible_window(manager: WeComWindowManager | None = None, *,
         raise failure(code, coverage, coverage)
     pixels.setflags(write=False)
     height, width = pixels.shape[:2]
+    coordinates = None
     mouse = state.mouse if current_state.mouse == state.mouse else None
+    if inspect is None and before.last.desktop is not None:
+        try:
+            coordinates = build_coordinates(target.pid, target.hwnd, target.class_name, (state.width, state.height),
+                                            (width, height), state.dpi, before.last.desktop, paint_verified=True)
+        except CoordinateError as error:
+            raise failure("COORDINATE_MAPPING_UNVERIFIED", str(error), coverage) from error
+    elif inspect is None and render is _render_complete_client:
+        raise failure("COORDINATE_MAPPING_UNVERIFIED", "未取得可独立复核的物理桌面与客户区映射", coverage)
     if mouse is not None:
-        mouse = (round(mouse[0] * width / state.width), round(mouse[1] * height / state.height))
+        if coordinates:
+            try:
+                mouse = coordinates.screen_to_image(cursor_position())
+            except (CoordinateError, OSError):
+                mouse = None
+        else:
+            mouse = (round(mouse[0] * width / state.width), round(mouse[1] * height / state.height))
     if probe_size:
         coverage = f"缓冲区 {probe_size[0]}×{probe_size[1]} 的右、底留有未绘制边带 · {coverage}"
     return VisualFrame(WindowCapture(target.pid, target.hwnd, target.title, target.class_name,
                                      target.rect, width, height, pixels, state.dpi / 96),
-                       captured_at, state, mouse, details(coverage))
+                       captured_at, state, mouse, details(coverage), coordinates)

@@ -51,7 +51,7 @@ class CollectionBubble(QWidget):
         reason = progress["reason"] or core.risk or waiting_for or ""
         counters = (f"未读徽标 {unread_markers} · 可处理已发现 {core.discovered}\n"
                     f"点击 {core.clicks} · 会话确认 {core.verified} · "
-                    f"已读取 {len(core.messages)} · 失败 {core.failures}")
+                    f"已读取 {len(core.messages)} · 失败 {core.failures + len(core.blockers)}")
         if final:
             self._finalized = True
             outcomes = tuple(progress["outcomes"].values())

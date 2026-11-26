@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ctypes
-import ntpath
 from ctypes import wintypes
+import ntpath
+from autoim.windows_dpi import physical_coordinates, window_dpi
+from autoim.wecom.window_coordinates import DesktopGeometry, probe_desktop
 from dataclasses import dataclass, replace
 from datetime import datetime
 from time import perf_counter
@@ -30,6 +32,7 @@ class WindowSample:
     dpi: int | None = None
     foreground_hwnd: int | None = None
     error: str = ""
+    desktop: DesktopGeometry | None = None
 
     @property
     def show_command(self) -> int | None:
@@ -72,7 +75,10 @@ class WindowHealth:
     def capture_blocker(self) -> str | None:
         if self.status not in ("WINDOW_VALID", "WINDOW_NOT_FOREGROUND"):
             return self.status
-        return None if self.last and self.last.zoomed else "NOT_MAXIMIZED"
+        if self.last and (self.last.zoomed or self.last.desktop and self.last.client_size
+                          and self.last.client_size[0] >= 640 and self.last.client_size[1] >= 360):
+            return None
+        return "NOT_MAXIMIZED"
 
     @property
     def identity(self) -> tuple | None:
@@ -84,6 +90,11 @@ class WindowHealth:
     @property
     def geometry(self) -> tuple | None:
         return (self.last.rect, self.last.client_size, self.last.dpi) if self.last else None
+
+
+    @property
+    def geometry_key(self):
+        return self.geometry, self.last.desktop.identity if self.last and self.last.desktop else None
 
 
 def _native_sample(hwnd: int, gui, process) -> WindowSample:
@@ -106,10 +117,12 @@ def _native_sample(hwnd: int, gui, process) -> WindowSample:
         zoomed.argtypes = (wintypes.HWND,)
         zoomed.restype = wintypes.BOOL
         facts["zoomed"] = bool(zoomed(hwnd))
-        dpi = ctypes.windll.user32.GetDpiForWindow
-        dpi.argtypes = (wintypes.HWND,)
-        dpi.restype = wintypes.UINT
-        facts["dpi"] = dpi(hwnd)
+        facts["dpi"] = window_dpi(hwnd)
+        if not facts["iconic"]:
+            try:
+                facts["desktop"] = probe_desktop(hwnd, facts["client_size"], gui)
+            except (OSError, AttributeError, ValueError, RuntimeError):
+                pass
     except Exception as exc:
         facts["error"] = f"{type(exc).__name__} · {exc}"
     return WindowSample(**facts)
@@ -139,6 +152,7 @@ def _parked_rectangle(sample: WindowSample) -> bool:
             and len(sample.placement) > 2 and sample.placement[2] == (x, y))
 
 
+@physical_coordinates
 def probe_window(manager: WeComWindowManager | None = None, *, read=None, inspect_process=_process_identity) -> WindowHealth:
     """Resolve anew, bracket Win32 calls and distinguish ambiguity from closure."""
     manager = manager or WeComWindowManager()

@@ -663,7 +663,7 @@ class VisualCollectionPanel(QWidget):
         if not accepted:
             return
         filename, _ = QFileDialog.getSaveFileName(self, "导出诊断 ZIP",
-                                                 str(runtime_paths().diagnostics / f"AutoIM-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"),
+                                                 str(runtime_paths().diagnostics / f"AutoIM-{PC_VERSION}-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"),
                                                  "诊断 ZIP (*.zip)")
         if not filename:
             return
@@ -680,6 +680,7 @@ class VisualCollectionPanel(QWidget):
             core = state.core
             snapshot["core"] = {"phase": core.phase, "clicks": core.clicks, "verified": core.verified,
                                 "messages": len(core.messages), "failures": core.failures,
+                                "blockers": core.blockers, "hover_failures": core.hover_failures,
                                 "partial": core.partial, "read_unfinished": core.read_unfinished}
         self.run_worker(lambda: self.runtime.export(Path(filename), scopes[choice], detection, snapshot,
                                                     full_visual=export_mode == modes[1]),
@@ -1092,6 +1093,7 @@ class VisualCollectionPanel(QWidget):
         self.clear_core_button.setEnabled(bool(messages) and not self._in_flight)
         if core:
             self.core_stats.setText(
+                f"阻断 {len(core.blockers)} · 悬停回退 {core.hover_failures} · "
                 f"本轮 B2 徽标 {self._status.unread_marker_count} · 未定位 {self._status.unowned_unread_count} · "
                 f"静音排除 {self._status.muted_excluded_count} · 折叠排除 {self._status.folded_excluded_count} · "
                 f"行待核 {self._status.other_unreliable_unread} · 静音待核 {self._status.unknown_muted_unread}\n"
@@ -1122,11 +1124,13 @@ class VisualCollectionPanel(QWidget):
                  "STAGED": "已暂存，待补存",
                  "NOT_SAVED": "未保存"}
         for row, message in enumerate(messages):
+            precise = message.hover if message.hover and message.hover.anchor and not message.hover.issue else None
             values = (message.contact, str(message.sequence), direction.get(message.direction, message.direction),
                       message.time or "—", message.kind, message.text or "—", message.quality,
-                      unread.get(message.unread, message.unread), time_source[message.clock.time_source],
+                      unread.get(message.unread, message.unread),
+                      "悬停精确时间" if precise else time_source[message.clock.time_source],
                       collection[message.collection_status], saved[message.save_status],
-                      message.clock.anchor or message.clock.local_date or "—")
+                      precise.anchor if precise else message.clock.anchor or message.clock.local_date or "—")
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
@@ -1138,7 +1142,8 @@ class VisualCollectionPanel(QWidget):
             self.core_table.item(row, 8).setToolTip(
                 f"{message.clock.anchor or '日期未确认'} · {message.clock.precision} · 段内序号 {message.clock_sequence}")
             self.core_table.item(row, 11).setToolTip(
-                f"{message.clock.normalized or '—'} · {message.clock.precision} · "
+                (f"悬停 {message.hover.raw} · {message.hover.issue or message.hover.precision}\n" if message.hover else "")
+                + f"{message.clock.normalized or '—'} · {message.clock.precision} · "
                 f"{'年份推断' if message.clock.year_inferred else '—'} · "
                 f"{message.clock.issue or ' / '.join(message.clock.correction) or '—'}")
         if messages and self._service:

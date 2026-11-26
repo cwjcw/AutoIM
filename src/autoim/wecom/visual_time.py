@@ -1,6 +1,6 @@
 """C2 visual time labels interpreted relative to their original local capture."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 import re
 import unicodedata
@@ -108,3 +108,37 @@ def parse_message_time(raw, observed, *, source="GROUP_ANCHOR", prior=None):
         return MessageTime(raw, source, "DATE", local_date=day.isoformat(), **evidence)
     return MessageTime(raw, source, "MINUTE", stamp.isoformat(timespec="minutes"),
                        local_date=day.isoformat(), **evidence)
+
+
+_HOVER_TIME = re.compile(r"([0-9]{1,2})\s*[/／]\s*([0-9]{1,2})\s+([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
+
+
+def parse_hover_time(raw, observed, *, lower=None, upper=None):
+    value = unicodedata.normalize("NFKC", raw).strip()
+    found = _HOVER_TIME.fullmatch(value)
+    base = MessageTime(raw, "HOVER", normalized=value, format="MONTH_DAY_CLOCK_SECONDS")
+    if not found or observed.utcoffset() is None:
+        return replace(base, issue="INVALID_HOVER_FORMAT")
+    month, day, hour, minute, second = map(int, found.groups())
+    try:
+        anniversary = observed.replace(year=observed.year - 1)
+    except ValueError:
+        anniversary = observed.replace(year=observed.year - 1, day=28)
+    options = []
+    years = ((observed.year,) if (month, day) == (observed.month, observed.day)
+             else (observed.year, observed.year - 1))
+    for year in years:
+        try:
+            stamp = datetime(year, month, day, hour, minute, second, tzinfo=observed.tzinfo)
+        except ValueError:
+            continue
+        if anniversary < stamp <= observed:
+            options.append(stamp)
+    if not options:
+        return replace(base, issue="HOVER_OUTSIDE_CAPTURE_YEAR")
+    bounded = [stamp for stamp in options if (lower is None or stamp >= lower) and (upper is None or stamp < upper)]
+    if len(bounded) != 1:
+        return replace(base, issue="HOVER_TIME_GROUP_CONFLICT" if not bounded else "HOVER_YEAR_AMBIGUOUS")
+    stamp = bounded[0]
+    return replace(base, anchor=stamp.isoformat(timespec="seconds"), precision="SECOND",
+                   local_date=stamp.date().isoformat(), year_inferred=True)

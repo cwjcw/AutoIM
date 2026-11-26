@@ -16,9 +16,9 @@ import numpy as np
 
 from autoim.wecom.visual_store import name_key
 
-KINDS = {"b2", "before", "after", "c2", "database", "failure"}
+KINDS = {"b2", "before", "after", "c2", "database", "failure", "capture_failure", "hover"}
 PRIVATE_RASTERS = ("c2-mask-foreground", "c2-mask-morphology")
-REGIONS = {"b2", "b2-edge", "c1", "c2", *PRIVATE_RASTERS}
+REGIONS = {"b2", "b2-edge", "c1", "c2", "capture", "hover-before", "hover-after", *PRIVATE_RASTERS}
 
 
 class EvidenceExportError(OSError):
@@ -130,6 +130,8 @@ def title_evidence(raw):
 def message_evidence(raw, messages, *, body=True):
     records = [{**item.diagnostic(), "observed_box": rect(item.box), "contact": item.contact,
                 "key": name_key(item.contact), "text": item.text if body else "", "time": item.time,
+                "hover_time": item.hover.raw if body and item.hover else "",
+                "hover_anchor": item.hover.anchor if item.hover else None,
                 "time_anchor": item.clock.anchor, "time_source": item.clock.time_source,
                 "time_precision": item.clock.precision, "group_sequence": item.clock_sequence,
                 "normalized_time": item.clock.normalized, "time_correction": item.clock.correction,
@@ -292,6 +294,8 @@ class _Anonymize:
         return "".join(fragments)
 
     def clean(self, value, key=""):
+        if key in ("hover_time", "hover_anchor"):
+            return "已读取" if value else ""
         if isinstance(value, dict):
             masked = {name: self.clean(item, name) for name, item in value.items()
                       if name not in ("time_anchor", "previous_anchor", "normalized_time", "date_anchor")}
@@ -469,6 +473,8 @@ def write_evidence(archive, store, events, report, *, full):
             require(event, "after")
         elif code in ("MESSAGE_OCR_COMPLETED", "INDEPENDENT_C2_OBSERVED"):
             require(event, "c2")
+        elif code == "CORE_CAPTURE_REJECTED":
+            require(event, "capture_failure", "")
         elif code in ("TARGET_FAILED", "STAGE_TIMEOUT"):
             require(event, "failure")
     docs = {"contacts.json": _dump(contacts), "message-observations.json": _dump(messages),

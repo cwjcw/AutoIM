@@ -4,6 +4,8 @@ import hashlib
 import json
 import sqlite3
 import codecs
+from contextlib import closing
+from autoim.runtime_storage import backup_runtime
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,6 +123,9 @@ def _matches(old, new):
     if (old["direction"], old["kind"], old["sender_name"] or "", _body(old["body"])) != (
             new.direction, new.kind, new.sender, _body(new.text)):
         return False
+    exact, observed = _stamp(old.get("hover_anchor")), _stamp(new.hover.anchor) if new.hover and not new.hover.issue else None
+    if exact and observed:
+        return exact == observed
     prior, current = _stamp(old["anchor"]), _stamp(new.clock.anchor)
     if prior and current:
         return prior == current
@@ -162,6 +167,71 @@ def _time_columns(db):
             db.execute(f"ALTER TABLE core_message_times ADD COLUMN {column} {sql_type}")
 
 
+def _has_table(db, table):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def _history(db, cid):
+    hover = _has_table(db, "core_hover_times")
+    precise = "h.precise_time" if hover else "NULL"
+    join = "LEFT JOIN core_hover_times h ON h.message_id=m.id" if hover else ""
+    return list(reversed([_compatible_history(row) for row in db.execute(f"""
+        SELECT m.id,m.position,m.direction,m.kind,m.sender_name,m.body,m.time_text,m.first_seen,
+               t.anchor,t.time_source,t.normalized_text,{precise} AS hover_anchor
+        FROM messages m JOIN core_message_times t ON m.id=t.message_id
+        {join}
+        WHERE m.conversation_id=? AND m.source=? ORDER BY m.position DESC LIMIT 160""", (cid, SOURCE))]))
+
+
+def preview_visible(store, account, analysis, captured_at):
+    messages = attach_times(analysis.messages, captured_at)
+    if not store.path.is_file():
+        return messages, ("FIRST",) * len(messages)
+    with closing(sqlite3.connect(store.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.25)) as db:
+        db.row_factory = sqlite3.Row
+        if not _has_table(db, "core_message_times"):
+            return messages, ("FIRST",) * len(messages)
+        rows = db.execute("""SELECT c.id FROM conversations c JOIN accounts a ON a.id=c.account_id
+            WHERE a.profile=? AND c.name_key=? AND c.association_status='CORE_NAME_CONFIRMED' AND c.evidence=?""",
+                          (account.profile, name_key(messages[0].contact), FULL_NAME_EVIDENCE)).fetchall()
+        if len(rows) > 1:
+            return messages, ("REVIEW",) * len(messages)
+        if not rows:
+            return messages, ("FIRST",) * len(messages)
+        cid = rows[0]["id"]
+        history = _history(db, cid)
+        state = db.execute("SELECT last_anchor,gap FROM core_conversation_tail WHERE conversation_id=?", (cid,)).fetchone()
+        anchor, gap = state if state else (None, False)
+    decisions, _, _ = compare_visible(history, messages, anchor, gap=gap,
+                                       latest=analysis.latest != "UNKNOWN" and not analysis.gaps)
+    return messages, decisions
+
+
+def _usable_hover(item):
+    return item.hover and item.hover.anchor and not item.hover.issue
+
+
+def _protect_hover_schema(store, check):
+    paths = runtime_paths()
+    if store.path != paths.isolated_db or not store.path.is_file() or not store.path.stat().st_size:
+        return
+    with closing(sqlite3.connect(store.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.25)) as db:
+        if _has_table(db, "core_hover_times") or not _has_table(db, "messages"):
+            return
+    check()
+    backup_runtime(paths, "before-hover-time-schema", roles={"isolated"}, budget=3)
+    check()
+
+
+def _save_hover(db, message_id, item, observed):
+    if _usable_hover(item) and message_id:
+        db.execute("""INSERT OR IGNORE INTO core_hover_times
+            (message_id,raw_time,precise_time,precision,source,year_inferred,captured_at)
+            VALUES (?,?,?,?,'HOVER',?,?)""",
+                   (message_id, item.hover.raw, item.hover.anchor, item.hover.precision,
+                    int(item.hover.year_inferred), observed))
+
+
 def _coverage_gap(gap, messages, decisions):
     points = gap.get("box")
     left = max((item for item in messages if points and item.box.bottom <= points[1] and item.clock.anchor),
@@ -174,7 +244,7 @@ def _coverage_gap(gap, messages, decisions):
             "decisions": [decisions.count("FIRST"), decisions.count("NEW"), decisions.count("REVIEW")]}
 
 
-def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=False):
+def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=False, matched=None):
     """Return per-observation decisions plus the independently aligned overlap."""
     defaults = ["REVIEW"] * len(messages)
     if not history:
@@ -187,8 +257,15 @@ def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=Fa
         if alignments:
             break
     if len(alignments) == 1 and overlap == 1 and not (
-            _stamp(history[-1]["anchor"]) and _stamp(messages[alignments[0]].clock.anchor)):
+            (_stamp(history[-1]["anchor"]) and _stamp(messages[alignments[0]].clock.anchor))
+            or (history[-1].get("hover_anchor") and _usable_hover(messages[alignments[0]]))):
         alignments = []
+    if len(alignments) > 1:
+        exact = [(sum(bool(old.get("hover_anchor") and _usable_hover(item)) for old, item in
+                      zip(history[-overlap:], messages[start:start + overlap])), start) for start in alignments]
+        best = max(score for score, _ in exact)
+        if best:
+            alignments = [start for score, start in exact if score == best]
     counted_equal_tail = False
     if len(alignments) > 1 and latest and not gap and _stamp(history[-1]["anchor"]):
         start, stop = alignments[0], alignments[-1] + overlap
@@ -201,26 +278,39 @@ def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=Fa
     if len(alignments) == 1:
         start = alignments[0]
         end = start + overlap
-        for i in range(start, end):
+        for i, old in zip(range(start, end), history[-overlap:]):
             defaults[i] = "EXISTING"
+            if matched is not None:
+                matched[i] = old.get("id")
         prefix = history[:-overlap]
         # Unmatched content above the overlap stays pending for review.
         for i, old in zip(range(start - 1, -1, -1), reversed(prefix)):
             if not _matches(old, messages[i]):
                 break
             defaults[i] = "EXISTING"
+            if matched is not None:
+                matched[i] = old.get("id")
+        fine_floor = max(filter(None, (_stamp(row.get("hover_anchor")) for row in history)), default=None)
         floor = max(filter(None, (_stamp(row["anchor"]) for row in history)), default=None)
         for i in range(end, len(messages)):
             item = messages[i]
             anchor = _stamp(item.clock.anchor)
-            if item.quality != "RELIABLE" or (floor and anchor and anchor < floor):
+            fine = _stamp(item.hover.anchor) if _usable_hover(item) else None
+            if item.quality != "RELIABLE" or (floor and anchor and anchor < floor) or (fine_floor and fine and fine < fine_floor):
                 continue
             defaults[i] = "NEW"
+            if fine:
+                fine_floor = fine
             if anchor and (floor is None or anchor > floor):
                 floor = anchor
         return defaults, overlap, "COUNTED_EQUAL_TAIL" if counted_equal_tail else "ORDERED_TAIL"
     if len(alignments) > 1:
         return defaults, 0, "AMBIGUOUS_TAIL"
+    fine_tail = _stamp(history[-1].get("hover_anchor"))
+    fine_values = [_stamp(item.hover.anchor) if _usable_hover(item) else None for item in messages]
+    if (latest and not gap and fine_tail and fine_values and all(item and item > fine_tail for item in fine_values)
+            and all(a <= b for a, b in zip(fine_values, fine_values[1:]))):
+        return ["NEW" if item.quality == "RELIABLE" else "REVIEW" for item in messages], 0, "AFTER_PRECISE_TAIL"
     boundary = _stamp(last_anchor)
     anchors = [_stamp(item.clock.anchor) for item in messages]
     if (not gap and boundary and anchors and all(value and value > boundary for value in anchors)
@@ -277,6 +367,9 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
     messages = attach_times(messages, captured_at)
     at = captured_at.isoformat(timespec="milliseconds")
     check()
+    use_hover = any(_usable_hover(item) for item in messages)
+    if use_hover:
+        _protect_hover_schema(store, check)
     with store.transaction(timeout=0.7, before_commit=check, durable=bool(batch_id)) as db:
         if batch_id:
             db.execute("""CREATE TABLE IF NOT EXISTS core_commit_receipts (
@@ -297,6 +390,11 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
         db.execute("""CREATE TABLE IF NOT EXISTS core_conversation_tail (
             conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), last_anchor TEXT, gap INTEGER NOT NULL)""")
         _time_columns(db)
+        if use_hover:
+            db.execute("""CREATE TABLE IF NOT EXISTS core_hover_times (
+                message_id TEXT PRIMARY KEY REFERENCES messages(id), raw_time TEXT NOT NULL,
+                precise_time TEXT NOT NULL, precision TEXT NOT NULL, source TEXT NOT NULL,
+                year_inferred INTEGER NOT NULL, captured_at TEXT NOT NULL)""")
         aid = bind_core_account(db, account, at)
         conversations = db.execute("""SELECT id FROM conversations WHERE account_id=? AND name_key=?
             AND association_status='CORE_NAME_CONFIRMED' AND evidence=?""",
@@ -309,17 +407,17 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                 (id,account_id,name_key,display_name,visual_title,kind,association_status,evidence,first_seen,last_seen,last_status)
                 VALUES (?,?,?,?,?,?,'CORE_NAME_CONFIRMED',?,?,?,'VISIBLE')""",
                        (cid, aid, name_key(contact), contact, contact, conversation_kind, FULL_NAME_EVIDENCE, at, at))
-        history = list(reversed([_compatible_history(row) for row in db.execute("""
-            SELECT m.position,m.direction,m.kind,m.sender_name,m.body,m.time_text,m.first_seen,
-                   t.anchor,t.time_source,t.normalized_text
-            FROM messages m JOIN core_message_times t ON m.id=t.message_id
-            WHERE m.conversation_id=? AND m.source=? ORDER BY m.position DESC LIMIT 160""", (cid, SOURCE))]))
+        history = _history(db, cid)
         historical = db.execute("""SELECT COUNT(*) FROM messages m JOIN core_message_times t ON m.id=t.message_id
             WHERE m.conversation_id=? AND m.source=?""", (cid, SOURCE)).fetchone()[0]
         state = db.execute("SELECT last_anchor,gap FROM core_conversation_tail WHERE conversation_id=?", (cid,)).fetchone()
         last_anchor, had_gap = tuple(state) if state else (None, False)
+        matched = {}
         decisions, overlap, anchor_status = compare_visible(
-            history, messages, last_anchor, gap=had_gap, latest=analysis.latest != "UNKNOWN" and not analysis.gaps)
+            history, messages, last_anchor, gap=had_gap, latest=analysis.latest != "UNKNOWN" and not analysis.gaps,
+            matched=matched)
+        decisions = ["REVIEW" if item.hover and item.hover.issue else decision
+                     for item, decision in zip(messages, decisions)]
         # A delayed observation can confirm already-saved content. It cannot
         # insert an older item after the latest position in an existing history.
         previous_seen = db.execute("SELECT last_seen FROM conversations WHERE id=?", (cid,)).fetchone()[0]
@@ -331,12 +429,16 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                 anchor_status = "OLDER_CAPTURE_REQUIRES_REVIEW"
         position = db.execute("SELECT COALESCE(MAX(position),0) FROM messages WHERE conversation_id=?", (cid,)).fetchone()[0]
         new_anchors = []
-        for item, decision in zip(messages, decisions):
+        for index, (item, decision) in enumerate(zip(messages, decisions)):
             check()
+            if decision == "EXISTING" and use_hover and not delayed:
+                _save_hover(db, matched.get(index), item, at)
             if decision == "REVIEW":
                 store._observation(db, aid, cid, None, None, run_id, at, item.kind, item.direction,
-                                   {"text": item.text, "time_text": item.time, "source": SOURCE}, item.confidence,
-                                   item.box, "UNCERTAIN", anchor_status, item.reason or "ORDER_OR_TIME_UNCERTAIN")
+                                   {"text": item.text, "time_text": item.time, "source": SOURCE,
+                                    "hover": {"raw": item.hover.raw, "candidate": item.hover.anchor,
+                                              "issue": item.hover.issue} if item.hover else None}, item.confidence,
+                                   item.box, "UNCERTAIN", anchor_status, (item.hover.issue if item.hover else "") or item.reason or "ORDER_OR_TIME_UNCERTAIN")
             if decision not in ("FIRST", "NEW"):
                 continue
             position += 1
@@ -354,6 +456,8 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                        (mid, item.clock.anchor, item.clock.time_source, item.clock.precision, item.clock_sequence, run_id,
                         item.clock.normalized, json.dumps(item.clock.correction), int(item.clock.year_inferred),
                         item.clock.issue, item.clock.local_date))
+            if use_hover:
+                _save_hover(db, mid, item, at)
             if item.file or item.kind == "IMAGE":
                 file = item.file
                 db.execute("INSERT INTO attachments VALUES (?,?,?,?,?,0)", (mid, file.file_name if file else None,

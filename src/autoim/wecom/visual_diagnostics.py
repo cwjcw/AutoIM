@@ -86,7 +86,7 @@ def build_visual_report(observation: MonitorObservation | None = None, *,
         "采集方式 Windows PrintWindow（PW_CLIENTONLY），本地 OCR",
     ]
     if recent:
-        _, hwnd, _, width, height, dpi = recent.window_key
+        _, hwnd, _, width, height, dpi = recent.window_key[:6]
         lines.append(f"识别帧 {_time(recent.at)} · HWND 0x{hwnd:X} · 原图 {width}×{height} · DPI {dpi}"
                      + (" · 上次有效画面" if observation is None else ""))
     else:

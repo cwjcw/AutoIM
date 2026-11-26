@@ -200,6 +200,9 @@ class PendingBatch:
         data = asdict(self)
         if not self.analysis.viewport_limits:
             data["analysis"].pop("viewport_limits")
+        for item in data["analysis"]["messages"]:
+            if item["hover"] is None:
+                item.pop("hover")
         for field in ("captured_at", "created_at"):
             data[field] = data[field].isoformat()
         return _json(data)
@@ -236,6 +239,9 @@ def _decode_message(data):
     data["box"] = Box(**data["box"])
     data["clock"]["correction"] = tuple(data["clock"]["correction"])
     data["clock"] = MessageTime(**data["clock"])
+    if data.get("hover") is not None:
+        data["hover"]["correction"] = tuple(data["hover"]["correction"])
+        data["hover"] = MessageTime(**data["hover"])
     data["ocr_boxes"] = tuple(tuple(box) for box in data["ocr_boxes"])
     if data["file"] is not None:
         file = data["file"]

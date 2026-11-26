@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
 )
 
 from autoim import __version__
+from autoim.version import PC_TITLE
+from autoim.windows_dpi import dpi_status, initialize_dpi
 from autoim.runtime_paths import runtime_paths
 from autoim.runtime_storage import maintenance_status
 from autoim.automation.clipboard import ClipboardSnapshot
@@ -93,7 +95,7 @@ class MainWindow(QMainWindow):
         self.calibration = CalibrationStore(self.paths.config / "wecom-calibration.json")
         self._last_capture: WindowCapture | None = None
         self._pending_region: dict | None = None
-        self.setWindowTitle("AutoIM")
+        self.setWindowTitle(PC_TITLE)
         self.resize(1120, 760)
         self.setMinimumSize(900, 620)
         self._build_ui()
@@ -945,16 +947,7 @@ QProgressBar::chunk { background:#2d5fe8; border-radius:3px; }
 
 
 def main() -> int:
-    if sys.platform == "win32":
-        import ctypes
-
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
+    initialized_dpi = initialize_dpi()
     app = QApplication(sys.argv)
     app.setApplicationName("AutoIM")
     app.setFont(QFont("Microsoft YaHei UI", 10))
@@ -975,6 +968,11 @@ def main() -> int:
     window.show()
     collection = window.visual_capture_panel.collection_panel
     collection.enable_runtime(runtime)
+    from dataclasses import asdict
+    screen = window.screen()
+    runtime.emit("app", "", "APP", "DPI_INITIALIZED", details={
+        "initial": asdict(initialized_dpi), "qt_thread": asdict(dpi_status()),
+        "qt_screen": screen.name() if screen else "", "qt_device_pixel_ratio": window.devicePixelRatioF()})
     runtime.emit("app", "", "APP", "RUNTIME_INITIALIZED", details={**paths.status(), "state": initialization})
 
     def report_maintenance(result):

@@ -111,6 +111,7 @@ class CoreMessage:
     file: object | None = None
     method: str = "BUBBLE_FIRST"
     ocr_boxes: tuple = ()
+    hover: MessageTime | None = None
 
     def diagnostic(self):
         return dict(observation_id=self.id, sequence=self.sequence, direction=self.direction,
@@ -119,7 +120,8 @@ class CoreMessage:
                     ocr_boxes=self.ocr_boxes, method=self.method,
                     recovered=self.method in ("OCR_REVERSE", "MERGED_EVIDENCE"),
                     clipped=self.quality == "CLIPPED", quality=self.quality, parser_status=self.parser_status,
-                    unread=self.unread,
+                    unread=self.unread, hover_precision=self.hover.precision if self.hover else "",
+                    hover_issue=self.hover.issue if self.hover else "",
                     reason=self.reason)
 
 
@@ -238,6 +240,8 @@ class CoreView:
     clicks: int = 0
     verified: int = 0
     failures: int = 0
+    blockers: tuple[tuple[str, str], ...] = ()
+    hover_failures: int = 0
     partial: int = 0
     repeated: int = 0
     messages: tuple[CoreMessage, ...] = ()

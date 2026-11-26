@@ -8,7 +8,7 @@ import os
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
-from time import monotonic
+from time import monotonic, sleep
 from threading import Event, Lock
 
 import numpy as np
@@ -16,7 +16,12 @@ import numpy as np
 from autoim.wecom.collection_runtime import safe_reason
 from autoim.wecom.collection_profile import PopupEvidence, ProfileWindows, owner_chain
 from autoim.wecom.collection_profile import ProfileAction, ProfileSurface, changed_regions
-from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client, _render_complete_client, capture_visible_window)
+from autoim.windows_dpi import physical_coordinates, window_dpi
+from autoim.wecom.window_coordinates import (CoordinateError, build_coordinates, cursor_position, move_cursor,
+                                             probe_desktop, window_at)
+from autoim.wecom.collection_hover import HoverRaster, changed_pixels, hover_region
+from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client,
+                                         _render_complete_client, capture_screen_region, capture_visible_window)
 from autoim.wecom.visual_contacts import ContactObservation, name_key, recover_b2_start
 from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_observation import VisualObservation
@@ -197,7 +202,8 @@ def row_target(observation: VisualObservation, row: ContactObservation, *, allow
 def _identity(frame: VisualFrame) -> tuple:
     c, s = frame.capture, frame.state
     health = frame.diagnostics.window_health
-    return c.pid, c.hwnd, c.rect, c.width, c.height, s.width, s.height, s.dpi, health.identity if health else None
+    return (c.pid, c.hwnd, c.rect, c.width, c.height, s.width, s.height, s.dpi, health.identity if health else None,
+            frame.coordinates.snapshot if frame.coordinates else None)
 
 
 class CollectionNavigation:
@@ -211,10 +217,12 @@ class CollectionNavigation:
         self._read_input = _input_state if idle is None else lambda: InputState(*idle())
         self._desktop = desktop
         self._own_input = None
+        self._hover_cursor = None
         self._started = float("-inf")
         self.input_diagnostic = ""
         self.report = lambda *args, **kwargs: None
 
+    @physical_coordinates
     def prepare_window(self, cancel, *, deadline_check=None):
         def check():
             if cancel.is_set():
@@ -232,7 +240,7 @@ class CollectionNavigation:
         check()
         return self.manager.prepare_collection_window(
             self._probe, self.permit.perform, check, wait,
-            async_visibility=deadline_check is not None,
+            async_visibility=deadline_check is not None, allow_restored=deadline_check is not None,
             report=lambda code, result, details: self.report("WINDOW", code, result=result, details=details))
 
     def mark_started(self):
@@ -257,7 +265,8 @@ class CollectionNavigation:
                 raise NavigationPaused("等待用户空闲 · " + self.input_diagnostic)
         return sample.last_tick
 
-    def verify_view(self, observation: VisualObservation, *, need_idle: bool = False):
+    @physical_coordinates
+    def verify_view(self, observation: VisualObservation, *, need_idle: bool = False, purpose="B2"):
         """Verify the existing foreground window without activating it."""
         import win32gui
         import win32process
@@ -276,15 +285,25 @@ class CollectionNavigation:
                 or health.geometry != (c.rect, (s.width, s.height), s.dpi)
                 or (captured_health and captured_health.identity != health.identity)):
             raise NavigationPaused("WINDOW_CHANGED · 窗口身份或坐标系变化，需重新采集", health=health)
+        mapping = frame.coordinates
+        if mapping and (not health.last.desktop or health.last.desktop.identity != mapping.desktop.identity):
+            raise NavigationPaused("WINDOW_CHANGED · 物理桌面几何变化", health=health)
+        if health.last.desktop and not mapping:
+            raise NavigationPaused("缺少已验证的物理坐标映射", health=health)
         cw, ch = health.last.client_size
         try:
             if not win32gui.IsWindowEnabled(c.hwnd):
                 raise NavigationPaused(f"IsWindowEnabled 为 False · 主窗口 HWND 0x{c.hwnd:X}", health=health)
-            top_left = win32gui.ClientToScreen(c.hwnd, (0, 0))
+            top_left = mapping.desktop.client_origin if mapping else win32gui.ClientToScreen(c.hwnd, (0, 0))
         except win32gui.error as exc:
             raise NavigationPaused(f"WINDOW_CHANGED · ClientToScreen/IsWindowEnabled 失败 · {exc}", health=health) from exc
 
         def screen(point: tuple[int, int]) -> tuple[int, int]:
+            if mapping:
+                try:
+                    return mapping.image_to_screen(point, for_input=True)
+                except CoordinateError as error:
+                    raise NavigationPaused(str(error), health=health) from error
             x, y = point
             if not (0 <= x < c.width and 0 <= y < c.height):
                 raise NavigationPaused("视觉位置超出原图")
@@ -296,12 +315,14 @@ class CollectionNavigation:
         def unobscured(point: tuple[int, int]) -> tuple[int, int]:
             xy = screen(point)
             try:
-                hit = win32gui.WindowFromPoint(xy)
+                hit = window_at(xy) if mapping else win32gui.WindowFromPoint(xy)
                 root = win32gui.GetAncestor(hit, 2) if hit else 0
             except (OSError, win32gui.error) as exc:
                 raise NavigationPaused(f"WindowFromPoint/GetAncestor 失败 · 坐标 {xy} · {exc}") from exc
+            coordinates = {"client_point": mapping.image_to_client(point), "snapshot": mapping.snapshot,
+                           "method": mapping.method, "mapping_verified": True} if mapping else {}
             if root != c.hwnd:
-                details = {"region": "B2", "purpose": "B2_ACTUAL_INPUT", "actual_point": True,
+                details = {**coordinates, "region": purpose, "purpose": purpose + "_ACTUAL_INPUT", "actual_point": True,
                            "point": point, "screen_point": xy, "hwnd": hit, "root": root, "obscured": True,
                            "expected": c.hwnd, "rule": "ROOT_NOT_EXPECTED_MAIN"}
                 if hit:
@@ -310,9 +331,9 @@ class CollectionNavigation:
                                        pid=win32process.GetWindowThreadProcessId(hit)[1])
                     except (OSError, win32gui.error):
                         pass
-                self.report("WINDOW", "B2_TARGET_HIT", details=details)
+                self.report("WINDOW", purpose + "_TARGET_HIT", details=details)
                 raise NavigationPaused(_occlusion_detail(hit, c.hwnd, xy, win32gui, win32process), local=True)
-            self.report("WINDOW", "B2_TARGET_HIT", details={"region": "B2", "purpose": "B2_ACTUAL_INPUT",
+            self.report("WINDOW", purpose + "_TARGET_HIT", details={**coordinates, "region": purpose, "purpose": purpose + "_ACTUAL_INPUT",
                         "actual_point": True, "point": point, "screen_point": xy, "hwnd": hit, "root": root,
                         "expected": c.hwnd, "obscured": False})
             return xy
@@ -446,7 +467,7 @@ class CollectionNavigation:
         health = self._probe()
         original = reference.diagnostics.window_health
         if (original is None or original.identity is None or health.identity != original.identity
-                or health.geometry != original.geometry or health.capture_blocker):
+                or health.geometry_key != original.geometry_key or health.capture_blocker):
             raise NavigationPaused("账号核验期间窗口身份、尺寸或 DPI 变化", health=health)
         return health
 
@@ -527,9 +548,29 @@ class CollectionNavigation:
         return frame, tuple(surfaces), tuple(hwnd for hwnd, _ in owned)
 
     @staticmethod
+    @physical_coordinates
     def profile_physical(frame, action):
         import win32gui as gui
         surface = action.surface
+        if frame.coordinates:
+            if surface.embedded:
+                mapping = frame.coordinates
+            else:
+                origin, width, height = surface.geometry
+                rows, cols = surface.pixels.shape[:2]
+                try:
+                    desktop = probe_desktop(surface.hwnd, (width, height), gui)
+                    if not desktop or desktop.client_origin != origin:
+                        raise CoordinateError("PROFILE_CLIENT_ORIGIN_CHANGED")
+                    mapping = build_coordinates(frame.capture.pid, surface.hwnd, gui.GetClassName(surface.hwnd),
+                                                (width, height), (cols, rows), window_dpi(surface.hwnd),
+                                                desktop, paint_verified=True)
+                except (CoordinateError, OSError) as error:
+                    raise NavigationPaused(str(error)) from error
+            try:
+                return mapping.image_to_screen(action.point, for_input=True)
+            except CoordinateError as error:
+                raise NavigationPaused(str(error)) from error
         if surface.embedded:
             health = frame.diagnostics.window_health
             width, height = health.last.client_size if health else (frame.state.width, frame.state.height)
@@ -622,22 +663,104 @@ class CollectionNavigation:
         owned = self._owned_profile_windows(health, known_windows)
         foreground = self._profile_foreground(health, owned, known_windows)
         hwnd = action.surface.hwnd
-        if action.surface.embedded:
-            width, height = health.last.client_size
-        elif (hwnd, action.surface.geometry) in owned:
-            _, width, height = action.surface.geometry
-        else:
+        if not action.surface.embedded and (hwnd, action.surface.geometry) not in owned:
             raise NavigationPaused("资料窗口不再属于本次核验")
         if not gui.IsWindowEnabled(hwnd):
             raise NavigationPaused(f"资料操作目标 IsWindowEnabled 为 False · HWND 0x{hwnd:X}")
-        height_px, width_px = action.surface.pixels.shape[:2]
-        x, y = action.point
-        xy = gui.ClientToScreen(hwnd, (int((x + .5) * width / width_px), int((y + .5) * height / height_px)))
-        hit = gui.WindowFromPoint(xy)
+        xy = self.profile_physical(frame, action)
+        hit = window_at(xy) if frame.coordinates else gui.WindowFromPoint(xy)
         if not hit or gui.GetAncestor(hit, 2) != hwnd:
             raise NavigationPaused("资料目标遮挡 · " + _occlusion_detail(hit, hwnd, xy, gui, process))
         self.report("WINDOW", "TARGET_HIT", details={"hwnd": hit, "expected": hwnd, "point": xy})
         return xy, foreground, self._activity(True)
+
+    @physical_coordinates
+    def hover_message(self, observation, item, check):
+        """Move only, under the same input permit and hit checks as navigation."""
+        from win32gui import GetAncestor, GetForegroundWindow
+
+        check()
+        frame, history = observation.frame, observation.layout.get("C2")
+        mapping = frame.coordinates
+        box = item.box
+        text_centers = (Box(*coords).center for coords in item.ocr_boxes)
+        point = next((center for center in text_centers if box.contains(center)), box.center)
+        if (not mapping or not history or item.kind != "TEXT" or item.quality != "RELIABLE"
+                or not history.contains((box.left, box.top))
+                or not history.contains((box.right - 1, box.bottom - 1))):
+            raise NavigationPaused("HOVER_MESSAGE_GEOMETRY_UNVERIFIED")
+        region = hover_region(mapping, history, box, point)
+        l, t, r, b = region
+        if not (r - l >= 80 and b - t >= 50):
+            raise NavigationPaused("HOVER_CROP_TOO_SMALL")
+        neutral = next((candidate
+                        for y in (point[1], box.top - round(12 * frame.visual_unit),
+                                  box.bottom + round(12 * frame.visual_unit))
+                        for fraction in (.50, .43, .57, .35, .65)
+                        if history.contains(candidate := (history.left + round(history.width * fraction), y))
+                        and all(not msg.box.contains(candidate) for msg in observation.messages)), None)
+        if neutral is None:
+            raise NavigationPaused("HOVER_NO_NEUTRAL_POINT")
+        started = monotonic()
+        activity = self._read_input()
+        cursor = cursor_position()
+        own_recent = self._own_input == activity.last_tick and self._hover_cursor == cursor
+        _, tick = self.verify_view(observation, need_idle=not own_recent, purpose="C2_HOVER")
+        if activity.last_tick != tick or activity.held:
+            raise NavigationPaused("HOVER_USER_INPUT_CHANGED")
+
+        def verify_input():
+            check()
+            self.permit.ensure_current()
+            sample = self._read_input()
+            if (sample.last_tick != tick or sample.held or cursor_position() != cursor
+                    or GetForegroundWindow() != frame.capture.hwnd or not self._desktop()):
+                raise NavigationPaused("HOVER_USER_INPUT_CHANGED")
+
+        def move(target):
+            nonlocal tick, cursor
+            def guarded_move():
+                nonlocal tick, cursor
+                verify_input()
+                hit, _ = self.verify_view(observation, purpose="C2_HOVER")
+                expected = hit(target)
+                verify_input()
+                move_cursor(expected)
+                if cursor_position() != expected or GetForegroundWindow() != frame.capture.hwnd:
+                    raise NavigationPaused("HOVER_POINTER_UNVERIFIED")
+                cursor = expected
+                tick = self._read_input().last_tick
+                self._own_input, self._hover_cursor = tick, cursor
+            self.permit.perform(guarded_move, scroll=False)
+
+        def wait(seconds):
+            end = monotonic() + seconds
+            while monotonic() < end:
+                verify_input()
+                sleep(min(.04, max(0, end - monotonic())))
+
+        def capture():
+            verify_input()
+            self.verify_view(observation, purpose="C2_HOVER")
+            points = ((l, t), (r-1, t), (l, b-1), (r-1, b-1), ((l+r)//2, (t+b)//2))
+            if any(not (hit := window_at(point)) or GetAncestor(hit, 2) != frame.capture.hwnd for point in points):
+                raise NavigationPaused("HOVER_LOCAL_CROP_OCCLUDED")
+            verify_input()
+            pixels = capture_screen_region(region)
+            verify_input()
+            return pixels
+
+        move(neutral)
+        wait(.18)
+        before = capture()
+        move(point)
+        raster = None
+        for delay in (.62, .52):
+            wait(delay)
+            raster = HoverRaster(region, cursor, before, capture(), round((monotonic() - started) * 1000))
+            if changed_pixels(raster) is not None:
+                break
+        return raster
 
     def select(self, observation: VisualObservation, row: ContactObservation, *, fresh_capture=None, deadline_check=None) -> None:
         self._act(observation, row_target(observation, row, allow_duplicate=deadline_check is not None), row.box, scroll=False,
@@ -650,6 +773,7 @@ class CollectionNavigation:
         point = (area.left + round(area.width * .52), area.top + round(area.height * .62))
         self._act(observation, point, area, scroll=True)
 
+    @physical_coordinates
     def _act(self, observation: VisualObservation, point: tuple[int, int], target: Box, *, scroll: bool,
              profile: ProfileAction | None = None, known_windows=(), menu=None, fresh_capture=None, deadline_check=None) -> None:
         frame = observation.frame
@@ -674,7 +798,7 @@ class CollectionNavigation:
             thresholds = VisualThresholds()
             automatic_layout = detect_layout(fresh.pixels, {}, thresholds)
             if fresh_capture:
-                automatic_layout = recover_b2_start(automatic_layout, fresh.pixels, fresh.state.dpi / 96, thresholds)
+                automatic_layout = recover_b2_start(automatic_layout, fresh.pixels, fresh.visual_unit, thresholds)
             automatic_b2 = automatic_layout.get("B2")
             if automatic_b2 is None or not automatic_b2.contains(point):
                 raise NavigationPaused("自动分区无法独立确认该位置属于 B2")
@@ -709,13 +833,20 @@ class CollectionNavigation:
             if deadline_check:
                 deadline_check()
             self.permit.ensure_current()
-            win32api.SetCursorPos(xy)
+            if frame.coordinates:
+                try:
+                    move_cursor(xy)
+                except CoordinateError as error:
+                    raise NavigationPaused(str(error)) from error
+            else:
+                win32api.SetCursorPos(xy)
             if not profile:
                 self.report("WINDOW", "CURSOR_MOVED", details={"point": point, "screen_point": xy, "action": "B2"})
-            if win32gui.GetCursorPos() != xy or win32gui.GetForegroundWindow() != foreground:
+            cursor = cursor_position() if frame.coordinates else win32gui.GetCursorPos()
+            if cursor != xy or win32gui.GetForegroundWindow() != foreground:
                 raise NavigationPaused("发送鼠标动作前，指针或前台窗口已变化")
             if profile:
-                hit = win32gui.WindowFromPoint(xy)
+                hit = window_at(xy) if frame.coordinates else win32gui.WindowFromPoint(xy)
                 if not hit or win32gui.GetAncestor(hit, 2) != expected_hwnd:
                     raise NavigationPaused(f"资料点击前命中窗口变化 · {xy} · HWND 0x{hit:X}")
             elif map_point(point) != xy:

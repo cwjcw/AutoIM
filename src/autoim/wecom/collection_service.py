@@ -6,7 +6,7 @@ import sqlite3
 from concurrent.futures import CancelledError
 from hashlib import blake2s
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock
@@ -18,11 +18,12 @@ import numpy as np
 
 from autoim.calibration import CalibrationStore
 from autoim.runtime_paths import runtime_paths
+from autoim.wecom.collection_hover import HoverBudget
 from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
 from autoim.wecom.collection_evidence import c2_evidence_regions, contact_scan, message_evidence, rect, title_evidence
-from autoim.wecom.collection_incremental import CoreAccount, DefaultAccountConflict, attach_times, save_visible
+from autoim.wecom.collection_incremental import CoreAccount, DefaultAccountConflict, attach_times, preview_visible, save_visible
 from autoim.wecom.collection_pending import CoreDurability, PendingBatch, SavingBlocked, saving_reason
 from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, isolated_row, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
@@ -34,7 +35,7 @@ from autoim.wecom.visual_account import LoginEvidence, read_login
 from autoim.wecom.visual_capture import CaptureError, capture_visible_window
 from autoim.wecom.visual_b2 import mute_region
 from autoim.wecom.visual_contacts import ContactObservation, muted_icon_region
-from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
+from autoim.wecom.visual_layout import Box, LayoutObservation, VisualThresholds, detect_layout
 from autoim.wecom.visual_monitor import _different, probe_frame, summarize
 from autoim.wecom.visual_observation import VisualObservation, observe_frame
 from autoim.wecom.visual_ocr import LocalTextRecognizer, OcrUnavailable
@@ -817,8 +818,8 @@ class CollectionService:
 
     @staticmethod
     def _lifetime(frame):
-        identity = _identity(frame)
-        return identity[0], identity[1], identity[-1]
+        health = frame.diagnostics.window_health
+        return frame.capture.pid, frame.capture.hwnd, health.identity if health else None
 
     def assist_identity(self, action):
         """UI updates this only between workers. Any future action needs a fresh frame."""
@@ -1253,7 +1254,7 @@ class CollectionService:
     @staticmethod
     def _health_key(health: WindowHealth) -> tuple:
         sample = health.last
-        return (health.status, health.reason, health.identity, health.geometry, health.foreground,
+        return (health.status, health.reason, health.identity, health.geometry_key, health.foreground,
                 sample.exists if sample else None, sample.iconic if sample else None,
                 sample.show_command if sample else None, sample.owner if sample else None)
 
@@ -1324,12 +1325,22 @@ class CollectionService:
         health = frame.diagnostics.window_health
         state, capture = frame.state, frame.capture
         pixels = frame.pixels
-        if (state.minimized or not state.maximized or state.dpi < 1
+        mapping = frame.coordinates
+        if (state.minimized or (not state.maximized and not mapping) or state.dpi < 1
                 or pixels.dtype != np.uint8 or pixels.ndim != 3 or pixels.shape[2] != 3
-                or pixels.shape[:2] != (state.height, state.width)
-                or capture.width != state.width or capture.height != state.height
+                or pixels.shape[:2] != (capture.height, capture.width)
+                or (not mapping and (capture.width, capture.height) != (state.width, state.height))
                 or capture.rect is None or capture.pid < 1 or capture.hwnd < 1):
             raise NavigationPaused("截图尺寸、窗口状态或坐标证据无效")
+        if mapping and ((mapping.pid, mapping.hwnd, mapping.class_name, mapping.dpi) !=
+                        (capture.pid, capture.hwnd, capture.class_name, state.dpi)
+                        or mapping.client_size != (state.width, state.height)
+                        or mapping.image_size != (capture.width, capture.height)
+                        or not health or not health.last or not health.last.desktop
+                        or health.last.desktop.identity != mapping.desktop.identity):
+            raise NavigationPaused("COORDINATE_MAPPING_UNVERIFIED · 截图与几何快照不一致")
+        if health and health.last and health.last.desktop and not mapping:
+            raise NavigationPaused("COORDINATE_MAPPING_UNVERIFIED · 物理映射缺失")
         if health is not None and (
                 health.status not in ("WINDOW_VALID", "WINDOW_NOT_FOREGROUND")
                 or health.capture_blocker is not None
@@ -1934,6 +1945,8 @@ class CollectionService:
         self._core_event(code, task, result, reason=reason, read_risk=missing_read)
         if analysis and analysis.messages:
             run.clock.begin(7, "解析消息时间、比对本机历史、保存并展示")
+            if allow_persistence and self.active and task.verified and not task.target.duplicate_name:
+                analysis = self._core_hover(task, raw, analysis)
             analysis = self._core_persist(task, raw, analysis, allow=allow_persistence)
             if self._core_account:
                 run.view = replace(run.view, messages=(*run.view.messages, *analysis.messages)[-500:])
@@ -2027,6 +2040,9 @@ class CollectionService:
 
     def _stop_core_storage(self, reason):
         self._core.storage_blocked = reason
+        issues = self._core.view.blockers
+        if ("STORAGE", reason) not in issues:
+            self._core_state(blockers=(*issues, ("STORAGE", reason)))
         self._core.clock.complete("BLOCKED_BY_DEPENDENCY", reason)
         self._storage_blocked_state(reason)
         self._core_event("CORE_STORAGE_BLOCKED", result="BLOCKED_BY_DEPENDENCY", reason=reason,
@@ -2071,6 +2087,98 @@ class CollectionService:
             self._keep_core_database(task, task.before, observations,
                                      {"committed": False, "reason": reason, "staged": staged}, event)
             return None, replace(analysis, messages=observations)
+
+    def _core_hover(self, task, raw, analysis):
+        run = self._core
+        if (not run.reader or not self._core_account or not raw.frame.coordinates
+                or not isinstance(self.navigator, CollectionNavigation)
+                or (task and (raw is task.before or task.read_at != raw.frame.captured_at))):
+            return analysis
+        at = (task.read_at if task else None) or raw.frame.captured_at
+        try:
+            if task:
+                messages, decisions = preview_visible(self.test_store, self._core_account, analysis, at)
+            else:
+                messages = attach_times(analysis.messages, at)
+                decisions = ("OBSERVE",) * len(messages)
+        except (OSError, sqlite3.Error, ValueError):
+            return analysis
+        chosen = [index for index, item in enumerate(messages) if item.kind == "TEXT"
+                  and item.quality == "RELIABLE" and decisions[index] != "EXISTING"]
+        if not chosen:
+            return analysis
+        elapsed_limit = perf_counter() + 3.6
+        try:
+            stage_end = run.clock.check()
+        except TestDeadline:
+            return analysis
+        # Leave time for enqueue/commit and leave all already verified content
+        # available even when the optional local OCR reaches its time budget.
+        deadline = min(elapsed_limit, stage_end - .9)
+        if deadline - perf_counter() < 1.9:
+            return analysis
+
+        def check():
+            self._core_check()
+            if perf_counter() >= deadline:
+                raise HoverBudget("HOVER_BUDGET_EXHAUSTED")
+
+        # Unresolved/repeated candidates and the newest reliable message take
+        # priority. Previously verified history is left alone.
+        chosen.sort(key=lambda index: (decisions[index] == "REVIEW",
+                                       not messages[index].clock.anchor, index), reverse=True)
+        if not task:
+            chosen = list({messages[index].direction: index for index in reversed(chosen)}.values())
+        updated = list(messages)
+        run.clock.progress("按需读取 C2 悬停精确时间")
+        for attempt, index in enumerate(sorted(chosen[:2])):
+            if deadline - perf_counter() < .95:
+                break
+            item = updated[index]
+            hover_started = EventTime.now().wall
+            result = None
+            try:
+                check()
+                raster = self.navigator.hover_message(raw, item, check)
+                lower = datetime.fromisoformat(item.clock.anchor) if item.clock.anchor else None
+                upper = next((datetime.fromisoformat(next_item.clock.anchor) for next_item in messages[index + 1:]
+                              if next_item.clock.anchor and next_item.clock.anchor != item.clock.anchor), None)
+                result, reason, box, ocr_ms = run.reader.request(
+                    ("hover_ocr", raster, at, lower, upper), check, self._cancel)
+                earlier = next((previous.hover for previous in reversed(updated[:index])
+                                if previous.hover and previous.hover.anchor and not previous.hover.issue), None)
+                if result and result.anchor and earlier and (
+                        datetime.fromisoformat(result.anchor) < datetime.fromisoformat(earlier.anchor)):
+                    result = replace(result, issue="HOVER_REVERSED_SEQUENCE")
+                    reason = result.issue
+                event = self._core_event("HOVER_TIME_OBSERVED", task, "AUTO_PASS" if result and not result.issue else "PARTIAL",
+                    observation_id=item.id, reason=reason, bubble=bounds(item.box), screen_point=raster.point,
+                    crop_screen=raster.region, tooltip=bounds(box), mapping=raw.frame.coordinates.snapshot,
+                    started_at=hover_started.isoformat(), finished_at=EventTime.now().wall.isoformat(),
+                    move_and_wait_ms=raster.move_ms, local_ocr_ms=ocr_ms,
+                    time_precision=result.precision if result else "", fallback=not result or bool(result.issue))
+                if result:
+                    updated[index] = replace(item, hover=result)
+                if self.runtime and (result or attempt == 0):
+                    height, width = raster.after.shape[:2]
+                    local = Box(0, 0, width, height)
+                    capture = replace(raw.frame.capture, image=raster.after, width=width, height=height)
+                    visual = replace(raw, frame=replace(raw.frame, capture=capture, coordinates=None))
+                    self._keep_core_evidence("hover", visual, {"observation_id": item.id,
+                        "hover_time": asdict(result) if result else None, "screen_region": raster.region, "screen_point": raster.point,
+                        "associated_box": bounds(box), "ocr_ms": ocr_ms, "reason": reason},
+                        [("hover-before", local, [], raster.before),
+                         ("hover-after", local, [(rect(box), "TOOLTIP")] if box else [], raster.after)],
+                        task=task, source_event=event)
+                if not result or result.issue:
+                    self._core_state(hover_failures=run.view.hover_failures + 1)
+            except (NavigationPaused, CaptureError, HoverBudget, OcrUnavailable, CancelledError, TestDeadline,
+                    OSError, ValueError) as exc:
+                self._core_state(hover_failures=run.view.hover_failures + 1)
+                self._core_event("HOVER_TIME_FALLBACK", task, "PARTIAL", observation_id=item.id,
+                                 bubble=bounds(item.box), reason=safe_reason(exc), fallback=True)
+                break
+        return replace(analysis, messages=tuple(updated))
 
     def _core_persist(self, task, raw, analysis, *, allow):
         run = self._core
@@ -2163,8 +2271,16 @@ class CollectionService:
         self._core_check()
         frame = (run.reader.request("capture", self._core_check, self._cancel) if run.reader else self.capture())
         self._core_check()
-        self._validate_read_frame(frame)
         run.evidence_frame = frame
+        try:
+            self._validate_read_frame(frame)
+        except NavigationPaused as exc:
+            error = CaptureError("COORDINATE_FRAME_REJECTED", str(exc))
+            error.frame, error.diagnostics = frame, frame.diagnostics
+            raise error from exc
+        if frame.coordinates:
+            self._core_event("CAPTURE_MAPPING_VERIFIED", result="AUTO_PASS",
+                             geometry=frame.coordinates.diagnostic(), capture_ms=round(frame.diagnostics.elapsed_ms))
         return frame
 
     def _core_read_frame(self, frame, operation):
@@ -2192,6 +2308,12 @@ class CollectionService:
         identifier = uuid4().hex
         analysis = analyze_read(raw, identifier, raw.conversation.title if raw.conversation.title_name_reliable else "",
                                 None, "", verified=False, badge_cleared=False, refreshed=False)
+        # A manual F10 diagnostic can verify current text tooltips without
+        # attributing or writing these existing messages as collected history.
+        if raw.conversation.title_name_reliable and analysis.messages:
+            # The diagnostic reads the currently visible, titled page. It
+            # does not attach these observations to persistent history.
+            analysis = self._core_hover(None, raw, analysis)
         displayed = tuple(replace(item, unread="INDEPENDENT_OCR") for item in attach_times(
             analysis.messages, frame.captured_at))
         run.independent_done = True
@@ -2214,7 +2336,16 @@ class CollectionService:
                          risk="独立 OCR 测试 · 非已确认目标未读")
         return self._set(reason="已执行当前页面独立 OCR，未确认目标未读归属")
 
-    def _core_blocked(self, reason, *, timeout=False):
+    def _core_blocked(self, reason, *, timeout=False, failure_type=""):
+        phase = self._core.clock.phase
+        if not failure_type and phase and phase.number in (1, 2, 6):
+            failure_type = {1: "WINDOW_PREPARATION", 2: "B2_LAYOUT_OR_OCR", 6: "C2_READ"}[phase.number]
+        if failure_type:
+            issues = self._core.view.blockers
+            if (failure_type, reason) not in issues:
+                self._core_state(blockers=(*issues, (failure_type, reason)))
+            self._core_event("CORE_STAGE_BLOCKED", result="BLOCKED_BY_DEPENDENCY",
+                             failure_type=failure_type, reason=reason)
         run = self._core
         number = run.clock.phase.number if run.clock.phase else 0
         run.clock.complete("TIMEOUT" if timeout else "BLOCKED_BY_DEPENDENCY", reason)
@@ -2258,7 +2389,9 @@ class CollectionService:
             if run.presentation:
                 return self._status
             if run.finish_after_independent and run.independent_done:
-                self.stop(source="automatic", final_reason="本轮可执行测试已结束")
+                issue = run.view.blockers[-1][1] if run.view.blockers else ""
+                self.stop(source="failure" if issue else "automatic",
+                          final_reason=issue or "本轮可执行测试已结束")
                 return self._status
             if run.independent_reason:
                 clock.begin(6, "导航或列表任务未完成，独立读取当前 C2")
@@ -2279,6 +2412,22 @@ class CollectionService:
         except (CaptureError, NavigationPaused, OcrUnavailable) as exc:
             if not self.active:
                 return self._status
+            if isinstance(exc, CaptureError):
+                code = exc.code
+                event = self._core_event("CORE_CAPTURE_REJECTED", result="BLOCKED_BY_DEPENDENCY",
+                                         reason=safe_reason(exc), has_raw=exc.frame is not None, code_detail=code)
+                if exc.frame is not None and self.runtime and not any(
+                        item[0] == code for item in run.view.blockers):
+                    frame = exc.frame
+                    d = frame.diagnostics
+                    sample = d.window_health.last if d.window_health else None
+                    self.runtime.keep_visual(self._run_id, "", self._status.scan_id, "capture_failure",
+                        VisualObservation(frame, LayoutObservation((), "UNVERIFIED"), "CAPTURE_ONLY"),
+                        {"code": code, "reason": safe_reason(exc), "client": d.client_size,
+                         "raw": d.raw_size, "probe": d.probe_size, "dpi": d.dpi, "window": d.window_rect,
+                         "desktop": asdict(sample.desktop) if sample and sample.desktop else None},
+                        [("capture", Box(0, 0, frame.capture.width, frame.capture.height), [])], source_event=event)
+                return self._core_blocked(safe_reason(exc), failure_type=code)
             return self._core_blocked(safe_reason(exc))
         finally:
             if not self.active:
@@ -2298,6 +2447,13 @@ class CollectionService:
             return self._wait_for_window("WINDOW_STATE_UNCERTAIN · 未能验证企业微信主窗口进程身份")
         run.lifetime = lifetime
         task = run.task
+        if task and frame.coordinates and task.before.frame.coordinates and (
+                frame.coordinates.snapshot != task.before.frame.coordinates.snapshot):
+            self._core_event("GEOMETRY_RESYNC", task, "PARTIAL", clicked=bool(task.clicked_at),
+                             old_snapshot=task.before.frame.coordinates.snapshot,
+                             new_snapshot=frame.coordinates.snapshot)
+            return self._finish_core_target(task, task.before, "TARGET_PARTIAL" if task.best else "TARGET_FAILED",
+                                            reason="WINDOW_GEOMETRY_CHANGED_AFTER_CLICK", analysis=task.best)
         attempted = EventTime.now()
         self._set(screenshot_succeeded_at=frame.captured_at, b2_scan_attempt_at=attempted.wall,
                   scan_disposition="B2_SCANNING", status="RUNNING", trace_job=task.id if task else "")
@@ -2378,7 +2534,7 @@ class CollectionService:
             captured = frame.diagnostics.window_health
             if captured and current.identity != captured.identity and run.lifetime:
                 return self._invalidate_core("WINDOW_LIFETIME_CHANGED_DURING_OCR")
-            if current.capture_blocker or (captured and current.geometry != captured.geometry):
+            if current.capture_blocker or (captured and current.geometry_key != captured.geometry_key):
                 return self._wait_for_window(f"{current.status} · OCR 后窗口状态或坐标变化")
         else:
             current = frame.diagnostics.window_health
@@ -2838,7 +2994,7 @@ class CollectionService:
                     return self._set(status="STOPPED", reason="已停止，未执行导航")
                 if current.capture_blocker:
                     return self._wait_for_window(f"{current.capture_blocker} · {current.reason}", invalidate=True)
-                if health and (current.identity != health.identity or current.geometry != health.geometry):
+                if health and (current.identity != health.identity or current.geometry_key != health.geometry_key):
                     return self._wait_for_window("WINDOW_CHANGED · OCR 后企业微信窗口身份或坐标变化", invalidate=True)
                 elif current.status == "WINDOW_NOT_FOREGROUND":
                     stage = "截图" if health and health.status == "WINDOW_NOT_FOREGROUND" else "OCR"

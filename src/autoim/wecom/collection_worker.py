@@ -8,15 +8,14 @@ from autoim.wecom.visual_ocr import OcrUnavailable
 
 
 def _read_worker(connection, calibration, thresholds):
-    import ctypes
+    from autoim.windows_dpi import initialize_dpi
 
+    initialize_dpi()
+
+    from autoim.wecom.collection_hover import recognize_hover
     from autoim.wecom.collection_service import CollectionReader
     from autoim.wecom.visual_capture import capture_visible_window
 
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except (AttributeError, OSError):
-        pass
     reader = CollectionReader(calibration, thresholds)
     frame = None
     with connection:
@@ -30,11 +29,14 @@ def _read_worker(connection, calibration, thresholds):
                     frame = result = capture_visible_window()
                 elif operation in ("header", "body", "independent"):
                     result = reader.read_core(frame, lambda _: operation != "header", history_only=operation == "independent")
+                elif isinstance(operation, tuple) and operation[0] == "hover_ocr":
+                    _, raster, observed, lower, upper = operation
+                    result = recognize_hover(raster, reader.read, observed, lower=lower, upper=upper)
                 else:
                     raise ValueError("unknown read operation")
                 connection.send(("OK", result))
             except CaptureError as error:
-                connection.send(("CAPTURE", (error.code, str(error), error.diagnostics)))
+                connection.send(("CAPTURE", (error.code, str(error), error.diagnostics, error.frame)))
             except (EOFError, OSError):
                 return
             except Exception as error:
@@ -86,9 +88,9 @@ class CoreReadWorker:
             self.close()
             raise
         if kind == "CAPTURE":
-            code, message, diagnostics = result
+            code, message, diagnostics, frame = result
             error = CaptureError(code, message)
-            error.diagnostics = diagnostics
+            error.diagnostics, error.frame = diagnostics, frame
             raise error
         if kind != "OK":
             raise OcrUnavailable(f"只读采集子进程失败（{result}）")

@@ -57,7 +57,8 @@ def _different(first: np.ndarray, second: np.ndarray, *, fraction: float = .0035
 
 def _window_key(frame: VisualFrame) -> tuple:
     capture = frame.capture
-    return capture.pid, capture.hwnd, capture.rect, capture.width, capture.height, frame.state.dpi
+    return (capture.pid, capture.hwnd, capture.rect, capture.width, capture.height, frame.state.dpi,
+            frame.coordinates.snapshot if frame.coordinates else None)
 
 
 @dataclass(frozen=True, slots=True)

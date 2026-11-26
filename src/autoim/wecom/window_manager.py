@@ -221,6 +221,7 @@ class WeComWindowManager:
         raise WindowResolutionError(error)
 
     def prepare_collection_window(self, probe, perform, check, wait, *, async_visibility=False,
+                                  allow_restored=False,
                                   report=lambda *args, **kwargs: None):
         """Prepare one fixed WeCom lifecycle on an explicit collection start."""
         first = probe()
@@ -281,10 +282,11 @@ class WeComWindowManager:
                           lambda hwnd: show_window(hwnd, 9), lambda state: state.status != "WINDOW_MINIMIZED")
         if current.status == "WINDOW_MINIMIZED":
             return current
-        current = execute("WINDOW_MAXIMIZE", current, not current.last.zoomed,
+        current = execute("WINDOW_MAXIMIZE", current, not current.last.zoomed
+                          and (not allow_restored or current.capture_blocker is not None),
                           lambda hwnd: show_window(hwnd, 3), lambda state: state.last.zoomed)
         try:
-            current = execute("WINDOW_ACTIVATE", current, current.status == "WINDOW_NOT_FOREGROUND" and current.last.zoomed,
+            current = execute("WINDOW_ACTIVATE", current, current.status == "WINDOW_NOT_FOREGROUND" and not current.capture_blocker,
                               gui.SetForegroundWindow, lambda state: state.foreground)
         except gui.error:
             current = checked()

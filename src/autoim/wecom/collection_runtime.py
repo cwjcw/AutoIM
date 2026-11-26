@@ -20,7 +20,7 @@ from autoim.wecom.collection_evidence import EvidenceArchive, EvidenceJob, write
 from autoim.wecom.collection_test import PHASES
 from autoim.runtime_paths import project_root, runtime_paths
 
-PC_VERSION = "PC-V3.5.3.4"
+from autoim.version import PC_VERSION
 
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",
@@ -256,7 +256,7 @@ class CollectionRuntime:
                           "detection": detection, "task": task, "scan": scan, "kind": kind,
                           "captured_at": frame.captured_at.isoformat(), "dpi": frame.state.dpi,
                           "size": [frame.capture.width, frame.capture.height],
-                          "coordinates": "original_window_pixels", "data": data}
+                          "coordinates": "screen_physical_crop" if kind == "hover" else "original_window_pixels", "data": data}
                 self.queue.put(EvidenceJob(self.evidence.keep, (record, frame.pixels, regions), self.evidence.slots))
             return identifier
 

@@ -357,7 +357,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     started = perf_counter()
     pixels = frame.pixels
     layout = detect_layout(pixels, calibration, thresholds)
-    unit = max(.65, min(frame.state.dpi / 96, 3.0))
+    unit = frame.visual_unit
     a, b1, b2, c1, c2, c3 = (layout.get(name) for name in ("A", "B1", "B2", "C1", "C2", "C3"))
     search, add = _toolbar_controls(pixels, b1) if b1 else (None, None)
     hover = next((item.name for item in layout.regions if item.name not in ("B", "C")
