@@ -10,7 +10,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from autoim.wecom.collection_profile import normalize_email
-from autoim.wecom.visual_store import database_path, name_key
+from autoim.runtime_paths import runtime_paths
+from autoim.wecom.visual_store import name_key
 from autoim.wecom.visual_time import normalize_time_label, parse_message_time
 
 SOURCE = "CORE_VISIBLE_INCREMENTAL"
@@ -45,7 +46,7 @@ class CoreAccount:
 
     @classmethod
     def inspect(cls, path: Path | None = None):
-        path = path or database_path().parent / "core-default-account.json"
+        path = path or runtime_paths().account
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -235,6 +236,36 @@ def _decided(messages, decisions):
                  for item, decision in zip(messages, decisions))
 
 
+def core_accounts(db):
+    return db.execute("""SELECT id,profile,login_name,email,identity_status FROM accounts
+        WHERE profile LIKE 'CORE-LOCAL-%' OR identity_status='LOCAL_DEFAULT_UNVERIFIED'""").fetchall()
+
+
+def validate_core_account(db, account):
+    rows = core_accounts(db)
+    if not rows:
+        return None
+    row = rows[0]
+    if (len(rows) != 1 or row["profile"] != account.profile or row["identity_status"] != "LOCAL_DEFAULT_UNVERIFIED"
+            or name_key(row["login_name"] or "") != name_key(account.name)
+            or (row["email"] and normalize_email(row["email"]) != account.email)):
+        raise DefaultAccountConflict("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+    return row
+
+
+def bind_core_account(db, account, at):
+    if normalize_email(account.email) != account.email:
+        raise DefaultAccountConflict("DEFAULT_ACCOUNT_EMAIL_INVALID")
+    row = validate_core_account(db, account)
+    if row is not None:
+        if row["email"] != account.email:
+            db.execute("UPDATE accounts SET email=? WHERE id=?", (account.email, row["id"]))
+        return row["id"]
+    return db.execute("""INSERT INTO accounts(profile,identity_status,first_seen,login_name,email)
+            VALUES (?, 'LOCAL_DEFAULT_UNVERIFIED', ?, ?, ?)""",
+                      (account.profile, at, account.name, account.email)).lastrowid
+
+
 def save_visible(store, account, analysis, conversation_kind, captured_at, run_id, check, *,
                  batch_id="", batch_digest="", historical_recovery=False):
     messages = analysis.messages
@@ -266,13 +297,7 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
         db.execute("""CREATE TABLE IF NOT EXISTS core_conversation_tail (
             conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), last_anchor TEXT, gap INTEGER NOT NULL)""")
         _time_columns(db)
-        db.execute("""INSERT OR IGNORE INTO accounts(profile, identity_status, first_seen, login_name)
-            VALUES (?, 'LOCAL_DEFAULT_UNVERIFIED', ?, ?)""", (account.profile, at, account.name))
-        aid = db.execute("SELECT id FROM accounts WHERE profile=? AND identity_status='LOCAL_DEFAULT_UNVERIFIED'",
-                         (account.profile,)).fetchone()
-        if aid is None:
-            raise DefaultAccountConflict("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
-        aid = aid[0]
+        aid = bind_core_account(db, account, at)
         conversations = db.execute("""SELECT id FROM conversations WHERE account_id=? AND name_key=?
             AND association_status='CORE_NAME_CONFIRMED' AND evidence=?""",
                                    (aid, name_key(contact), FULL_NAME_EVIDENCE)).fetchall()

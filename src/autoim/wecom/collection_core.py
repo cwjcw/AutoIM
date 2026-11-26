@@ -15,7 +15,7 @@ import numpy as np
 
 from autoim.wecom.visual_layout import Box
 from autoim.wecom.visual_monitor import _different, _history_content_box, _thumbnail
-from autoim.wecom.visual_store import database_path
+from autoim.runtime_paths import runtime_paths
 from autoim.wecom.visual_time import MessageTime
 
 MAX_READ_POLLS = 4
@@ -24,7 +24,7 @@ MAX_CACHED_OBSERVATIONS = 2500
 
 
 def failure_crop_directory() -> Path:
-    return database_path().parent / "private-test-crops"
+    return runtime_paths().diagnostics / "private-test-crops"
 
 
 def bounds(box):
@@ -129,6 +129,7 @@ class CoreAnalysis:
     latest: str
     completeness: str
     gaps: tuple[dict, ...]
+    viewport_limits: tuple[dict, ...] = ()
 
 
 def _read_message(item, task, contact):
@@ -157,7 +158,13 @@ def _read_message(item, task, contact):
 
 def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared, refreshed):
     """Report each bubble independently, then assess its unread range."""
-    messages = tuple(_read_message(item, task, contact) for item in raw.messages)
+    limits = tuple({"reason": item.viewport_limit, "box": bounds(item.box)}
+                   for item in raw.messages if item.viewport_limit)
+    limits += tuple({"reason": entry.kind, "box": bounds(entry.span.box)}
+                    for entry in raw.message_ocr if entry.kind == "TOP_VIEWPORT_CLIPPED"
+                    and entry.container_number is None)
+    messages = tuple(_read_message(item, task, contact) for item in raw.messages
+                     if item.viewport_limit != "TOP_VIEWPORT_CLIPPED")
     # C2 OCR text classified as a centered SYSTEM row by the existing parser.
     separators = [entry.span.box for entry in raw.message_ocr if entry.kind == "SYSTEM"
                   and entry.span.score >= .85 and normalized_text(entry.span.text) == "以下是新消息"]
@@ -186,7 +193,7 @@ def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared,
             latest = "PREVIEW_AND_REFRESH"
     if not verified:
         return CoreAnalysis(tuple(replace(item, unread="ATTRIBUTION_UNCERTAIN") for item in messages),
-                            latest, raw.message_completeness, gaps)
+                            latest, raw.message_completeness, gaps, limits)
     separator = separators[0] if len(separators) == 1 else None
     after = [item for item in messages if separator and item.box.top >= separator.bottom]
     gap_after = bool(separator and any(gap["box"] and gap["box"][3] > separator.bottom for gap in gaps))
@@ -212,7 +219,7 @@ def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared,
         elif latest != "UNKNOWN" and item is messages[-1]:
             state = "LATEST_VISIBLE"
         checked.append(replace(item, unread=state))
-    return CoreAnalysis(tuple(checked), latest, raw.message_completeness, gaps)
+    return CoreAnalysis(tuple(checked), latest, raw.message_completeness, gaps, limits)
 
 
 @dataclass(frozen=True, slots=True)

@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from autoim.calibration import CalibrationStore
+from autoim.runtime_paths import runtime_paths
 from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
@@ -37,7 +38,7 @@ from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_monitor import _different, probe_frame, summarize
 from autoim.wecom.visual_observation import VisualObservation, observe_frame
 from autoim.wecom.visual_ocr import LocalTextRecognizer, OcrUnavailable
-from autoim.wecom.visual_store import LocalAccount, SaveResult, VisualStore, avatar_key, database_path, name_key
+from autoim.wecom.visual_store import LocalAccount, SaveResult, VisualStore, avatar_key, name_key
 from autoim.wecom.window_manager import WeComWindowManager, WindowResolutionError
 from autoim.wecom.window_state import WindowHealth, probe_window
 
@@ -476,7 +477,7 @@ class IsolatedRun:
 
 
 def isolated_database_path():
-    return database_path().parent / "test-data" / "wecom-test.sqlite3"
+    return runtime_paths().isolated_db
 
 
 class _ProbeRollback(Exception):
@@ -537,9 +538,9 @@ class CollectionService:
         self._verify_isolated_database()
         if durability and durability.store.path.resolve() != self.test_store.path.resolve():
             raise ValueError("CORE_STORAGE_PATH_CONFLICT")
-        root = self.test_store.path.parent.parent if self._isolate_core_reads else None
-        self._durability = durability or (CoreDurability(self.test_store, root / "core-default-account.json",
-                                           root / "pending-collections" / "observations.sqlite3") if root else None)
+        paths = runtime_paths() if self._isolate_core_reads else None
+        self._durability = durability or (CoreDurability(self.test_store, paths.account, paths.pending_db)
+                                           if paths else None)
         self._isolated_run: IsolatedRun | None = None
         self.mode = "test"
         self._prepare_pending = False
@@ -2445,10 +2446,11 @@ class CollectionService:
                                         "time_issue": item.clock.issue, "time_precision": item.clock.precision,
                                         "time_correction": item.clock.correction, "year_inferred": item.clock.year_inferred}
                                        for item in timed],
-                             completeness=analysis.completeness, gaps=analysis.gaps,
+                             completeness=analysis.completeness, gaps=analysis.gaps, viewport_limits=analysis.viewport_limits,
                              body_reads=task.body_reads, recognition_ms=round(raw.recognition_ms))
             data, marks = message_evidence(raw, timed)
-            shot = self._keep_core_evidence("c2", raw, {**data, "conversation_verified": True, "gaps": analysis.gaps},
+            shot = self._keep_core_evidence("c2", raw, {**data, "conversation_verified": True, "gaps": analysis.gaps,
+                                             "viewport_limits": analysis.viewport_limits},
                                             c2_evidence_regions(raw, marks), task=task, source_event=event)
             confirmed = sum(item.unread == "CONFIRMED_UNREAD" for item in analysis.messages)
             self._core_event("UNREAD_RANGE_CHECKED", task, "AUTO_PASS" if confirmed else "PARTIAL", unread_confirmed=confirmed,

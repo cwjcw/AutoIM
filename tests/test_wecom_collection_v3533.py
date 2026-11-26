@@ -94,6 +94,8 @@ class StorageTests(unittest.TestCase):
         batch = self.batch("visible")
         self.queue.stage(batch)
         self.queue.process(self.store, ACCOUNT, batch.batch_id, check)
+        with self.store.transaction() as db:
+            db.execute("UPDATE accounts SET email=NULL")
         self.durable.account.path.unlink()
         self.durable.account.backup.unlink()
         with self.assertRaisesRegex(SavingBlocked, "DEFAULT_ACCOUNT_FILE_MISSING"):

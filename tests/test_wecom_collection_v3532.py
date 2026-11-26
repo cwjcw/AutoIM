@@ -8,7 +8,6 @@ from unittest import TestCase
 from unittest.mock import patch
 from uuid import uuid4
 import json
-import os
 import zipfile
 
 import cv2
@@ -184,13 +183,16 @@ class ConfigurationTests(TestCase):
         with patch.object(Path, "read_bytes", side_effect=PermissionError):
             self.assertEqual(CoreAccount.inspect(Path("inaccessible")).reason, "DEFAULT_ACCOUNT_READ_FAILED")
 
-    def test_default_path_follows_the_actual_localappdata_environment(self):
-        with TemporaryDirectory() as directory, patch.dict(os.environ, {"LOCALAPPDATA": directory}):
-            path = Path(directory) / "AutoIM" / "core-default-account.json"
-            self.assertEqual(CoreAccount.inspect().path, path)
-            path.parent.mkdir()
-            path.write_text(json.dumps({"name": ACCOUNT.name, "email": ACCOUNT.email}), encoding="utf-8-sig")
-            self.assertEqual(CoreAccount.inspect().account, ACCOUNT)
+    def test_default_path_uses_runtime_config(self):
+        from autoim.runtime_paths import RuntimePaths, project_root
+        with TemporaryDirectory() as directory:
+            paths = RuntimePaths(project_root(), Path(directory).resolve() / "runtime")
+            path = paths.account
+            with patch("autoim.wecom.collection_incremental.runtime_paths", return_value=paths):
+                self.assertEqual(CoreAccount.inspect().path, path)
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"name": ACCOUNT.name, "email": ACCOUNT.email}), encoding="utf-8-sig")
+                self.assertEqual(CoreAccount.inspect().account, ACCOUNT)
 
 
 class PersistenceTests(TestCase):

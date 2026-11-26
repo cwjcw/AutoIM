@@ -20,7 +20,9 @@ from autoim.wecom.collection_service import isolated_database_path
 from autoim.wecom.visual_layout import Box, VisualThresholds
 from autoim.wecom.visual_messages import analyze_messages, find_containers
 from autoim.wecom.visual_ocr import TextSpan
-from autoim.wecom.visual_store import VisualStore, database_path, name_key
+from autoim.runtime_paths import runtime_paths
+from autoim.runtime_storage import backup_runtime
+from autoim.wecom.visual_store import VisualStore, name_key
 
 
 def _events(path, detection):
@@ -107,8 +109,8 @@ def _observations(record, folder, contact):
     return replayed, new_gaps, completeness
 
 
-def recover_observation(log_root, day, detection, identifier, account):
-    archive = EvidenceArchive(log_root / "visual-evidence", retention=30)
+def recover_observation(log_root, day, detection, identifier, account, *, evidence_root=None):
+    archive = EvidenceArchive(evidence_root or log_root / "visual-evidence", retention=30)
     matches = tuple(_events(log_root / day.isoformat() / "events.jsonl", detection))
     selected = next(event for event in matches if event["code"] == "VISUAL_EVIDENCE"
                     and event["details"]["evidence_id"] == identifier and event["details"]["kind"] == "c2")
@@ -169,9 +171,8 @@ def main():
     parser.add_argument("evidence", nargs="+", metavar="DATE:DETECTION:C2_ID")
     parser.add_argument("--write", action="store_true", help="write to the local isolated core database")
     args = parser.parse_args()
-    root = database_path().parent
-    durable = CoreDurability(VisualStore(isolated_database_path()), root / "core-default-account.json",
-                             root / "pending-collections" / "observations.sqlite3")
+    paths = runtime_paths()
+    durable = CoreDurability(VisualStore(isolated_database_path()), paths.account, paths.pending_db)
     check = lambda: None
     try:
         configured = CoreAccount.inspect(durable.account.path)
@@ -183,8 +184,10 @@ def main():
             day, detection, c2_id = value.split(":")
             EvidenceArchive._id(detection)
             EvidenceArchive._id(c2_id)
-            batches.append(recover_observation(root / "logs", date.fromisoformat(day), detection, c2_id, account))
+            batches.append(recover_observation(paths.logs, date.fromisoformat(day), detection, c2_id, account,
+                                               evidence_root=paths.evidence))
         if args.write:
+            backup_runtime(paths, "before-history", budget=30)
             durable.account.ensure(durable.store, check, supplied=account)
         for batch in sorted(batches, key=lambda item: item.captured_at):
             print(f"observation={batch.captured_at.isoformat()} messages={len(batch.analysis.messages)} "

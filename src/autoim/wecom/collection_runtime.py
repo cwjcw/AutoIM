@@ -18,9 +18,9 @@ from uuid import uuid4
 from autoim import __version__
 from autoim.wecom.collection_evidence import EvidenceArchive, EvidenceJob, write_evidence
 from autoim.wecom.collection_test import PHASES
-from autoim.wecom.visual_store import database_path
+from autoim.runtime_paths import project_root, runtime_paths
 
-PC_VERSION = "PC-V3.5.3.3"
+PC_VERSION = "PC-V3.5.3.4"
 
 STAGES = {
     "WINDOW": "恢复、最大化并验证企业微信前台",
@@ -111,15 +111,25 @@ def safe_reason(value):
     return _PHONE.sub("[号码已隐去]", _SECRET.sub(r"\1=[隐去]", _EMAIL.sub("[邮箱已隐去]", str(value))))[:1500]
 
 
-def git_version():
+def repository_state(root):
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, timeout=2, check=True,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+
     try:
-        root = Path(__file__).resolve().parents[3]
-        result = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], cwd=root,
-                                capture_output=True, text=True, timeout=2, check=True,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        head = git("rev-parse", "HEAD")
+        dirty = bool(git("status", "--porcelain", "--untracked-files=normal"))
+        source_dirty = bool(git("status", "--porcelain", "--untracked-files=normal", "--",
+                                "src", "pyproject.toml", "uv.lock"))
+        if not re.fullmatch(r"[0-9a-f]{40}", head) or git("rev-parse", "HEAD") != head:
+            return {"head": None, "dirty": None, "source_dirty": None, "source": "git", "reason": "HEAD_UNSTABLE"}
+        return {"head": head, "dirty": dirty, "source_dirty": source_dirty, "source": "git", "reason": ""}
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"head": None, "dirty": None, "source_dirty": None, "source": "git", "reason": type(error).__name__}
+
+
+def git_version():
+    return repository_state(project_root())["head"] or "unknown"
 
 
 def _human(event):
@@ -206,13 +216,20 @@ class _Listener(QueueListener):
 
 class CollectionRuntime:
     def __init__(self, root=None, *, max_bytes=20 * 1024 * 1024, backups=5, retention=30, revision=None):
-        self.root = Path(root) if root is not None else database_path().parent / "logs"
+        paths = runtime_paths()
+        self.root = Path(root) if root is not None else paths.logs
         self.session = uuid4().hex
-        self.revision = revision or git_version()
+        git = repository_state(paths.project) if revision is None else {
+            "head": revision, "dirty": None, "source_dirty": None, "source": "injected", "reason": ""}
+        self.revision = git["head"] or "unknown"
+        self.execution = {"app_version": __version__, "pc_version": PC_VERSION,
+                          "started_at": datetime.now().astimezone().isoformat(),
+                          "source_path": str(Path(__file__).resolve()), "project": str(paths.project),
+                          "runtime": str(paths.root), "startup_git": git}
         self.queue = SimpleQueue()
         self.handler = QueueHandler(self.queue)
         self.files = _EventFiles(self.root, max_bytes, backups, retention)
-        self.evidence = EvidenceArchive(self.root / "visual-evidence", retention)
+        self.evidence = EvidenceArchive(self.root / "visual-evidence" if root is not None else paths.evidence, retention)
         self.listener = _Listener(self.queue, self.files)
         self.listener.failure = ""
         self.listener.start()
@@ -254,7 +271,7 @@ class CollectionRuntime:
                 if key in details:
                     details[key] = safe_reason(details[key])
             event = {"id": uuid4().hex, "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                     "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision,
+                     "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision, "execution": self.execution,
                      "session": self.session, "detection": detection, "task": task, "mode": mode,
                      "stage": stage, "code": code, "result": result, "level": level, "elapsed_ms": elapsed_ms,
                      "details": details}
@@ -369,7 +386,7 @@ class CollectionRuntime:
                 stop.update(status=outcome, final_status=outcome, completed=passed, waiting=False,
                             reason="" if passed else "停止审计缺少必要子步骤证据")
             return {"version": PC_VERSION, "git": self.revision, "session": self.session,
-                    "detection": detection, "evidence_scopes": sorted(scopes.get(detection, ())),
+                    "execution": self.execution, "detection": detection, "evidence_scopes": sorted(scopes.get(detection, ())),
                     "stop_audit": dict(audit), "stages": stages, "substeps": substeps}
 
     def sync(self):
@@ -426,6 +443,7 @@ class CollectionRuntime:
                         selected.append(event)
                     readable.write((_human(event) + "\n").encode("utf-8"))
                     structured.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                exported = repository_state(Path(self.execution["project"]))
                 with path.open("xb") as destination:
                     created = True
                     with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -435,14 +453,20 @@ class CollectionRuntime:
                                 copyfileobj(stream, entry)
                         archive.writestr("environment.json", json.dumps({"platform": platform.system(),
                                           "release": platform.release(), "python": platform.python_version(),
-                                          "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision}))
-                        archive.writestr("diagnostic.json", json.dumps(snapshot, ensure_ascii=False, indent=2))
+                                          "app_version": __version__, "pc_version": PC_VERSION, "git": self.revision,
+                                          "execution": self.execution, "export_git": exported}))
+                        archive.writestr("diagnostic.json", json.dumps({**snapshot, "execution": self.execution, "export_git": exported},
+                                                                    ensure_ascii=False, indent=2))
                         recorded = ({}, {}, {}, {})
                         for event in selected:
                             self._track(event, *recorded)
                         report = self.report(detection, recorded=recorded)
-                        report["detections"] = {run: self.report(run, recorded=recorded)
-                                                for run in dict.fromkeys(event["detection"] for event in selected)}
+                        versions = {event["detection"]: event for event in selected}
+                        report["export_git"] = exported
+                        report["detections"] = {
+                            run: {**self.report(run, recorded=recorded), "version": event.get("pc_version", "unknown"),
+                                  "git": event.get("git", "unknown"), "execution": event.get("execution")}
+                            for run, event in versions.items()}
                         archive.writestr("flow-report.json", json.dumps(report, ensure_ascii=False, indent=2))
                         write_evidence(archive, self.evidence, selected, report, full=full_visual)
         except BaseException:

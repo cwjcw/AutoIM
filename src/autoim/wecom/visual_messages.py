@@ -36,6 +36,7 @@ class VisibleMessageObservation:
     sender_name: str = ""
     time_source: str = "GROUP_ANCHOR"
     method: str = "BUBBLE_FIRST"
+    viewport_limit: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,7 @@ class MessageAnalysis:
     anchors: tuple[int | None, int | None]
     containers: tuple[Container, ...] = ()
     masks: tuple[np.ndarray, ...] = ()
+    candidate_evidence: tuple[dict, ...] = ()
 
     @property
     def context(self) -> tuple[TextSpan, ...]:
@@ -395,6 +397,32 @@ def _emoji_only(value):
                                for char in value)
 
 
+def _color_support(pixels, box, region):
+    sample = box.crop(pixels)[::2, ::2].astype(np.int16)
+    probe = Box(max(region.left, region.center[0] - 24), box.top,
+                min(region.right, region.center[0] + 24), box.bottom)
+    nearby = probe.crop(pixels)[::2, ::2].astype(np.int16)
+    if not sample.size or not nearby.size:
+        return 0., 0., 0.
+    color = np.median(sample, axis=(0, 1))
+    ambient = np.median(nearby, axis=(0, 1))
+    contrast = float(np.max(np.abs(color - ambient)))
+    fill = float(np.mean(np.max(np.abs(sample - color), axis=2) <= 5))
+    foreground = float(np.mean(np.max(np.abs(sample - ambient), axis=2) >= 8))
+    return contrast, fill, foreground
+
+
+def _top_fragment(pixels, span, region, unit, thresholds):
+    box = span.box
+    if box.top > region.top + round(3 * unit) or not _in_message_lane(box, region, thresholds):
+        return False
+    at_edge = replace(box, top=region.top, bottom=min(region.bottom, box.bottom + round(unit)))
+    contrast, fill, _ = _color_support(pixels, at_edge, region)
+    # The viewport header can occupy several pixels before the data crop.
+    # Require a coherent, distinct fill under the OCR fragment at the edge.
+    return contrast >= 8 and fill >= .44
+
+
 def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Container, ...],
                      spans: tuple[TextSpan, ...], unit: float,
                      calibration: Mapping[str, NormalizedRect],
@@ -458,14 +486,22 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             dispositions.append(OcrDisposition(span, "UNASSIGNED", None, index,
                                                "对应容器未通过消息分类", True))
             continue
-        dispositions.append(OcrDisposition(span, "UNASSIGNED", None, nearest, reason, True))
+        if page_verified and _top_fragment(pixels, span, region, unit, thresholds):
+            dispositions.append(OcrDisposition(span, "TOP_VIEWPORT_CLIPPED", None, nearest,
+                                               "文字贴近上边界且具有连续的消息填充"))
+        else:
+            dispositions.append(OcrDisposition(span, "UNASSIGNED", None, nearest, reason, True))
     eligible = tuple(item for i, item in enumerate(containers, 1)
                      if (not item.needs_text or i in grouped) and _in_message_lane(item.box, region, thresholds)
                      and (not item.quiet_outline or item in preliminary))
     anchors = content_anchors(eligible, region, pixels.shape[1], calibration, thresholds)
     results = []
+    diagnostics = []
     for index, item in enumerate(containers, 1):
         box = item.box
+        detail = {"width": box.width, "height": box.height, "ocr_count": len(grouped.get(index, ())),
+                  "classification": "INSUFFICIENT_EVIDENCE", "reason": "PAGE_OR_CONTAINER_EVIDENCE_INSUFFICIENT"}
+        diagnostics.append(detail)
         if (not page_verified or (item.quiet_outline and item not in preliminary)
                 or (item.needs_text and index not in grouped and item not in preliminary)
                 or (not _in_message_lane(box, region, thresholds) and not item.clipped and item not in preliminary)):
@@ -500,7 +536,22 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             evidence.append("疑似引用、转发或其他复杂卡片，正文边界未确认")
         elif not weak and text:
             kind = "EMOJI" if _emoji_only(text) else "TEXT"
+        contrast, fill, foreground = _color_support(pixels, box, region)
+        detail.update(fill_contrast=round(contrast, 2), fill_fraction=round(fill, 3),
+                      foreground_fraction=round(foreground, 3), direction=direction,
+                      media_structure=kind if kind.startswith(("IMAGE", "FILE")) else "")
+        if (kind == "UNKNOWN" and not matching and direction == "UNKNOWN" and not item.clipped
+                and box.height >= box.width * 1.65 and contrast < 7 and foreground < .30):
+            detail.update(classification="BACKGROUND_NOISE", reason="UNANCHORED_SPARSE_ELONGATED_CONTOUR")
+            continue
+        viewport_limit = ""
         if item.clipped:
+            if box.bottom >= region.bottom - round(2 * unit):
+                viewport_limit = "BOTTOM_VIEWPORT_CLIPPED"
+            elif box.top <= region.top + round(2 * unit) and (
+                    (contrast >= 8 and fill >= .44) or any(_top_fragment(pixels, span, region, unit, thresholds)
+                                                          for span in matching)):
+                viewport_limit = "TOP_VIEWPORT_CLIPPED"
             direction = "UNKNOWN"
             if file is None:
                 kind = "UNKNOWN"
@@ -512,6 +563,9 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             status = "UNCLASSIFIED"
         else:
             status = "CANDIDATE"
+        detail.update(classification=viewport_limit or (kind if status == "CANDIDATE" else
+                      "UNKNOWN_BUBBLE" if contrast >= 8 and fill >= .44 else "SUSPECTED_MESSAGE"),
+                      reason=status)
         preceding = [span for span in times if span.box.bottom <= box.top]
         time = max(preceding, key=lambda span: span.box.bottom).text if preceding else ""
         if time:
@@ -521,10 +575,13 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             display_text = file.file_name or "\n".join(file.name_rows)
         results.append(VisibleMessageObservation(len(results) + 1, box, direction, kind,
                                                  display_text, time, left_dist, right_dist,
-                                                 status, tuple(evidence), matching, file=file, method=item.method))
+                                                 status, tuple(evidence), matching, file=file, method=item.method,
+                                                 viewport_limit=viewport_limit))
         for pos in positions:
             span = dispositions[pos].span
-            if file is not None:
+            if viewport_limit == "TOP_VIEWPORT_CLIPPED":
+                dispositions[pos] = OcrDisposition(span, viewport_limit, index, index, "顶部气泡经视口裁切")
+            elif file is not None:
                 reason = ("已与文件卡片图标区关联" if span in file.icon_evidence else "已与文件卡片字段关联")
                 dispositions[pos] = OcrDisposition(span, "MEDIA", index, index, reason)
             elif kind == "IMAGE":
@@ -535,7 +592,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                 reason = ("容器触及视口，正文可能截断" if item.clipped else
                           "OCR 置信度不足或容器类型未确认")
                 dispositions[pos] = OcrDisposition(span, "UNASSIGNED", None, index, reason, True)
-    return MessageAnalysis(tuple(results), tuple(dispositions), anchors, containers, masks)
+    return MessageAnalysis(tuple(results), tuple(dispositions), anchors, containers, masks, tuple(diagnostics))
 
 
 def classify_messages(pixels: np.ndarray, region: Box, containers: tuple[Container, ...],

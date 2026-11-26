@@ -58,9 +58,11 @@ class StoreTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "visual.sqlite3"
         self.store = VisualStore(self.path)
 
-    def test_path_defaults_to_local_app_data_outside_the_repo(self):
+    def test_path_uses_runtime_even_if_localappdata_changes(self):
+        from autoim.runtime_paths import runtime_paths
         with patch.dict("os.environ", {"LOCALAPPDATA": str(self.path.parent)}):
-            self.assertEqual(database_path(), self.path.parent / "AutoIM" / "wecom-visual.sqlite3")
+            self.assertEqual(database_path(), runtime_paths().formal_db)
+            self.assertNotEqual(database_path(), self.path.parent / "AutoIM" / "wecom-visual.sqlite3")
 
     def test_schema_and_transaction_commit(self):
         with self.store.transaction() as db:

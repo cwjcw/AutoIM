@@ -116,6 +116,7 @@ class ContactObservation:
     divider_y: tuple[int, ...] = ()
     highlight_box: Box | None = None
     name_threshold: float | None = None
+    viewport_boundary: str = "FULL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,8 +195,8 @@ def _badge(pixels: np.ndarray, avatar: Box, row: Box, unit: float,
     return hits[0] if len(hits) == 1 else None
 
 
-def recover_b2_start(layout, pixels, unit, thresholds):
-    """Reject an automatic B1 seam that cuts off a corroborated early unread row."""
+def recover_b2_start(layout, pixels, unit, thresholds, *, read_text=None):
+    """Recover a complete first row hidden by an automatic B1 seam."""
     b1, b2, c1 = (layout.get(part) for part in ("B1", "B2", "C1"))
     if (not b1 or not b2 or not c1 or b2.top <= c1.bottom + 20 * unit
             or any("人工" in part.evidence for part in layout.regions if part.name in ("B1", "B2"))):
@@ -215,13 +216,31 @@ def recover_b2_start(layout, pixels, unit, thresholds):
         return layout
     start = max(c1.bottom, start)
     early = Box(b2.left, start, b2.right, round((first.center[1] + second.center[1]) / 2))
-    if early.bottom <= early.top or not _badge(pixels, first, early, unit, thresholds):
+    if early.bottom <= early.top or early.height < pitch * .85 or first.top <= early.top + 1:
         return layout
+    reason = "首行头像、红色未读徽标与后续行距交叉确认"
+    if not _badge(pixels, first, early, unit, thresholds):
+        if start - c1.bottom <= .12 * pitch:
+            start = c1.bottom
+            early = replace(early, top=start)
+        dividers = divider_rows(pixels, search, unit)
+        if not read_text or not any(abs(y - early.bottom) <= .12 * pitch for y in dividers):
+            return layout
+        spans = [span for span in read_text(pixels, early) if span.score >= thresholds.text_score
+                 and early.contains(span.box.center) and span.box.top > early.top and span.box.bottom < early.bottom]
+        split = early.left + early.width * .65
+        names = [span for span in spans if first.right < span.box.left < split and span.box.center[1] < first.center[1]]
+        name, _ = name_line(names)
+        preview = any(first.right < span.box.left < split and span.box.center[1] >= first.center[1] for span in spans)
+        time = any(span.box.left >= split and activity_text(span.text) for span in spans)
+        if not (name and not parse_visual_name(" ".join(span.text for span in name)).issue and preview and time):
+            return layout
+        reason = "首行头像、完整名称、预览、活动时间和连续分隔线交叉确认"
     height, width = pixels.shape[:2]
     adjusted = {"B1": replace(b1, bottom=start), "B2": replace(b2, top=start)}
     return replace(layout, regions=tuple(
         replace(item, box=adjusted[item.name], normalized=adjusted[item.name].relative(width, height),
-                evidence="首行头像、红色未读徽标与后续行距交叉确认")
+                evidence=reason)
         if item.name in adjusted else item for item in layout.regions))
 
 
@@ -552,6 +571,8 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                          and all(item.box.top > region.top and item.box.bottom < region.bottom
                                  and item.box.right < region.right - tolerance for item in good_names))
         status = "PARTIALLY_VISIBLE" if partial else "CANDIDATE" if reliable_name else "NAME_UNCERTAIN"
+        boundary = ("CLIPPED_IDENTIFIABLE" if partial and reliable_name and (avatar or time_anchor) else
+                    "CLIPPED_UNRELIABLE" if partial else "FULL" if reliable_name else "UNRESOLVED")
         kind = _contact_kind(parsed_name.display_name)
         if multi_feature and kind == "FOLDED_CHAT_CONTAINER" and raw_name.strip() != "折叠的聊天":
             kind = "CONTACT"
@@ -593,7 +614,7 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                                           name_spans=picked, name_rejected=rejected, activity_span=activity,
                                           divider_y=tuple(line for line in lines if row.top - 2 <= line <= row.bottom + 2),
                                           highlight_box=highlight if i == selected else None,
-                                          name_threshold=thresholds.text_score))
+                                          name_threshold=thresholds.text_score, viewport_boundary=boundary))
     if diagnostics is not None:
         for span in spans:
             if span not in used:

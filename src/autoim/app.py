@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QThreadPool, Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QGuiApplication
@@ -32,6 +31,8 @@ from PySide6.QtWidgets import (
 )
 
 from autoim import __version__
+from autoim.runtime_paths import runtime_paths
+from autoim.runtime_storage import maintenance_status
 from autoim.automation.clipboard import ClipboardSnapshot
 from autoim.calibration import CalibrationStore
 from autoim.clipboard_diagnostics import run_manual_copy_test, update_manual_copy_report
@@ -48,7 +49,6 @@ from autoim.vision import (
 from autoim.vision_widgets import ScreenshotSelectionDialog
 from autoim.workers import ClientInfo, FunctionWorker, detect_wecom, refresh_wecom_status, scan_uia_tree
 
-ROOT = Path(__file__).resolve().parents[2]
 REAL_COPY_ENABLED = False  # Re-enable only after the user completes a fresh WeCom calibration acceptance.
 
 
@@ -89,7 +89,8 @@ class MainWindow(QMainWindow):
         self._workers: set[FunctionWorker] = set()
         self.client: ClientInfo | None = None
         self._status_refresh_running = False
-        self.calibration = CalibrationStore(ROOT / "config" / "wecom-calibration.json")
+        self.paths = runtime_paths()
+        self.calibration = CalibrationStore(self.paths.config / "wecom-calibration.json")
         self._last_capture: WindowCapture | None = None
         self._pending_region: dict | None = None
         self.setWindowTitle("AutoIM")
@@ -103,7 +104,7 @@ class MainWindow(QMainWindow):
         self.status_timer.start()
 
     def _build_ui(self) -> None:
-        self.settings = QSettings("AutoIM", "AutoIM")
+        self.settings = QSettings(str(self.paths.config / "settings.ini"), QSettings.Format.IniFormat)
         page, layout = self._page_shell("AutoIM", "企业微信消息采集")
         layout.setContentsMargins(28, 22, 28, 22)
         layout.setSpacing(12)
@@ -161,7 +162,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.scan_button); scan.addLayout(controls)
         self.scan_progress = QProgressBar(); self.scan_progress.setTextVisible(False); self.scan_progress.setMaximumHeight(6); self.scan_progress.hide()
         scan.addWidget(self.scan_progress)
-        self.scan_output = QPlainTextEdit(); self.scan_output.setReadOnly(True); self.scan_output.setPlaceholderText("扫描结果将在此显示，并写入 outputs/wecom-uia-tree.txt")
+        self.scan_output = QPlainTextEdit(); self.scan_output.setReadOnly(True); self.scan_output.setPlaceholderText("扫描结果将在此显示，并写入 runtime/diagnostics/wecom-uia-tree.txt")
         self.scan_output.setMinimumHeight(190)
         scan.addWidget(self.scan_output)
         layout.addWidget(scan_panel, 1)
@@ -178,11 +179,11 @@ class MainWindow(QMainWindow):
         self.diag_button = QPushButton("开始多后端诊断"); self.diag_button.setObjectName("primaryButton"); self.diag_button.clicked.connect(self.start_multi_backend_diagnostics); params.addWidget(self.diag_button)
         diag.addLayout(params)
         self.diag_progress = QProgressBar(); self.diag_progress.setTextVisible(False); self.diag_progress.setMaximumHeight(6); self.diag_progress.hide(); diag.addWidget(self.diag_progress)
-        self.diag_output = QPlainTextEdit(); self.diag_output.setReadOnly(True); self.diag_output.setPlaceholderText("诊断汇总将显示于此，并保存到 outputs/uia-diagnostics/summary.txt"); self.diag_output.setMinimumHeight(260); diag.addWidget(self.diag_output)
+        self.diag_output = QPlainTextEdit(); self.diag_output.setReadOnly(True); self.diag_output.setPlaceholderText("诊断汇总将显示于此，并保存到 runtime/diagnostics/uia-diagnostics/summary.txt"); self.diag_output.setMinimumHeight(260); diag.addWidget(self.diag_output)
         layout.addWidget(diagnostics_panel)
 
         self.visual_capture_panel = VisualCapturePanel(
-            ROOT / "config" / "wecom-pc-visual-calibration-v12.json", self._run_worker, settings=self.settings)
+            self.paths.config / "wecom-pc-visual-calibration-v12.json", self._run_worker, settings=self.settings)
         layout.addWidget(self.visual_capture_panel)
 
         parse_panel = QFrame(); parse_panel.setObjectName("panel")
@@ -407,7 +408,7 @@ class MainWindow(QMainWindow):
         self.scan_button.setEnabled(False)
         self.scan_progress.setRange(0, 0); self.scan_progress.show()
         depth = self.depth.value()
-        path = ROOT / "outputs" / "wecom-uia-tree.txt"
+        path = self.paths.diagnostics / "wecom-uia-tree.txt"
         logging.info("开始 UIA 扫描，最大深度 %d", depth)
         self._run_worker(scan_uia_tree, self.client.hwnd, depth, path, on_result=self.scan_finished)
 
@@ -424,7 +425,7 @@ class MainWindow(QMainWindow):
             "class_name": self.client.class_name,
         }
         depth, limit, timeout = self.diag_depth.value(), self.diag_limit.value(), self.diag_timeout.value()
-        output_dir = ROOT / "outputs" / "uia-diagnostics"
+        output_dir = self.paths.diagnostics / "uia-diagnostics"
         self.diag_output.setPlainText("正在依次执行 4 种 backend；每种 backend 都有独立超时保护…")
         logging.info("开始 UIA 多后端诊断：depth=%d, controls=%d, timeout=%ds", depth, limit, timeout)
         self._run_worker(run_multi_backend_diagnostics, client, depth, limit, timeout, output_dir,
@@ -639,8 +640,8 @@ class MainWindow(QMainWindow):
         self.clip_message_classification.setCurrentIndex(0)
         self.clip_unrelated_classification.setCurrentIndex(0)
         contact_name = self.clip_contact_name.text().strip()
-        output_path = ROOT / "outputs" / "clipboard-diagnostics.txt"
-        summary_path = ROOT / "outputs" / "clipboard-diagnostics-summary.txt"
+        output_path = self.paths.diagnostics / "clipboard-diagnostics.txt"
+        summary_path = self.paths.diagnostics / "clipboard-diagnostics-summary.txt"
         self.clip_output.setPlainText("将依次执行 Ctrl+C 与 Ctrl+A + Ctrl+C，请稍候…")
         save_body = self.save_body_checkbox.isChecked()
         self._run_worker(lambda: run_manual_copy_test(contact_name, output_path, summary_path, save_body=save_body),
@@ -877,7 +878,7 @@ class MainWindow(QMainWindow):
         )
         self.plan_output.setPlainText(f"已完成用户点选消息的一次正常复制。\n截图点：{result['point']}\nClipboard 是否变化：{'是' if result['changed'] else '否'}\nSHA256：{result['sha256']}")
         if text and self.save_body_checkbox.isChecked():
-            path = ROOT / "outputs" / "vision-diagnostics" / "copied-message.txt"
+            path = self.paths.diagnostics / "vision-diagnostics" / "copied-message.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
             logging.info("开发诊断正文已按用户选择保存到 %s", path)
@@ -958,13 +959,30 @@ def main() -> int:
     app.setApplicationName("AutoIM")
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(STYLESHEET)
+    paths = runtime_paths()
+    initialization = paths.initialize()
+    preferences = paths.config / "settings.ini"
+    if not preferences.is_file():
+        legacy = QSettings("AutoIM", "AutoIM")
+        settings = QSettings(str(preferences), QSettings.Format.IniFormat)
+        for key in legacy.allKeys():
+            settings.setValue(key, legacy.value(key))
+        settings.sync()
     bus = LogBus()
     setup_logging(bus)
+    runtime = CollectionRuntime()
     window = MainWindow(bus)
     window.show()
     collection = window.visual_capture_panel.collection_panel
-    runtime = CollectionRuntime()
     collection.enable_runtime(runtime)
+    runtime.emit("app", "", "APP", "RUNTIME_INITIALIZED", details={**paths.status(), "state": initialization})
+
+    def report_maintenance(result):
+        collection.persistence_status = result
+        runtime.emit("app", "", "APP", "RUNTIME_MAINTENANCE", details=result)
+
+    window._run_worker(lambda: maintenance_status(paths), on_result=report_maintenance,
+                       on_error=lambda _: report_maintenance({"backup": "FAILED", "reason": "RUNTIME_MAINTENANCE_FAILED"}))
     collection.bind_hotkey(window)
     if collection.mode_select.currentData() == "production":
         QTimer.singleShot(0, collection, collection.identify_account)

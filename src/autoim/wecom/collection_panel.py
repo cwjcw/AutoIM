@@ -21,6 +21,7 @@ from autoim.wecom.collection_bubble import CollectionBubble
 from autoim.wecom.collection_core import failure_crop_directory
 from autoim.wecom.collection_notifications import CollectionNotifier
 from autoim.wecom.collection_hotkey import CollectionHotkey
+from autoim.runtime_paths import runtime_paths
 from autoim.wecom.collection_runtime import PC_VERSION, safe_reason
 from autoim.wecom.collection_service import CollectionScope, CollectionService, ScanStatus
 from autoim.wecom.visual_diagnostics import DiagnosticCopyControls
@@ -235,6 +236,7 @@ class VisualCollectionPanel(QWidget):
         self._hotkey = None
         self._shortcut = "F10"
         self.runtime = None
+        self.persistence_status = {}
         self._last_detection = ""
         self._stop_source = "control"
         self._pending_assist = None
@@ -413,6 +415,15 @@ class VisualCollectionPanel(QWidget):
             history.addWidget(button)
         history.addStretch(1)
         advanced.addLayout(history)
+        paths = runtime_paths()
+        locations = QHBoxLayout()
+        for label, path in (("数据目录", paths.root), ("诊断目录", paths.diagnostics), ("备份目录", paths.backups),
+                            ("隔离库位置", paths.isolated_db.parent), ("待保存位置", paths.pending)):
+            button = QPushButton(label)
+            button.setToolTip(str(path))
+            button.clicked.connect(lambda _, directory=path: self._open_runtime_location(directory))
+            locations.addWidget(button)
+        advanced.addLayout(locations)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
@@ -606,6 +617,11 @@ class VisualCollectionPanel(QWidget):
             layout.addLayout(choices)
         dialog.show()
 
+    @staticmethod
+    def _open_runtime_location(directory):
+        if directory.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
     def _open_logs(self):
         if self.runtime:
             self.runtime.root.mkdir(parents=True, exist_ok=True)
@@ -647,7 +663,7 @@ class VisualCollectionPanel(QWidget):
         if not accepted:
             return
         filename, _ = QFileDialog.getSaveFileName(self, "导出诊断 ZIP",
-                                                 f"AutoIM-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip",
+                                                 str(runtime_paths().diagnostics / f"AutoIM-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"),
                                                  "诊断 ZIP (*.zip)")
         if not filename:
             return
@@ -659,7 +675,7 @@ class VisualCollectionPanel(QWidget):
                     "stop_reason": state.stop_reason, "contacts": state.contact_count,
                     "unread": state.unread_marker_count, "storage_state": state.storage_state,
                     "storage_pending": state.storage_pending, "storage_invalid": state.storage_invalid,
-                    "storage_recovered": state.storage_recovered}
+                    "storage_recovered": state.storage_recovered, "persistence": self.persistence_status}
         if state.core:
             core = state.core
             snapshot["core"] = {"phase": core.phase, "clicks": core.clicks, "verified": core.verified,

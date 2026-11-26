@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 from collections import OrderedDict
+from autoim.runtime_paths import runtime_paths
+from autoim.runtime_storage import database_role, mark_database, protect_database, protect_schema_upgrade
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -87,8 +88,7 @@ _MIGRATIONS = {
 
 
 def database_path() -> Path:
-    base = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else Path.home() / "AppData" / "Local"
-    return base / "AutoIM" / "wecom-visual.sqlite3"
+    return runtime_paths().formal_db
 
 
 def _now() -> str:
@@ -146,6 +146,8 @@ class _LiveBaseline:
 class VisualStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or database_path()
+        self._paths = runtime_paths()
+        self._role = database_role(self._paths, self.path)
         self._lock = RLock()
         self._ready = False
         self._live: OrderedDict[str, _LiveBaseline] = OrderedDict()
@@ -154,6 +156,10 @@ class VisualStore:
     @contextmanager
     def transaction(self, *, timeout=4, before_commit=None, durable=False):
         with self._lock:
+            if self._role:
+                protect_database(self._paths, self._role)
+                if not self._ready:
+                    protect_schema_upgrade(self._paths, self._role, SCHEMA_VERSION)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with closing(sqlite3.connect(self.path, timeout=timeout, isolation_level=None)) as db:
                 db.row_factory = sqlite3.Row
@@ -175,6 +181,8 @@ class VisualStore:
                     raise
                 else:
                     self._ready = True
+                    if self._role:
+                        mark_database(self._paths, self._role)
 
     @staticmethod
     def _migrate(db: sqlite3.Connection) -> None:

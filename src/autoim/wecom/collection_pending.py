@@ -10,12 +10,17 @@ import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+
+from autoim.runtime_paths import runtime_paths
+from autoim.runtime_storage import (RuntimeDataError, backup_runtime, config_backup_sources,
+                                    database_role, mark_database, protect_database)
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
 from autoim.wecom.collection_core import CoreAnalysis, CoreMessage
-from autoim.wecom.collection_incremental import CoreAccount, DefaultAccountConflict, SaveVisible, attach_times, save_visible
+from autoim.wecom.collection_incremental import (CoreAccount, DefaultAccountConflict, SaveVisible, attach_times,
+                                                bind_core_account, core_accounts, save_visible, validate_core_account)
 from autoim.wecom.visual_files import FileCardObservation
 from autoim.wecom.visual_layout import Box
 from autoim.wecom.visual_ocr import TextSpan
@@ -37,6 +42,8 @@ def saving_reason(error):
     if isinstance(error, sqlite3.Error):
         code = getattr(error, "sqlite_errorname", None)
         return code or "SQLITE_UNAVAILABLE"
+    if isinstance(error, RuntimeDataError):
+        return str(error)
     if isinstance(error, OSError):
         return "LOCAL_IO_FAILED"
     return type(error).__name__
@@ -70,21 +77,12 @@ class _RollbackProbe(Exception):
     pass
 
 
-def _core_accounts(db):
-    return db.execute("""SELECT profile,login_name,email,identity_status FROM accounts
-        WHERE profile LIKE 'CORE-LOCAL-%' OR identity_status='LOCAL_DEFAULT_UNVERIFIED'""").fetchall()
-
-
 def probe_store(store, account, check):
     """Exercise schema, identity and a real write, with no business side effects."""
     check()
     try:
         with store.transaction(timeout=.45) as db:
-            rows = _core_accounts(db)
-            if rows and (len(rows) != 1 or rows[0]["profile"] != account.profile
-                         or rows[0]["identity_status"] != "LOCAL_DEFAULT_UNVERIFIED"
-                         or name_key(rows[0]["login_name"] or "") != name_key(account.name)):
-                raise SavingBlocked("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+            validate_core_account(db, account)
             for table in ("conversations", "messages", "message_observations"):
                 db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
             db.execute("CREATE TABLE core_pending_write_probe (id INTEGER)")
@@ -100,37 +98,52 @@ class PersistentAccount:
         self.path = Path(path)
         self.backup = self.path.with_name("core-default-account.backup.json")
 
-    def _from_database(self, store):
+    def _database_account(self, store):
         if not store.path.is_file():
             return None
-        # Inspect only. In particular, an old hash with no email cannot
-        # reconstruct the original account and is never used as a guess.
         with closing(sqlite3.connect(store.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.45)) as db:
             db.row_factory = sqlite3.Row
             if not db.execute("SELECT 1 FROM sqlite_master WHERE name='accounts' AND type='table'").fetchone():
                 return None
-            rows = _core_accounts(db)
-        if len(rows) != 1:
-            return None
-        row = rows[0]
-        if (row["identity_status"] != "LOCAL_DEFAULT_UNVERIFIED" or not row["email"] or not row["login_name"]):
-            return None
-        account = CoreAccount(row["login_name"], row["email"])
-        return account if account.profile == row["profile"] else None
+            rows = core_accounts(db)
+        if len(rows) > 1:
+            raise SavingBlocked("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+        return dict(rows[0]) if rows else None
 
     def ensure(self, store, check, *, supplied=None):
+        check()
+        paths = runtime_paths()
         primary, backup = CoreAccount.inspect(self.path), CoreAccount.inspect(self.backup)
-        verified = {account for account in (primary.account, backup.account, supplied) if account}
-        if len(verified) > 1:
+        candidates = [(primary.account, "PRIMARY"), (backup.account, "BACKUP"), (supplied, "SUPPLIED")]
+        if self.path == paths.account and not any(account for account, _ in candidates):
+            candidates.extend((CoreAccount.load(file), "HISTORICAL_BACKUP") for file in config_backup_sources(paths))
+        if len({(candidate.profile, name_key(candidate.name)) for candidate, _ in candidates if candidate}) > 1:
             raise SavingBlocked("DEFAULT_ACCOUNT_LOCAL_COPY_CONFLICT")
-        account = next(iter(verified), None)
-        source = "PRIMARY" if primary.account else "BACKUP" if backup.account else "SUPPLIED"
-        if account is None:
-            account = self._from_database(store)
-            source = "ISOLATED_DATABASE"
-        if account is None:
+        try:
+            row = self._database_account(store)
+        except sqlite3.Error:
+            # A verified local configuration can be restored while the database
+            # is unavailable. Readiness still independently blocks navigation.
+            row = None
+        if row and row["email"]:
+            from autoim.wecom.collection_profile import normalize_email
+            email = normalize_email(row["email"])
+            if not email or not row["login_name"]:
+                raise SavingBlocked("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+            recovered = CoreAccount(row["login_name"], email)
+            if row["profile"] != recovered.profile or row["identity_status"] != "LOCAL_DEFAULT_UNVERIFIED":
+                raise SavingBlocked("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+            candidates.append((recovered, "ISOLATED_DATABASE"))
+        populated = [(account, source) for account, source in candidates if account]
+        if not populated:
             raise SavingBlocked(primary.reason)
-        probe_store(store, account, check)
+        account, source = populated[0]
+        if len({(candidate.profile, name_key(candidate.name)) for candidate, _ in populated}) != 1:
+            raise SavingBlocked("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+        if row and (row["profile"] != account.profile or row["identity_status"] != "LOCAL_DEFAULT_UNVERIFIED"
+                    or name_key(row["login_name"] or "") != name_key(account.name)):
+            raise SavingBlocked("DEFAULT_ACCOUNT_DATABASE_CONFLICT")
+        changed = primary.account is None or backup.account is None
         if backup.account is None:
             check()
             _atomic_config(self.backup, account)
@@ -139,6 +152,14 @@ class PersistentAccount:
             _atomic_config(self.path, account)
         if CoreAccount.load(self.path) != account or CoreAccount.load(self.backup) != account:
             raise SavingBlocked("DEFAULT_ACCOUNT_WRITE_VALIDATION_FAILED")
+        if changed and self.path == paths.account:
+            backup_runtime(paths, "config", roles=set(), budget=4)
+        probe_store(store, account, check)
+        if row and row["email"] != account.email:
+            if self.path == paths.account:
+                backup_runtime(paths, "before-account-backfill", roles={"isolated"}, budget=8)
+            with store.transaction(timeout=.45, before_commit=check, durable=True) as db:
+                bind_core_account(db, account, datetime.now(timezone.utc).isoformat())
         return account, source
 
     def check(self, expected):
@@ -177,6 +198,8 @@ class PendingBatch:
 
     def encode(self):
         data = asdict(self)
+        if not self.analysis.viewport_limits:
+            data["analysis"].pop("viewport_limits")
         for field in ("captured_at", "created_at"):
             data[field] = data[field].isoformat()
         return _json(data)
@@ -191,6 +214,7 @@ class PendingBatch:
         analysis = data["analysis"]
         analysis["messages"] = tuple(_decode_message(msg) for msg in analysis["messages"])
         analysis["gaps"] = tuple(analysis["gaps"])
+        analysis["viewport_limits"] = tuple(analysis.get("viewport_limits", ()))
         data["analysis"], data["evidence_ids"] = CoreAnalysis(**analysis), tuple(data["evidence_ids"])
         batch = cls(**data)
         batch.validate()
@@ -239,9 +263,13 @@ class PendingCollections:
     def __init__(self, path, *, capacity=64 * 1024 * 1024, retention_days=14):
         self.path = Path(path)
         self.capacity, self.retention_days = capacity, retention_days
+        self._paths = runtime_paths()
+        self._managed = database_role(self._paths, self.path) == "pending"
 
     @contextmanager
     def _transaction(self):
+        if self._managed:
+            protect_database(self._paths, "pending")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path, timeout=.45, isolation_level=None)) as db:
             db.row_factory = sqlite3.Row
@@ -256,6 +284,8 @@ class PendingCollections:
                     last_error TEXT, finished_at TEXT, retry_after TEXT)""")
                 yield db
                 db.commit()
+                if self._managed:
+                    mark_database(self._paths, "pending")
             except BaseException:
                 db.rollback()
                 raise

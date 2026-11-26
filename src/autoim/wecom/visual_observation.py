@@ -100,6 +100,7 @@ class MessageCandidateObservation:
     right_distance: float | None
     parsed_sequence: int | None
     reason: str = ""
+    visual: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,8 +358,6 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
     pixels = frame.pixels
     layout = detect_layout(pixels, calibration, thresholds)
     unit = max(.65, min(frame.state.dpi / 96, 3.0))
-    if message_gate is not None and not history_only:
-        layout = recover_b2_start(layout, pixels, unit, thresholds)
     a, b1, b2, c1, c2, c3 = (layout.get(name) for name in ("A", "B1", "B2", "C1", "C2", "C3"))
     search, add = _toolbar_controls(pixels, b1) if b1 else (None, None)
     hover = next((item.name for item in layout.regions if item.name not in ("B", "C")
@@ -373,6 +372,11 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
             ocr_status, ocr_reason = "FAILED", str(exc)
             warnings.append(ocr_reason)
     trace = _ObservedReader(reader)
+    if (multi_feature or message_gate is not None) and not history_only:
+        layout = recover_b2_start(layout, pixels, unit, thresholds,
+                                  read_text=lambda image, area: trace.read_region("B2 边界核对", image, area))
+        b1, b2 = layout.get("B1"), layout.get("B2")
+        search, add = _toolbar_controls(pixels, b1) if b1 else (None, None)
     title_spans = ()
     if c1 and not contacts_only:
         trace.region = "C1 标题"
@@ -450,17 +454,18 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
             context = tuple(item.span for item in dispositions if item.kind in ("TIME", "SYSTEM", "UNASSIGNED"))
         by_box = {item.box: item for item in messages}
         observations = []
-        for container in analysis.containers:
+        for container, candidate in zip(analysis.containers, analysis.candidate_evidence, strict=True):
             _, left, right = direction_evidence(container.box, c2, anchors, thresholds)
             item = by_box.get(container.box)
-            reason = (item.status if item else
+            reason = (candidate["reason"] if candidate["classification"] == "BACKGROUND_NOISE" else
+                      item.status if item else
                       "颜色轮廓近似头像，缺少可归属 OCR 证据" if container.needs_text else
                       "未通过消息分类或页面校验")
             observations.append(MessageCandidateObservation(
-                container, item.direction if item else "UNKNOWN", left, right, item.sequence if item else None, reason))
+                container, item.direction if item else "UNKNOWN", left, right, item.sequence if item else None, reason, candidate))
         candidates = tuple(observations)
         if (any(item.possible_message for item in dispositions)
-                or any(item.status != "CANDIDATE" for item in messages)
+                or any(item.status != "CANDIDATE" and item.viewport_limit != "TOP_VIEWPORT_CLIPPED" for item in messages)
                 or any(step.status == "FAILED" for step in trace.observations if step.region.startswith("C2"))):
             completeness = "VISIBLE_MESSAGES_INCOMPLETE"
             warnings.append("存在未能确认或归属的可见正文，详见 C2 文字归属。")

@@ -64,7 +64,7 @@ def contact_scan(raw, targets, scan, blocked):
             decision, reason = "NAVIGATION_BLOCKED", blocked
         activity = row.activity_span
         rows.append({"row": row.sequence, "box": rect(row.box), "position_reliable": row.geometry_reliable,
-                     "row_pitch": row.row_pitch, "boundary_source": row.boundary_source,
+                     "row_pitch": row.row_pitch, "boundary_source": row.boundary_source, "viewport_boundary": row.viewport_boundary,
                      "raw_name": row.raw_name, "full_display_name": row.display_name, "base_name": base,
                      "identity_labels": row.identity_labels, "key": key, "name_reliable": row.name_reliable,
                      "name_issue": row.name_issue, "name_threshold": row.name_threshold,
@@ -143,7 +143,7 @@ def message_evidence(raw, messages, *, body=True):
             "possible_message": item.possible_message} for item in raw.message_ocr]
     containers = [{ "box": rect(item.container.box), "direction": item.direction,
                     "clipped": item.container.clipped, "reason": item.reason,
-                    "method": item.container.method, "source": item.container.source} for item in raw.candidates]
+                    "method": item.container.method, "source": item.container.source, "visual": item.visual} for item in raw.candidates]
     boxes.extend((item["box"], "CONTAINER " + item["direction"]) for item in containers)
     return {"messages": records, "ocr": ocr, "containers": containers,
             "completeness": raw.message_completeness}, boxes
@@ -339,6 +339,8 @@ def _html(report, contacts, records, manifest, events):
                              for region in item["regions"] for role, path in region["included"].items())
                      + "</figure>" for item in manifest if item.get("regions"))
     body = "<h1>AutoIM 视觉识别诊断</h1>" + f'<p>{e(report["version"])} · {e(report["git"])} · {e(report["detection"])}</p>'
+    body += "<h2>运行版本</h2>" + table(("来源", "版本证据"),
+                    [("应用启动", report.get("execution")), ("导出时仓库", report.get("export_git"))])
     body += "<h2>本轮摘要</h2>" + table(("时间", "阶段", "事件", "任务", "结果", "细节"),
          [(x["time"], x["stage"], x["code"], x["task"], x["result"], x["details"]) for x in counts])
     body += "<h2>未读统计</h2>" + table(("扫描", "截图时间", "统计"),
