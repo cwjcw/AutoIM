@@ -283,7 +283,8 @@ def detect_global_unread(pixels: np.ndarray, area: Box, reader: TextRecognizer,
             and .7 <= box.width / box.height <= 3.5 and box.bottom < roi.height
             and box.top > 0 and box.crop(mask).mean() >= .44]
     if len(hits) != 1:
-        return GlobalUnreadObservation(entry, global_unread_visible=False if not hits else None,
+        possible = np.count_nonzero(mask) >= max(6, round((entry.height * .30) ** 2))
+        return GlobalUnreadObservation(entry, global_unread_visible=False if not hits and not possible else None,
                                        evidence=f"消息入口右侧红色徽标候选 {len(hits)} 个")
     badge = hits[0]
     value, reliable = _badge_number(pixels, badge, reader, thresholds)
@@ -426,6 +427,23 @@ def _contact_kind(name: str) -> str:
     return "CONTACT"
 
 
+def _inside_avatar_art(item, avatars, unit):
+    for avatar in avatars:
+        box = item.box
+        if not (avatar.top + avatar.height * .28 <= box.center[1] <= avatar.bottom):
+            continue
+        near = [other for other in avatars if other != avatar
+                and abs(other.center[1] - avatar.center[1]) < 170 * unit
+                and other.left <= avatar.center[0] <= other.right]
+        lane_right = np.median([other.right for other in near]) if len(near) >= 2 else avatar.right
+        if (box.left >= avatar.left and box.bottom <= avatar.bottom + round(unit)
+                and (box.right <= avatar.right or item.kind == "UNKNOWN_RED"
+                     and box.right <= lane_right + unit
+                     and box.center[1] > avatar.top + avatar.height * .55)):
+            return True
+    return False
+
+
 def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
                     unit: float, thresholds: VisualThresholds,
                     diagnostics: list[ContactTextDiagnostic] | None = None, *, multi_feature=False,
@@ -433,11 +451,9 @@ def detect_contacts(pixels: np.ndarray, region: Box, reader: TextRecognizer,
     badges = unread_badges(pixels, region, unit, thresholds.badge_red_delta,
                           rejected=badge_rejections) if multi_feature else ()
     avatars = _avatars(pixels, region, unit)
-    avatar_art = tuple(item for item in badges if any(
-        avatar.left < item.box.left and item.box.right < avatar.right
-        and avatar.top < item.box.top and item.box.bottom < avatar.bottom for avatar in avatars))
+    avatar_art = tuple(item for item in badges if _inside_avatar_art(item, avatars, unit))
     if badge_rejections is not None:
-        badge_rejections.extend(replace(item, kind="NON_BADGE", reason="紧凑红区完全位于头像内")
+        badge_rejections.extend(replace(item, kind="NON_BADGE", reason="头像下部红色图案，与角标位置不符")
                                 for item in avatar_art)
     badges = tuple(item for item in badges if item not in avatar_art)
     highlight = _highlight_row(pixels, region, unit)

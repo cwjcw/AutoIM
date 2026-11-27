@@ -230,7 +230,10 @@ class WeComWindowManager:
                     "dpi": health.last.dpi if health.last else None,
                     "iconic": health.last.iconic if health.last else None,
                     "zoomed": health.last.zoomed if health.last else None, "foreground": health.foreground,
-                    "geometry": health.geometry}
+                    "geometry": health.geometry, "placement": health.last.placement if health.last else None,
+                    "remote": health.last.desktop.remote if health.last and health.last.desktop else None,
+                    "monitor": health.last.desktop.monitor_rect if health.last and health.last.desktop else None,
+                    "dwm_rect": health.last.desktop.frame_physical if health.last and health.last.desktop else None}
         report("WINDOW_LOCATED", "AUTO_PASS" if first.identity else "FAILED", details=facts(first))
         if first.status not in {"WINDOW_VALID", "WINDOW_NOT_FOREGROUND", "WINDOW_MINIMIZED"} or not first.identity:
             return first
@@ -244,54 +247,70 @@ class WeComWindowManager:
             show_window.argtypes = (wintypes.HWND, wintypes.INT)
             show_window.restype = wintypes.BOOL
 
-        def checked():
+        def checked(*, settling=False):
             check()
             current = probe()
-            if (current.identity != original or current.status not in
+            if (current.identity != original or not settling and current.status not in
                     {"WINDOW_VALID", "WINDOW_NOT_FOREGROUND", "WINDOW_MINIMIZED"}):
                 raise WindowResolutionError("窗口准备期间 HWND、PID、进程生命周期或状态已变化")
             return current
 
-        def change(action):
+        def change(code, action, verified, method):
+            from time import monotonic
+            started = monotonic()
+
             def guarded():
                 current = checked()
                 check()
-                action(current.window.hwnd)
+                returned = action(current.window.hwnd)
+                report(code + "_REQUESTED", "", details={"method": method, "return": returned, "before": facts(current)})
             perform(guarded, scroll=False)
-            wait()
-            return checked()
+            observed = None
+            for attempt in range(6 if async_visibility else 1):
+                wait()
+                observed = checked(settling=True)
+                report(code + "_OBSERVED", "", details={"attempt": attempt + 1, "method": method,
+                      "elapsed_ms": round((monotonic() - started) * 1000), "observed": facts(observed)})
+                if verified(observed):
+                    break
+            return observed
 
-        def execute(code, previous, applicable, action, verified):
+        def execute(code, previous, applicable, action, verified, method):
             if not applicable:
                 report(code, "SKIPPED", details={"before": facts(previous), "executed": False})
                 return previous
             try:
-                observed = change(action)
-                if async_visibility and not verified(observed):
-                    wait()
-                    observed = checked()
+                observed = change(code, action, verified, method)
             except gui.error as exc:
                 report(code, "FAILED", details={"before": facts(previous), "executed": True,
                                                "reason": f"Win32 {type(exc).__name__} {getattr(exc, 'winerror', '')}"})
-                raise
+                observed = checked()
+                if code == "WINDOW_ACTIVATE" and not observed.foreground:
+                    raise WindowResolutionError("Windows 拒绝前台激活企业微信") from None
+                return observed
             report(code, "AUTO_PASS" if verified(observed) else "FAILED",
-                   details={"before": facts(previous), "after": facts(observed), "executed": True})
+                   details={"before": facts(previous), "after": facts(observed), "executed": True, "method": method})
             return observed
 
+        method = "ShowWindowAsync" if async_visibility else "ShowWindow"
+        restored = lambda state: state.status in ("WINDOW_VALID", "WINDOW_NOT_FOREGROUND") and not state.last.iconic
+        zoomed = lambda state: restored(state) and state.last.zoomed and state.last.show_command == 3
         current = execute("WINDOW_RESTORE", first, first.status == "WINDOW_MINIMIZED",
-                          lambda hwnd: show_window(hwnd, 9), lambda state: state.status != "WINDOW_MINIMIZED")
-        if current.status == "WINDOW_MINIMIZED":
+                          lambda hwnd: show_window(hwnd, 9), restored, method)
+        if not restored(current):
             return current
-        current = execute("WINDOW_MAXIMIZE", current, not current.last.zoomed
-                          and (not allow_restored or current.capture_blocker is not None),
-                          lambda hwnd: show_window(hwnd, 3), lambda state: state.last.zoomed)
-        try:
-            current = execute("WINDOW_ACTIVATE", current, current.status == "WINDOW_NOT_FOREGROUND" and not current.capture_blocker,
-                              gui.SetForegroundWindow, lambda state: state.foreground)
-        except gui.error:
-            current = checked()
-            if not current.foreground:
-                raise WindowResolutionError("Windows 拒绝前台激活，请手动切回企业微信") from None
+        current = execute("WINDOW_MAXIMIZE", current, not zoomed(current),
+                          lambda hwnd: show_window(hwnd, 3), zoomed, method)
+        if async_visibility and restored(current) and not zoomed(current):
+            current = execute("WINDOW_MAXIMIZE_SYSCOMMAND", current, True,
+                              lambda hwnd: gui.PostMessage(hwnd, 0x0112, 0xF030, 0),
+                              zoomed, "WM_SYSCOMMAND/SC_MAXIMIZE")
+        if not zoomed(current) and allow_restored and not current.capture_blocker:
+            report("WINDOW_MAXIMIZE_FALLBACK_RESTORED", "PARTIAL", details=facts(current))
+        if not zoomed(current) and not allow_restored:
+            raise WindowResolutionError("企业微信最大化未获 Windows 状态确认")
+        current = execute("WINDOW_ACTIVATE", current, current.status == "WINDOW_NOT_FOREGROUND" and not current.capture_blocker,
+                          gui.SetForegroundWindow, lambda state: state.foreground, "SetForegroundWindow")
         return current
 
     def get_rect(self) -> tuple[int, int, int, int]:

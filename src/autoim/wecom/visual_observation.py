@@ -476,7 +476,7 @@ def observe_frame(frame: VisualFrame, calibration: Mapping[str, NormalizedRect],
                 or any(step.status == "FAILED" for step in trace.observations if step.region.startswith("C2"))):
             completeness = "VISIBLE_MESSAGES_INCOMPLETE"
             warnings.append("存在未能确认或归属的可见正文，详见 C2 文字归属。")
-        elif any(item.kind in ("TEXT", "IMAGE", "FILE") for item in messages):
+        elif any(item.status == "CANDIDATE" for item in messages):
             completeness = "VISIBLE_MESSAGES_ACCOUNTED_FOR"
     if any(step.status == "FAILED" for step in trace.observations):
         warnings.append("部分 OCR 裁剪失败。其余区域结果已保留。")

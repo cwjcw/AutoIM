@@ -37,6 +37,7 @@ class VisibleMessageObservation:
     time_source: str = "GROUP_ANCHOR"
     method: str = "BUBBLE_FIRST"
     viewport_limit: str = ""
+    container_confirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +287,41 @@ def _file_candidates(containers: tuple[Container, ...], spans: tuple[TextSpan, .
     return files
 
 
+def _structured_card(pixels, region, item, spans, unit, thresholds):
+    box = item.box
+    if (not item.quiet_outline or not _in_message_lane(box, region, thresholds)
+            or box.width < 115 * unit or box.height < 49 * unit):
+        return None
+    inner = box.crop(pixels)
+    if _has_photo_texture(inner, thresholds):
+        return "IMAGE", "闭合边界内具有连续图片纹理"
+    anchored = sorted((span for span in spans if span.score >= thresholds.text_score
+                       and _association_score(span.box, box, unit) is not None
+                       and box.left <= span.box.left <= box.left + box.width * .19),
+                      key=lambda span: span.box.top)
+    if (len(anchored) < 2 or anchored[0].box.top > box.top + .36 * box.height
+            or anchored[-1].box.bottom - anchored[0].box.top < .31 * box.height):
+        return None
+    sample = inner[::3, ::3]
+    background = np.median(sample, axis=(0, 1))
+    uniform = float(np.mean(np.max(np.abs(sample - background), axis=2) <= 9))
+    if uniform < .57 or not any(np.max(np.abs(side - background)) >= 5
+                                for side in _bubble_surround(pixels, box, region, unit)):
+        return None
+    if (len(anchored) >= 3 and any("聊天记录" in span.text and span.box.top <= box.top + .49 * box.height
+                                   for span in anchored[:3])):
+        return "CHAT_HISTORY_CARD", "浅色闭合卡片、聊天记录标题与独立摘要列"
+    chroma = (np.ptp(inner, axis=2) >= 26).astype(np.uint8)
+    icons = [mark for mark in contours(chroma) if 5 * unit <= mark.width <= 28 * unit
+             and 5 * unit <= mark.height <= 28 * unit and mark.top >= box.height * .48
+             and mark.left < box.width * .18 and mark.crop(chroma).mean() >= .37]
+    if (icons and anchored[0].box.width >= box.width * .42
+            and any(span.box.width <= box.width * .34 and span.box.top >= box.top + box.height * .51
+                    for span in anchored[1:])):
+        return "LINK_CARD", "卡片标题与底部小图标、来源文字分区"
+    return "UNKNOWN", "浅色闭合卡片、独立文字列与连续背景，具体类型待确认"
+
+
 def _bubble_surround(pixels, box, region, unit):
     gap, reach = max(1, round(3 * unit)), max(3, round(13 * unit))
     rim = Box(max(region.left + gap, box.left - reach), max(region.top, box.top - reach),
@@ -489,18 +525,24 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                                                         time_like | centered_system | clipped_spans, unit, thresholds, capture_masks)
     attachment_spans = tuple(span for span in spans if span not in time_like)
     preliminary = _file_candidates(containers, attachment_spans, unit, thresholds.text_score) if page_verified else {}
+    structured = {item: found for item in containers if item.quiet_outline and item not in preliminary and page_verified
+                  and not any(not outer.quiet_outline and item.box != outer.box and _inside(item.box, outer.box)
+                              and outer.box.width * outer.box.height <= 3.5 * item.box.width * item.box.height
+                              for outer in containers)
+                  if (found := _structured_card(pixels, region, item, attachment_spans, unit, thresholds))}
+    owning_cards = (*preliminary, *structured)
     # Strong outer bounds own inner icon contours. Competing card-sized boxes
     # remain separate so the normal association check can flag ambiguous OCR.
-    containers = tuple(sorted((item for item in containers if item in preliminary or not any(
+    containers = tuple(sorted((item for item in containers if item in owning_cards or not any(
         item.box.width * item.box.height <= card.box.width * card.box.height * .62
-        and _inside(item.box, card.box) for card in preliminary)),
+        and _inside(item.box, card.box) for card in owning_cards)),
         key=lambda item: (item.box.top, item.box.left)))
     dispositions = []
     grouped: dict[int, list[int]] = {}
     times = []
     for span in spans:
         ranked = sorted(((score, index) for index, item in enumerate(containers, 1)
-                         if not item.quiet_outline or item in preliminary
+                         if not item.quiet_outline or item in owning_cards
                          if (score := _association_score(span.box, item.box, unit)) is not None),
                         reverse=True)
         nearest = min(range(1, len(containers) + 1),
@@ -509,7 +551,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                       default=None)
         centered = abs(span.box.center[0] - center) <= region.width * .12
         side_supported = any(_in_message_lane(containers[i-1].box, region, thresholds)
-                             and (containers[i-1] not in preliminary or _inside(span.box, containers[i-1].box))
+                             and (containers[i-1] not in owning_cards or _inside(span.box, containers[i-1].box))
                              for _, i in ranked)
         if span in time_like and not any(containers[i-1] not in preliminary
                                          and _in_message_lane(containers[i-1].box, region, thresholds)
@@ -547,7 +589,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             dispositions.append(OcrDisposition(span, "UNASSIGNED", None, nearest, reason, True))
     eligible = tuple(item for i, item in enumerate(containers, 1)
                      if (not item.needs_text or i in grouped) and _in_message_lane(item.box, region, thresholds)
-                     and (not item.quiet_outline or item in preliminary))
+                     and (not item.quiet_outline or item in owning_cards))
     anchors = content_anchors(eligible, region, pixels.shape[1], calibration, thresholds)
     results = []
     diagnostics = []
@@ -556,9 +598,9 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
         detail = {"width": box.width, "height": box.height, "ocr_count": len(grouped.get(index, ())),
                   "classification": "INSUFFICIENT_EVIDENCE", "reason": "PAGE_OR_CONTAINER_EVIDENCE_INSUFFICIENT"}
         diagnostics.append(detail)
-        if (not page_verified or (item.quiet_outline and item not in preliminary)
-                or (item.needs_text and index not in grouped and item not in preliminary)
-                or (not _in_message_lane(box, region, thresholds) and not item.clipped and item not in preliminary)):
+        if (not page_verified or (item.quiet_outline and item not in owning_cards)
+                or (item.needs_text and index not in grouped and item not in owning_cards)
+                or (not _in_message_lane(box, region, thresholds) and not item.clipped and item not in owning_cards)):
             continue
         positions = grouped.get(index, ())
         matching = tuple(dispositions[i].span for i in positions)
@@ -579,6 +621,10 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
         if file is not None:
             kind = "FILE" if file.parse_status == "COMPLETE" else "FILE_CANDIDATE"
             evidence.extend(file.failure_reasons or ("卡片内文件名和大小已读取，附件内容未读取",))
+        elif item in structured:
+            kind, reason = structured[item]
+            evidence.extend((reason, "只提取可见文字，未打开对象内容"))
+            text = "" if kind == "IMAGE" else "\n".join(text_lines(matching)[:3])
         elif photo_shape and _IMAGE_PLACEHOLDER.fullmatch(text):
             kind = "IMAGE_PLACEHOLDER"
             evidence.append("仅识别到图片占位，真实图片内容未取得")
@@ -611,15 +657,17 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                 kind = "UNKNOWN"
             status = "PARTIALLY_VISIBLE"
             evidence.append("容器接触视口边缘，文字可能截断")
-        elif kind == "UNKNOWN" and weak:
+        elif kind == "UNKNOWN" and weak and item not in structured:
             status = "OCR_UNCERTAIN"
-        elif direction == "UNKNOWN" or kind not in ("TEXT", "IMAGE", "FILE", "EMOJI"):
+        elif direction == "UNKNOWN" or item not in structured and kind not in ("TEXT", "IMAGE", "FILE", "EMOJI"):
             status = "UNCLASSIFIED"
         else:
             status = "CANDIDATE"
         detail.update(classification=viewport_limit or (kind if status == "CANDIDATE" else
                       "UNKNOWN_BUBBLE" if contrast >= 8 and fill >= .44 else "SUSPECTED_MESSAGE"),
-                      reason=status)
+                      reason=status, object_confirmed=item in structured and status == "CANDIDATE",
+                      object_evidence=structured[item][1] if item in structured else "",
+                      content_coverage="VISIBLE_SUMMARY_ONLY" if item in structured else "")
         preceding = [span for span in times if span.box.bottom <= box.top]
         time = max(preceding, key=lambda span: span.box.bottom).text if preceding else ""
         if time:
@@ -630,7 +678,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
         results.append(VisibleMessageObservation(len(results) + 1, box, direction, kind,
                                                  display_text, time, left_dist, right_dist,
                                                  status, tuple(evidence), matching, file=file, method=item.method,
-                                                 viewport_limit=viewport_limit))
+                                                 viewport_limit=viewport_limit, container_confirmed=item in structured))
         for pos in positions:
             span = dispositions[pos].span
             if viewport_limit == "TOP_VIEWPORT_CLIPPED":
@@ -638,8 +686,8 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             elif file is not None:
                 reason = ("已与文件卡片图标区关联" if span in file.icon_evidence else "已与文件卡片字段关联")
                 dispositions[pos] = OcrDisposition(span, "MEDIA", index, index, reason)
-            elif kind == "IMAGE":
-                dispositions[pos] = OcrDisposition(span, "MEDIA", index, index, "已与媒体整体卡片关联")
+            elif kind == "IMAGE" or item in structured:
+                dispositions[pos] = OcrDisposition(span, "MEDIA", index, index, "已与独立消息对象关联，内部文字仅作摘要")
             elif kind in ("TEXT", "EMOJI"):
                 dispositions[pos] = OcrDisposition(span, "MESSAGE", index, index, "与唯一正文容器关联")
             else:

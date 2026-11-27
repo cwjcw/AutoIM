@@ -142,7 +142,7 @@ def _read_message(item, task, contact):
     quality, reason = "RELIABLE", ""
     if item.status == "PARTIALLY_VISIBLE":
         quality, reason = "CLIPPED", "CONTAINER_CLIPPED"
-    elif item.kind == "UNKNOWN":
+    elif item.kind == "UNKNOWN" and not (item.container_confirmed and item.status == "CANDIDATE"):
         quality, reason = "UNKNOWN_TYPE", "MESSAGE_TYPE_UNVERIFIED"
     elif item.status == "OCR_UNCERTAIN":
         quality, reason = "LOW_CONFIDENCE", "BODY_OCR_UNCERTAIN"
@@ -252,6 +252,14 @@ class CoreView:
     review_messages: int = 0
     save_failures: int = 0
     independent_messages: int = 0
+    a2_first: int | None = None
+    a2_current: int | None = None
+    a2_status: str = ""
+    a2_attempts: int = 0
+    a2_no_progress: int = 0
+    a2_new_targets: int = 0
+    a2_unconfirmed_open: int = 0
+    range_outcome: str = ""
 
 
 @dataclass(slots=True)
@@ -279,6 +287,18 @@ class CoreTask:
     before_evidence: str = ""
     c2_evidence: str = ""
     body_reads: int = 0
+    direct_reference: object | None = None
+
+
+@dataclass(slots=True)
+class A2Attempt:
+    before: object
+    state: str
+    at: datetime
+    evidence: str = ""
+    started_input: bool = False
+    confirmed_input: bool = False
+    polls: int = 0
 
 
 @dataclass(slots=True)
@@ -305,6 +325,11 @@ class CoreRun:
     finish_after_independent: bool = False
     selection_waits: int = 0
     badge_reviewed: bool = False
+    a2_pending: A2Attempt | None = None
+    a2_states: set = field(default_factory=set)
+    a2_initial: bool = False
+    a2_uncertain_scans: bool = False
+    a2_failed_attempts: int = 0
     mute_trials: Counter = field(default_factory=Counter)
     mute_recent: dict = field(default_factory=dict)
     muted_crops: set = field(default_factory=set)

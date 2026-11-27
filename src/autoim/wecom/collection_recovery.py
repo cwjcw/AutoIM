@@ -4,6 +4,7 @@ import argparse
 import json
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
 from hashlib import sha256
@@ -14,7 +15,7 @@ import numpy as np
 
 from autoim.wecom.collection_core import CoreAnalysis, CoreMessage, _read_message, normalized_text
 from autoim.wecom.collection_evidence import EvidenceArchive, EvidenceExportError
-from autoim.wecom.collection_incremental import CoreAccount
+from autoim.wecom.collection_incremental import FULL_NAME_EVIDENCE, CoreAccount, preview_visible
 from autoim.wecom.collection_pending import CoreDurability, PendingBatch, SavingBlocked, saving_reason
 from autoim.wecom.collection_service import isolated_database_path
 from autoim.wecom.visual_layout import Box, VisualThresholds
@@ -66,7 +67,7 @@ def _raster(record, folder, kind, *, decode=False):
         return original, box
 
 
-def _observations(record, folder, contact):
+def _observations(record, folder, contact, *, review=False):
     data, task = record["data"], record["task"]
     original, area = _raster(record, folder, "c2", decode=True)
     # This recovery input format carries the complete evidence for ordinary text.
@@ -77,7 +78,8 @@ def _observations(record, folder, contact):
         raise SavingBlocked("HISTORICAL_CONVERSATION_UNVERIFIED")
     recorded = tuple(CoreMessage(
         row["observation_id"], task, contact, row["sequence"], row["direction"], row["kind"], row["text"],
-        row["time"], "", row["confidence"], Box(*row["box"]), row["quality"], "UNKNOWN", row["reason"],
+        row["time"], "", row["confidence"], Box(*row["box"]), row["quality"],
+        row["unread"] if review else "UNKNOWN", row["reason"],
         row["parser_status"], clock_source="EXPLICIT" if row["time_source"] == "EXPLICIT" else "GROUP_ANCHOR",
         method=row.get("method", "BUBBLE_FIRST"), ocr_boxes=tuple(map(tuple, row.get("ocr_boxes", ()))))
         for row in data["messages"])
@@ -98,7 +100,7 @@ def _observations(record, folder, contact):
     def key(item):
         return item.kind, item.direction, normalized_text(item.text)
 
-    if (not replayed or any(row.kind != "TEXT" or row.quality != "RELIABLE" for row in replayed)
+    if (not replayed or any((row.kind != "TEXT" and not review) or row.quality != "RELIABLE" for row in replayed)
             or Counter(map(key, recorded)) - Counter(map(key, replayed))):
         return recorded, gaps, completeness
     new_gaps = tuple({"reason": "UNASSIGNED_MESSAGE_OCR",
@@ -106,10 +108,36 @@ def _observations(record, folder, contact):
                       "confidence": entry.span.score, "character_count": len(entry.span.text)}
                      for entry in parsed.dispositions if entry.possible_message)
     completeness = "VISIBLE_MESSAGES_INCOMPLETE" if new_gaps else "VISIBLE_MESSAGES_ACCOUNTED_FOR"
+    if review:
+        if (len(recorded) != 1 or new_gaps or replayed[-1].box != recorded[0].box
+                or key(replayed[-1]) != key(recorded[0]) or replayed[-1].time != recorded[0].time):
+            raise SavingBlocked("HISTORICAL_REVIEW_COVERAGE_UNVERIFIED")
+        replayed = recorded
     return replayed, new_gaps, completeness
 
 
-def recover_observation(log_root, day, detection, identifier, account, *, evidence_root=None):
+def _review_binding(store, account, contact, capture, detection, item, original_batch):
+    with closing(sqlite3.connect(store.path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        receipt = db.execute("SELECT decisions,captured_at FROM core_commit_receipts WHERE batch_id=? AND account_key=?",
+                             (original_batch, account.profile)).fetchone()
+        at = capture.isoformat(timespec="milliseconds")
+        if not receipt or json.loads(receipt[0]) != ["REVIEW"] or receipt[1] != at:
+            raise SavingBlocked("HISTORICAL_REVIEW_RECEIPT_UNVERIFIED")
+        rows = db.execute("""SELECT o.id,o.raw_ocr,o.status
+                FROM message_observations o JOIN conversations c ON o.conversation_id=c.id
+                JOIN accounts a ON o.account_id=a.id AND c.account_id=a.id
+                WHERE a.profile=? AND c.name_key=? AND c.evidence=? AND o.capture_id=?
+                AND o.observed_at=? AND o.kind=? AND o.direction=?
+                AND o.dedup_evidence='NO_RELIABLE_ALIGNMENT' AND o.status IN ('UNCERTAIN','RESOLVED')""",
+                          (account.profile, name_key(contact), FULL_NAME_EVIDENCE, detection, at,
+                           item.kind, item.direction)).fetchall()
+    matches = [(identifier, status) for identifier, body, status in rows if json.loads(body).get("text") == item.text]
+    if len(matches) != 1:
+        raise SavingBlocked("HISTORICAL_REVIEW_NOT_UNIQUE")
+    return matches[0]
+
+
+def recover_observation(log_root, day, detection, identifier, account, *, evidence_root=None, review_store=None):
     archive = EvidenceArchive(evidence_root or log_root / "visual-evidence", retention=30)
     matches = tuple(_events(log_root / day.isoformat() / "events.jsonl", detection))
     selected = next(event for event in matches if event["code"] == "VISUAL_EVIDENCE"
@@ -122,13 +150,21 @@ def recover_observation(log_root, day, detection, identifier, account, *, eviden
     verified = next(evt for evt in scoped if evt["code"] == "CONVERSATION_VERIFIED" and evt["result"] == "AUTO_PASS")
     body = next(evt for evt in scoped if evt["id"] == record["source_event"] and evt["code"] == "MESSAGE_OCR_COMPLETED"
                 and evt["result"] in ("AUTO_PASS", "PARTIAL"))
-    failed = next(evt for evt in scoped if evt["code"] == "CORE_DB_NOT_SAVED" and evt["details"].get("reason")
-                  in ("DEFAULT_ACCOUNT_UNAVAILABLE", "DEFAULT_ACCOUNT_FILE_MISSING"))
+    if review_store:
+        finish = next(evt for evt in scoped if evt["code"] == "CORE_DB_COMMITTED" and evt["result"] == "AUTO_PASS"
+                      and evt["details"].get("review") == 1
+                      and evt["details"].get("anchor_status") == "NO_RELIABLE_ALIGNMENT")
+        staged = next(evt for evt in scoped if evt["code"] == "CORE_BATCH_STAGED"
+                      and body["time"] <= evt["time"] <= finish["time"]
+                      and evt["details"].get("target_id") == clicked["details"].get("target_id"))
+    else:
+        finish = next(evt for evt in scoped if evt["code"] == "CORE_DB_NOT_SAVED" and evt["details"].get("reason")
+                      in ("DEFAULT_ACCOUNT_UNAVAILABLE", "DEFAULT_ACCOUNT_FILE_MISSING"))
     target = clicked["details"]["target_id"]
-    if (not clicked["time"] <= verified["time"] <= body["time"] <= failed["time"]
+    if (not clicked["time"] <= verified["time"] <= body["time"] <= finish["time"]
             or not record["data"]["conversation_verified"]
             or any(evt["details"].get("target_id") != target or evt["session"] != selected["session"]
-                   for evt in (clicked, verified, body, failed))):
+                   for evt in (clicked, verified, body, finish))):
         raise SavingBlocked("HISTORICAL_CONVERSATION_UNVERIFIED")
     before, _ = _record(archive, detection, next(evt for evt in events if evt["code"] == "VISUAL_EVIDENCE"
                        and evt["details"]["kind"] == "before"))
@@ -149,20 +185,33 @@ def recover_observation(log_root, day, detection, identifier, account, *, eviden
             break
     if not after_id or record["coordinates"] != "original_window_pixels":
         raise SavingBlocked("HISTORICAL_CONVERSATION_UNVERIFIED")
-    messages, gaps, completeness = _observations(record, folder, contact)
+    messages, gaps, completeness = _observations(record, folder, contact, review=bool(review_store))
     if not messages:
         raise SavingBlocked("HISTORICAL_NO_MESSAGE")
-    batch_id = uuid5(NAMESPACE_URL, f"autoim:core-recovery:{account.profile}:{detection}:{task}")
+    replay_kind = "core-review" if review_store else "core-recovery"
+    batch_id = uuid5(NAMESPACE_URL, f"autoim:{replay_kind}:{account.profile}:{detection}:{task}")
     messages = tuple(replace(item, id=uuid5(batch_id, str(index)).hex[:12])
                      for index, item in enumerate(messages, 1))
     latest = next((evt["details"]["method"] for evt in reversed(scoped)
                    if evt["code"] == "LATEST_POSITION_CHECKED" and evt["time"] <= body["time"]
                    and evt["details"].get("target_id") == target), "UNKNOWN")
     # No conversation kind is inferred from OCR text or the display name.
-    batch = PendingBatch.from_observation(account, CoreAnalysis(messages, latest, completeness, gaps),
+    analysis = CoreAnalysis(messages, latest, completeness, gaps)
+    review_id = None
+    if review_store:
+        if (len(messages) != 1 or gaps or latest == "UNKNOWN"
+                or messages[0].unread not in ("CONFIRMED_UNREAD", "UNREAD_CANDIDATE")):
+            raise SavingBlocked("HISTORICAL_REVIEW_COVERAGE_UNVERIFIED")
+        review_id, review_status = _review_binding(review_store, account, contact, capture, detection, messages[0],
+                                                   staged["details"]["batch_id"])
+        _, decisions = preview_visible(review_store, account, analysis, capture)
+        decisions = tuple(decisions)
+        if decisions not in (("NEW",), ("EXISTING",)) or review_status == "RESOLVED" and decisions != ("EXISTING",):
+            raise SavingBlocked("HISTORICAL_REVIEW_NOT_RESOLVABLE")
+    batch = PendingBatch.from_observation(account, analysis,
                                           "UNKNOWN", capture, method, detection, task,
                                           (before["id"], after_id, identifier), batch_id=batch_id.hex,
-                                          historical_recovery=True)
+                                          historical_recovery=True, review_id=review_id)
     return replace(batch, created_at=capture)
 
 
@@ -170,6 +219,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", nargs="+", metavar="DATE:DETECTION:C2_ID")
     parser.add_argument("--write", action="store_true", help="write to the local isolated core database")
+    parser.add_argument("--review", action="store_true", help="resolve a committed NO_RELIABLE_ALIGNMENT observation")
     args = parser.parse_args()
     paths = runtime_paths()
     durable = CoreDurability(VisualStore(isolated_database_path()), paths.account, paths.pending_db)
@@ -185,7 +235,8 @@ def main():
             EvidenceArchive._id(detection)
             EvidenceArchive._id(c2_id)
             batches.append(recover_observation(paths.logs, date.fromisoformat(day), detection, c2_id, account,
-                                               evidence_root=paths.evidence))
+                                               evidence_root=paths.evidence,
+                                               review_store=durable.store if args.review else None))
         if args.write:
             backup_runtime(paths, "before-history", budget=30)
             durable.account.ensure(durable.store, check, supplied=account)

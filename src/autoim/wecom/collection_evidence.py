@@ -16,9 +16,9 @@ import numpy as np
 
 from autoim.wecom.visual_store import name_key
 
-KINDS = {"b2", "before", "after", "c2", "database", "failure", "capture_failure", "hover"}
+KINDS = {"b2", "before", "after", "c2", "database", "failure", "capture_failure", "hover", "a2-before", "a2-after"}
 PRIVATE_RASTERS = ("c2-mask-foreground", "c2-mask-morphology")
-REGIONS = {"b1", "b2", "b2-edge", "c1", "c2", "capture", "hover-before", "hover-after", *PRIVATE_RASTERS}
+REGIONS = {"a2", "b1", "b2", "b2-edge", "c1", "c2", "capture", "hover-before", "hover-after", *PRIVATE_RASTERS}
 
 
 class EvidenceExportError(OSError):

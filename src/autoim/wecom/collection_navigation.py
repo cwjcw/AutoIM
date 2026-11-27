@@ -772,6 +772,20 @@ class CollectionNavigation:
         self._act(observation, row_target(observation, row, allow_duplicate=deadline_check is not None), row.box, scroll=False,
                   fresh_capture=fresh_capture, deadline_check=deadline_check)
 
+    def locate_unread(self, observation: VisualObservation, *, fresh_capture, deadline_check):
+        self.verify_normal_message(observation)
+        entry = observation.global_unread
+        if (not observation.frame.coordinates or entry.global_unread_visible is not True
+                or entry.entry is None or entry.badge is None):
+            raise NavigationPaused("A2 消息入口或总未读徽标未确认")
+        # The OCR label is in the entry's hit area. Never target the badge itself.
+        right = min(entry.entry.right, entry.badge.left)
+        target = Box(entry.entry.left, entry.entry.top, right, entry.entry.bottom)
+        if target.width < 8 * observation.frame.visual_unit:
+            raise NavigationPaused("A2 可验证的消息标签点击范围不足")
+        self._act(observation, target.center, target, scroll=False, a2=True,
+                  fresh_capture=fresh_capture, deadline_check=deadline_check)
+
     def scroll_visible_contacts(self, observation: VisualObservation) -> None:
         area = observation.layout.get("B2")
         if observation.page != "MESSAGES_CANDIDATE" or area is None or len(observation.contacts) < 3:
@@ -781,18 +795,21 @@ class CollectionNavigation:
 
     @physical_coordinates
     def _act(self, observation: VisualObservation, point: tuple[int, int], target: Box, *, scroll: bool,
-             profile: ProfileAction | None = None, known_windows=(), menu=None, fresh_capture=None, deadline_check=None) -> None:
+             profile: ProfileAction | None = None, known_windows=(), menu=None, fresh_capture=None,
+             deadline_check=None, a2=False) -> None:
         frame = observation.frame
+        purpose = "A2" if a2 else "B2"
         if profile:
             profile_check = self._profile_point(observation, profile, known_windows, menu)
         else:
-            area = observation.layout.get("B2")
+            area = observation.layout.get("A" if a2 else "B2")
             if area is None or not area.contains(point) or not target.contains(point):
-                raise NavigationPaused("操作点未通过 B2 范围检查")
+                raise NavigationPaused(f"操作点未通过 {purpose} 范围检查")
             age = (datetime.now(frame.captured_at.tzinfo) - frame.captured_at).total_seconds()
             if not 0 <= age <= 30:
                 raise NavigationPaused("联系人 OCR 结果已过期")
-            _, activity = self.verify_view(observation, need_idle=True)
+            _, activity = self.verify_view(observation, need_idle=True, purpose=purpose) if a2 else self.verify_view(
+                observation, need_idle=True)
             fresh = (fresh_capture or self.capture)()
             if _identity(frame) != _identity(fresh):
                 raise NavigationPaused("操作前窗口或坐标系已变化")
@@ -805,11 +822,12 @@ class CollectionNavigation:
             automatic_layout = detect_layout(fresh.pixels, {}, thresholds, fresh.visual_unit)
             if fresh_capture and not (automatic_layout.toolbar and automatic_layout.toolbar.bottom):
                 automatic_layout = recover_b2_start(automatic_layout, fresh.pixels, fresh.visual_unit, thresholds)
-            automatic_b2 = automatic_layout.get("B2")
-            if (automatic_b2 is None or not automatic_b2.contains(point)
-                    or automatic_layout.b2_boundary_uncertain(fresh.visual_unit)):
-                raise NavigationPaused("自动分区无法独立确认该位置属于 B2")
-            regions = (target,) if fresh_capture else tuple(observation.layout.get(name) for name in ("B1", "B2", "C1"))
+            automatic_area = automatic_layout.get("A" if a2 else "B2")
+            if (automatic_area is None or not automatic_area.contains(point)
+                    or not a2 and automatic_layout.b2_boundary_uncertain(fresh.visual_unit)):
+                raise NavigationPaused(f"自动分区无法独立确认该位置属于 {purpose}")
+            regions = ((area, observation.layout.get("B2"), observation.layout.get("C1")) if a2 else
+                       (target,) if fresh_capture else tuple(observation.layout.get(name) for name in ("B1", "B2", "C1")))
             for region in regions:
                 if region is None or not np.array_equal(region.crop(frame.pixels), region.crop(fresh.pixels)):
                     raise NavigationPaused("操作前目标行已变化，重新定位" if fresh_capture else "操作前联系人列表或标题已变化，重新定位")
@@ -822,7 +840,8 @@ class CollectionNavigation:
                 xy, foreground, current_activity = profile_check
                 expected_hwnd = profile.surface.hwnd
             else:
-                map_point, current_activity = self.verify_view(observation, need_idle=True)
+                map_point, current_activity = (self.verify_view(observation, need_idle=True, purpose=purpose) if a2
+                                                else self.verify_view(observation, need_idle=True))
                 xy = map_point(point)
                 foreground = expected_hwnd = frame.capture.hwnd
                 if current_activity != activity:
@@ -848,7 +867,7 @@ class CollectionNavigation:
             else:
                 win32api.SetCursorPos(xy)
             if not profile:
-                self.report("WINDOW", "CURSOR_MOVED", details={"point": point, "screen_point": xy, "action": "B2"})
+                self.report("WINDOW", "CURSOR_MOVED", details={"point": point, "screen_point": xy, "action": purpose})
             cursor = cursor_position() if frame.coordinates else win32gui.GetCursorPos()
             if cursor != xy or win32gui.GetForegroundWindow() != foreground:
                 raise NavigationPaused("发送鼠标动作前，指针或前台窗口已变化")
@@ -864,14 +883,30 @@ class CollectionNavigation:
             if scroll:
                 win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
             else:
+                click_started = monotonic()
                 win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
                 win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                if a2:
+                    self.report("WINDOW", "A2_CLICK_STARTED", details={"point": point, "screen_point": xy})
+                    # The second click is emitted immediately at the same physical point.
+                    # No arbitrary delay may exceed the user's Windows double-click setting.
+                    if deadline_check:
+                        deadline_check()
+                    self.permit.ensure_current()
+                    if (cursor_position() != xy or win32gui.GetForegroundWindow() != foreground
+                            or not (hit := window_at(xy)) or win32gui.GetAncestor(hit, 2) != expected_hwnd):
+                        raise NavigationPaused("A2 第二次点击前鼠标或窗口已变化")
+                    if (monotonic() - click_started) * 1000 >= ctypes.windll.user32.GetDoubleClickTime():
+                        raise NavigationPaused("A2 已超过系统双击时序")
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             try:
                 self._own_input = self._idle()[0]
             except OSError:
                 self._own_input = None
 
             self.report("WINDOW", "INPUT_EXECUTED", details={"point": point, "screen_point": xy,
-                        "action": profile.stage if profile else "B2", "operation": "SCROLL" if scroll else "CLICK"})
+                        "action": profile.stage if profile else purpose,
+                        "operation": "DOUBLE_CLICK" if a2 else "SCROLL" if scroll else "CLICK"})
 
         self.permit.perform(send, scroll=scroll)

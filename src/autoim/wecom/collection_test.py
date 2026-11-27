@@ -15,13 +15,14 @@ PHASES = {
     7: ("增量比对、隔离保存及展示", 5),
 }
 TEST_SECONDS = 180
+FULL_COLLECTION_SECONDS = 600
 TARGET_SECONDS = 60
 
 
 class TestDeadline(Exception):
-    def __init__(self, stage, limit):
+    def __init__(self, stage, limit, test_seconds=TEST_SECONDS):
         self.stage, self.limit = stage, limit
-        super().__init__({"TEST": "本轮测试达到 180 秒", "TARGET": "联系人处理达到 60 秒",
+        super().__init__({"TEST": f"本轮测试达到 {test_seconds} 秒", "TARGET": "联系人处理达到 60 秒",
                           "STAGE": f"{PHASES[stage][0]}超时" if stage else "阶段超时"}[limit])
 
 
@@ -35,12 +36,13 @@ class TestPhase:
 
 
 class TestClock:
-    def __init__(self, emit, now=perf_counter):
+    def __init__(self, emit, now=perf_counter, *, seconds=TEST_SECONDS):
         self.now = now
         self.emit = emit
         self.lock = RLock()
         self.started = now()
-        self.end = self.started + TEST_SECONDS
+        self.seconds = seconds
+        self.end = self.started + seconds
         self.target_end = float("inf")
         self.phase = None
         self.last_phase = 0
@@ -49,7 +51,7 @@ class TestClock:
         self.reason = ""
         self.last_issue = ""
         emit("TEST_STARTED", "", {})
-        emit("TEST_DEADLINE_SET", "", {"test_seconds": TEST_SECONDS, "target_seconds": TARGET_SECONDS,
+        emit("TEST_DEADLINE_SET", "", {"test_seconds": seconds, "target_seconds": TARGET_SECONDS,
                                       "stage_limits": {k: v[1] for k, v in PHASES.items()}})
 
     def begin_target(self):
@@ -81,7 +83,7 @@ class TestClock:
         with self.lock:
             end, limit = self._deadline()
             if self.now() >= end:
-                raise TestDeadline(self.phase.number if self.phase else 0, limit)
+                raise TestDeadline(self.phase.number if self.phase else 0, limit, self.seconds)
             return end
 
     def _event(self, code, result="", **details):
@@ -150,6 +152,6 @@ class TestClock:
                     "remaining": max(0, deadline - now) if phase else 0,
                     "duration": PHASES[phase.number][1] if phase else 0,
                     "total": now - self.started, "finished": self.finished is not None,
-                    "reason": str(TestDeadline(phase.number, limit)) if awaiting_timeout else self.reason,
+                    "reason": str(TestDeadline(phase.number, limit, self.seconds)) if awaiting_timeout else self.reason,
                     "awaiting_timeout": awaiting_timeout, "last_issue": self.last_issue,
                     "previous": self.last_phase, "outcomes": dict(self.outcomes)}

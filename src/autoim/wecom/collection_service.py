@@ -19,7 +19,7 @@ import numpy as np
 from autoim.calibration import CalibrationStore
 from autoim.runtime_paths import runtime_paths
 from autoim.wecom.collection_hover import HoverBudget
-from autoim.wecom.collection_core import (MAX_READ_POLLS, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
+from autoim.wecom.collection_core import (MAX_READ_POLLS, A2Attempt, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
                                          failure_crop_directory, history_changed, history_sample)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
 from autoim.wecom.collection_evidence import c2_evidence_regions, contact_scan, message_evidence, rect, title_evidence
@@ -29,7 +29,7 @@ from autoim.wecom.collection_navigation import CollectionNavigation, CollectionP
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
 from autoim.wecom.collection_runtime import safe_reason
-from autoim.wecom.collection_test import TestClock, TestDeadline
+from autoim.wecom.collection_test import FULL_COLLECTION_SECONDS, TEST_SECONDS, TestClock, TestDeadline
 from autoim.wecom.collection_worker import CoreReadWorker
 from autoim.wecom.visual_account import LoginEvidence, read_login
 from autoim.wecom.visual_capture import CaptureError, capture_visible_window
@@ -587,6 +587,8 @@ class CollectionService:
             elif code == "INPUT_EXECUTED":
                 self._core.task.clicked_at = EventTime.now().wall
                 self._core.task.applied_point = details.get("screen_point")
+        if self._core and self._core.a2_pending and code == "A2_CLICK_STARTED":
+            self._core.a2_pending.started_input = True
         if ((self._window_gate == "foreground" and code == "PROFILE_FOREGROUND" and details.get("allowed"))
                 or (self._window_gate == "input" and code == "INPUT_IDLE_SAMPLE"
                     and details.get("idle_ms", 0) >= 1800 and not details.get("held"))):
@@ -664,7 +666,8 @@ class CollectionService:
         self._record("RUN", "DETECTION_STARTED", details={"scope": repr(self.scope),
                      "flow": "CORE_ISOLATED_INCREMENTAL" if core else "EMAIL_DIAGNOSTIC" if email_test_only else "FORMAL_OR_LEGACY"})
         if core:
-            core.clock = TestClock(self._timed_core_event)
+            core.clock = TestClock(self._timed_core_event,
+                                   seconds=FULL_COLLECTION_SECONDS if self._durability else TEST_SECONDS)
             core.clock.begin(1, "检查本机保存环境" if self._durability else "定位、恢复、最大化并激活企业微信")
             if self._isolate_core_reads:
                 core.reader = CoreReadWorker(self.read._calibration_path, self.read._thresholds_path)
@@ -681,17 +684,25 @@ class CollectionService:
             run = self._core
             run.invalidated = True
             missing_read = bool(was_active and run.task and run.task.clicked_at)
+            unresolved_a2 = bool(was_active and run.a2_pending and run.a2_pending.started_input)
             if missing_read:
                 self._core_event("TARGET_PARTIAL", run.task, "PARTIAL", reason="STOPPED_AFTER_CLICK", read_risk=True)
             self._core_state(phase="TEST_FINISHED" if source in ("automatic", "timeout", "failure") else "STOPPED", waiting=0,
                              risk="BEFORE_UNREAD_NOT_READ" if missing_read else run.view.risk,
                              partial=run.view.partial + missing_read,
-                             read_unfinished=run.view.read_unfinished + missing_read)
+                             read_unfinished=run.view.read_unfinished + missing_read,
+                             a2_unconfirmed_open=run.view.a2_unconfirmed_open + unresolved_a2,
+                             range_outcome=run.view.range_outcome or (
+                                 {"timeout": "BUDGET", "failure": "BLOCKED", "control": "STOPPED"}.get(source, "STOPPED")
+                                 if self._durability and source != "automatic" else ""))
             if was_active and run.clock:
                 code = {"automatic": "TEST_COMPLETED", "timeout": "TEST_TIMEOUT", "failure": "TEST_FAILED"}.get(source, "TEST_STOPPED")
                 run.clock.finish(code, final_reason or "用户停止检测", clicks=run.view.clicks,
                                  discovered=run.view.discovered, verified=run.view.verified, messages=len(run.view.messages),
-                                 failures=run.view.failures, partial=run.view.partial)
+                                 failures=run.view.failures, partial=run.view.partial, a2_start=run.view.a2_first,
+                                 a2_remaining=run.view.a2_current, a2_status=run.view.a2_status,
+                                 a2_attempts=run.view.a2_attempts, a2_no_progress=run.view.a2_no_progress,
+                                 a2_new_targets=run.view.a2_new_targets, range_outcome=run.view.range_outcome)
             if not self._lock.locked() and run.reader:
                 run.reader.close()
         if self._profile_check and isinstance(self._profile_check.known_windows, ProfileWindows):
@@ -2265,7 +2276,7 @@ class CollectionService:
     def check_core_watchdog(self):
         run = self._core
         if self.active and run and run.clock.now() >= run.clock.end:
-            self.stop(source="timeout", final_reason="本轮测试达到 180 秒")
+            self.stop(source="timeout", final_reason=f"本轮测试达到 {run.clock.seconds} 秒")
 
     def _core_check(self):
         if not self.active:
@@ -2473,14 +2484,17 @@ class CollectionService:
             if _identity(header.frame) != _identity(task.before.frame):
                 phase = "WINDOW_GEOMETRY_CHANGED_AFTER_CLICK"
                 return False
-            candidate = _verify_transition(task.before, header, task.target)
+            candidate = header if task.direct_reference else _verify_transition(task.before, header, task.target)
             sample = history_sample(candidate)
             refreshed = history_changed(task.before_sample, sample)
             if refreshed and not task.changed:
                 task.changed = True
                 self._core_event("CONVERSATION_CHANGED", task, c2_changed=True,
                                  title_changed=name_key(header.conversation.title) != name_key(task.before.conversation.title))
-            evidence, distance = _core_selection_evidence(task.before, candidate, task.target, refreshed)
+            if task.direct_reference:
+                evidence, distance = _core_selection_evidence(task.direct_reference, candidate, task.target, refreshed)
+            else:
+                evidence, distance = _core_selection_evidence(task.before, candidate, task.target, refreshed)
             task.match_evidence = evidence
             task.match_distance = round(distance, 2) if distance is not None else None
             if evidence not in ("EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR",
@@ -2556,6 +2570,8 @@ class CollectionService:
                   account_reason="A1 视觉观察 · 确认会话使用本机隔离账号保存" if a1_observed else
                   "当前 A1 未读到可靠姓名 · 按已核对的企业微信窗口继续",
                   bound_pid=frame.capture.pid, bound_hwnd=frame.capture.hwnd, waiting_for_window=False)
+        if self._durability:
+            self._a2_observe(raw)
         if task:
             return self._core_read_target(task, raw, ready, phase)
         if (raw.page != "MESSAGES_CANDIDATE" or raw.layout.get("B2") is None or raw.layout.get("C2") is None
@@ -2645,6 +2661,152 @@ class CollectionService:
         run.clock.progress("重新截图复核会话和 C2", phase, retry=True)
         return self._set(reason="已点击目标，等待独立截图复核与读取")
 
+    def _a2_state(self, raw):
+        unread = raw.global_unread
+        count = unread.global_unread_count if unread.global_unread_count_reliable else None
+        state = ("NUMBER" if count is not None else "BADGE_UNKNOWN_NUMBER"
+                 if unread.global_unread_visible is True else "NONE"
+                 if unread.entry and unread.global_unread_visible is False else "UNKNOWN")
+        if state == "NONE":
+            count = 0
+        rows = tuple((name_key(row.display_name), row.kind, row.is_selected, row.has_unread_indicator,
+                      row.unread_count if row.unread_count_reliable else None)
+                     for row in raw.contacts)
+        key = blake2s(repr((rows, name_key(raw.conversation.title), state, count)).encode(), digest_size=12).hexdigest()
+        return state, count, key
+
+    def _a2_observe(self, raw):
+        run = self._core
+        state, count, key = self._a2_state(raw)
+        first = not run.a2_initial and state != "UNKNOWN"
+        self._core_state(a2_status=state, a2_current=run.view.a2_current if state == "UNKNOWN" else count,
+                         a2_first=count if first else run.view.a2_first)
+        run.a2_initial |= first
+        return state, count, key
+
+    def _a2_evidence(self, kind, raw, event, state, **details):
+        unread = raw.global_unread
+        data, rows = contact_scan(raw, unread_targets(raw, self.scope, allow_duplicate=True), self._status.scan_id, "")
+        title, marks = title_evidence(raw)
+        a = raw.layout.get("A")
+        return self._keep_core_evidence(kind, raw, {**data, **title, **details, "state": state,
+                "entry": rect(unread.entry), "badge": rect(unread.badge)},
+                [("a2", a, [(rect(unread.entry), "A2"), (rect(unread.badge), "TOTAL UNREAD")]),
+                 ("b2", raw.layout.get("B2"), rows), ("c1", raw.layout.get("C1"), marks)], source_event=event)
+
+    def _a2_result(self, raw, state, eligible):
+        run = self._core
+        step = run.a2_pending
+        before = step.before
+        conv, prior = raw.conversation, before.conversation
+        changed_title = bool(conv.title_name_reliable and prior.title_name_reliable
+                             and name_key(conv.title) != name_key(prior.title))
+        decreased = bool(before.global_unread.global_unread_count_reliable and (
+            state[0] == "NONE" or state[1] is not None and state[1] < before.global_unread.global_unread_count))
+        changed_history = history_changed(history_sample(before), history_sample(raw))
+        progress = bool(eligible or state[2] not in run.a2_states or decreased)
+        if (step.polls < 1 and not progress and not changed_title
+                and _identity(before.frame) == _identity(raw.frame)):
+            step.polls += 1
+            run.clock.complete("PARTIAL", "A2 界面未见变化，重新取图核对一次")
+            return self._set(reason="A2 定位后重新取图核对")
+        run.a2_pending = None
+        run.a2_states.add(state[2])
+        geometry_ok = _identity(before.frame) == _identity(raw.frame)
+        target = None
+        origin = before
+        if geometry_ok and changed_title and changed_history and step.confirmed_input:
+            previous_targets = unread_targets(before, self.scope, allow_duplicate=False)
+            proofs = [item for item in previous_targets if not item.skip_reason and not item.ambiguous
+                      and item.key not in run.handled and _matches_target(raw, item, avatar_corroborated=True)]
+            if decreased and len(proofs) == 1 and _core_selection_evidence(before, raw, proofs[0], True)[0] in (
+                    "EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AVATAR_UNAVAILABLE",
+                    "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR"):
+                target = proofs[0]
+            if target is None:
+                # A still-visible badge allows independent attribution even
+                # when the row was outside the previous viewport.
+                revealed = [item for item in eligible if not item.duplicate_name and item.avatar
+                            and item.row.is_selected is True and _matches_target(raw, item)
+                            and item.row.has_unread_indicator]
+                if len(revealed) == 1:
+                    target, origin = revealed[0], raw
+        missing = bool((changed_title or decreased) and target is None)
+        result = ("DIRECT_OPEN_VERIFIED" if target else "DIRECT_OPEN_UNCERTAIN" if missing else
+                  "GEOMETRY_CHANGED" if not geometry_ok else "NEW_TARGETS" if eligible else
+                  "LIST_CHANGED" if progress else "REPEATED_VIEW")
+        event = self._record("A2", "A2_LOCATE_RESULT", "AUTO_PASS" if progress and not missing else "PARTIAL",
+                    details={"before_state": step.state, "after_state": state[2],
+                             "before_unread": before.global_unread.global_unread_count, "after_unread": state[1],
+                             "result": result, "changed_title": changed_title, "decreased": decreased,
+                             "new_targets": len(eligible), "no_progress": not progress,
+                             "old_evidence": step.evidence, "scan": self._status.scan_id})
+        if self.runtime:
+            self._a2_evidence("a2-after", raw, event, state, result=result, before_evidence=step.evidence)
+        self._core_state(a2_no_progress=0 if progress else run.view.a2_no_progress + 1,
+                         a2_new_targets=run.view.a2_new_targets + len(eligible),
+                         a2_unconfirmed_open=run.view.a2_unconfirmed_open + missing)
+        if target:
+            stamp = EventTime.now().wall
+            run.task = CoreTask(target, before, stamp, run.discovered_at.get(target.key, step.at),
+                                before_sample=history_sample(before), clicked_at=step.at,
+                                before_evidence=step.evidence, scan_id=self._status.scan_id,
+                                direct_reference=origin if origin is raw else None)
+            run.clock.complete()
+            run.clock.begin_target()
+            run.clock.begin(5, "确认 A2 直接打开的未读会话")
+            self._core_state(phase="A2_VERIFYING_DIRECT_OPEN", contact=target.row.display_name)
+            return self._set(reason="A2 已改变选中会话，等待独立 C1/C2 复核")
+        return None
+
+    def _a2_locate(self, raw, state):
+        run = self._core
+        if not run.storage_ready:
+            return self._stop_core_storage("A2 定位前保存环境未就绪")
+        self._core_state(phase="A2_LOCATING")
+        run.clock.progress("双击 A2 消息入口定位其他未读")
+        try:
+            self._durability.before_click(self._core_account, self._core_check)
+        except (SavingBlocked, sqlite3.Error, OSError, ValueError) as error:
+            return self._stop_core_storage(saving_reason(error))
+        attempt = A2Attempt(raw, state[2], EventTime.now().wall)
+        run.a2_states.add(state[2])
+        requested = self._record("A2", "A2_LOCATE_REQUESTED",
+                        details={"state": state[2], "unread": state[1], "entry": bounds(raw.global_unread.entry),
+                                 "scan": self._status.scan_id, "waiting": run.view.waiting,
+                                 "mapping": raw.frame.coordinates.snapshot if raw.frame.coordinates else None})
+        if self.runtime:
+            attempt.evidence = self._a2_evidence("a2-before", raw, requested, state)
+            if not attempt.evidence:
+                return self._core_blocked("A2 操作前视觉证据未保存")
+            try:
+                self.runtime.sync()
+                archived, _ = self.runtime.evidence.read(self._run_id, attempt.evidence)
+                if not archived or any(part["missing"] for part in archived["regions"]):
+                    return self._core_blocked("A2 操作前视觉证据不完整")
+            except OSError:
+                return self._core_blocked("A2 操作前视觉证据未能写入本机")
+        run.a2_pending = attempt
+        try:
+            self.navigator.locate_unread(raw, fresh_capture=self._core_capture, deadline_check=self._core_check)
+        except (NavigationPaused, CaptureError, OSError) as exc:
+            self._record("A2", "A2_LOCATE_BLOCKED", "PARTIAL",
+                         details={"reason": safe_reason(exc), "single_click_sent": attempt.started_input})
+            if not self.active:
+                return self._status
+            if not attempt.started_input:
+                run.a2_pending = None
+                run.a2_failed_attempts += 1
+            run.clock.complete("PARTIAL", safe_reason(exc))
+            return self._set(reason="A2 定位受阻，将重新核对画面")
+        attempt.confirmed_input = True
+        attempt.started_input = True
+        run.a2_failed_attempts = 0
+        self._core_state(phase="A2_RESCANNING", a2_attempts=run.view.a2_attempts + 1)
+        self._record("A2", "A2_DOUBLE_CLICKED", "AUTO_PASS", details={"evidence": attempt.evidence, "state": state[2]})
+        run.clock.complete()
+        return self._set(reason="A2 双击后重新截图识别消息入口和联系人")
+
     def _core_scan(self, raw, attempted, current):
         run = self._core
         clock = run.clock
@@ -2721,6 +2883,12 @@ class CollectionService:
             if run.selection_waits >= 2 and not run.navigation_task:
                 return self._core_blocked(foreground_block)
             return self._set(status="PAUSED", reason="已完成 B2 扫描，等待企业微信恢复前台")
+        a2 = self._a2_state(raw) if self._durability else None
+        if a2:
+            if run.a2_pending:
+                outcome = self._a2_result(raw, a2, eligible)
+                if outcome is not None:
+                    return outcome
         if not eligible:
             self._core_state(phase="WAITING_UNREAD")
             if mute_wait:
@@ -2741,6 +2909,27 @@ class CollectionService:
             reason = ("B2 覆盖或未读徽标归属无法确认" if uncertain else
                       "当前可见范围没有未读" if not self._status.unread_marker_count
                       else "可见未读已处理或因范围、视觉证据不足而跳过")
+            if a2:
+                run.a2_uncertain_scans |= bool(uncertain)
+                if (a2[0] in ("NUMBER", "BADGE_UNKNOWN_NUMBER")
+                        and not raw.layout.b2_boundary_uncertain(raw.frame.visual_unit)
+                        and run.view.a2_no_progress < 3 and run.a2_failed_attempts < 3):
+                    return self._a2_locate(raw, a2)
+                unresolved = bool(run.a2_uncertain_scans or run.view.a2_unconfirmed_open or
+                                  self._status.unreliable_unread_count)
+                if a2[0] != "NONE":
+                    result, reason = "LOCATE_INCOMPLETE", "A2 未读定位未完成，剩余未读或入口状态无法确认"
+                elif (unresolved or run.view.partial or run.view.failures or run.view.review_messages
+                      or self._status.storage_pending):
+                    result, reason = "PARTIAL", "A2 无总未读，保留未归属、待复核或未完成任务"
+                elif self._status.skipped_unread:
+                    result, reason = "OUT_OF_SCOPE", "当前范围已处理，可见范围外会话仍有未读"
+                else:
+                    result, reason = "COMPLETE", "A2 无总未读，当前范围无未完成任务"
+                self._core_state(range_outcome=result)
+                self._record("A2", "A2_RANGE_FINISHED", "AUTO_PASS" if result in ("OUT_OF_SCOPE", "COMPLETE") else "PARTIAL",
+                             details={"outcome": result, "unread": a2[1], "reason": reason,
+                                      "no_progress": run.view.a2_no_progress, "input_failures": run.a2_failed_attempts})
             clock.complete("PARTIAL" if uncertain or self._status.unreliable_unread_count else "SKIPPED", reason)
             if not run.independent_done and not run.view.messages:
                 run.independent_reason = reason

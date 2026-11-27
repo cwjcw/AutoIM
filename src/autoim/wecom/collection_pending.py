@@ -186,18 +186,21 @@ class PendingBatch:
     created_at: datetime
     historical_recovery: bool = False
     schema_version: int = 1
+    review_id: int | None = None
 
     @classmethod
     def from_observation(cls, account, analysis, kind, captured_at, verification, run_id, task_id,
-                         evidence_ids=(), *, batch_id=None, historical_recovery=False):
+                         evidence_ids=(), *, batch_id=None, historical_recovery=False, review_id=None):
         messages = attach_times(analysis.messages, captured_at)
         return cls(batch_id or uuid4().hex, run_id, run_id, task_id, account.profile,
                    messages[0].contact if messages else "", kind, captured_at, verification,
                    replace(analysis, messages=messages), tuple(item for item in evidence_ids if item),
-                   datetime.now(timezone.utc), historical_recovery)
+                   datetime.now(timezone.utc), historical_recovery, review_id=review_id)
 
     def encode(self):
         data = asdict(self)
+        if self.review_id is None:
+            data.pop("review_id")
         if not self.analysis.viewport_limits:
             data["analysis"].pop("viewport_limits")
         for item in data["analysis"]["messages"]:
@@ -229,6 +232,8 @@ class PendingBatch:
                 or not self.task_id or not self.detection_id or not self.full_display_name
                 or not self.conversation_verification or self.captured_at.utcoffset() is None
                 or self.created_at.utcoffset() is None or not self.analysis.messages
+                or self.review_id is not None and (type(self.review_id) is not int or self.review_id <= 0
+                                                    or not self.historical_recovery or len(self.analysis.messages) != 1)
                 or any(item.task != self.task_id or item.contact != self.full_display_name
                        or item.unread in ("INDEPENDENT_OCR", "ATTRIBUTION_UNCERTAIN")
                        for item in self.analysis.messages)):
@@ -352,7 +357,7 @@ class PendingCollections:
             try:
                 result = save_visible(store, account, batch.analysis, batch.conversation_kind, batch.captured_at,
                                       batch.run_id, check, batch_id=identifier, batch_digest=row["digest"],
-                                      historical_recovery=batch.historical_recovery)
+                                      historical_recovery=batch.historical_recovery, review_id=batch.review_id)
             except (sqlite3.Error, OSError, ValueError, SavingBlocked) as error:
                 reason = saving_reason(error)
                 retries = row["retry_count"] + 1

@@ -14,10 +14,12 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from autoim.wecom.collection_core import MAX_READ_POLLS, CoreView, analyze_read
 from autoim.wecom.collection_incremental import SOURCE, CoreAccount
 from autoim.wecom.collection_navigation import NavigationPaused
+from autoim.wecom.collection_pending import SavingBlocked
 from autoim.wecom.collection_panel import VisualCollectionPanel
 from autoim.wecom.collection_runtime import CollectionRuntime
 from autoim.wecom.collection_service import CollectionScope, CollectionService, ScanStatus
 from autoim.wecom.visual_account import LoginEvidence
+from autoim.wecom.visual_contacts import GlobalUnreadObservation
 from autoim.wecom.visual_files import FileCardObservation
 from autoim.wecom.visual_layout import Box
 from autoim.wecom.visual_messages import OcrDisposition
@@ -452,6 +454,78 @@ class CoreFlowTests(unittest.TestCase):
         self.navigator.select.assert_not_called()
         self.assertFalse(self.formal.path.exists())
         self.assertFalse(self.isolated.path.exists())
+
+    @staticmethod
+    def with_a2(raw, count, *, badge=True):
+        return replace(raw, global_unread=GlobalUnreadObservation(
+            Box(6, 65, 31, 88), Box(32, 66, 47, 82) if badge else None, badge, count, count is not None))
+
+    def start_range(self):
+        self.start()
+        self.service._durability = Mock()
+        self.service._durability.queue.counts.return_value = (0, 0)
+        self.service._core.storage_ready = True
+
+    def test_a2_reveals_offscreen_target_after_fresh_scan(self):
+        self.start_range()
+        first = self.poll(self.with_a2(sample(), 8))
+        self.assertEqual((first.core.a2_attempts, first.core.a2_first), (1, 8))
+        self.navigator.select.assert_not_called()
+        resumed = self.poll(self.with_a2(sample(unread={1: (2, False)}), 8))
+        self.assertEqual((resumed.core.a2_new_targets, resumed.core.clicks), (1, 1))
+        self.navigator.select.assert_called_once()
+
+    def test_a2_preserves_visible_first_and_absence_finishes_without_double_click(self):
+        self.start_range()
+        self.poll(self.with_a2(sample(unread={1: (1, False)}), 5))
+        self.navigator.select.assert_called_once()
+        self.navigator.locate_unread.assert_not_called()
+        self.service.stop()
+        self.start_range()
+        state = self.poll(self.with_a2(sample(), None, badge=False))
+        self.assertEqual((state.core.a2_current, state.core.range_outcome), (0, "COMPLETE"))
+        self.navigator.locate_unread.assert_not_called()
+
+    def test_a2_same_state_stops_after_three_no_progress_results(self):
+        self.start_range()
+        repeated = self.with_a2(sample(), 3)
+        state = self.poll(repeated, count=7)
+        self.assertEqual((state.core.a2_attempts, state.core.a2_no_progress, state.core.range_outcome),
+                         (3, 3, "LOCATE_INCOMPLETE"))
+        self.assertEqual(self.navigator.locate_unread.call_count, 3)
+        self.navigator.select.assert_not_called()
+
+    def test_a2_open_without_row_badge_evidence_is_unconfirmed(self):
+        self.start_range()
+        self.poll(self.with_a2(sample(), 1))
+        state = self.poll(self.with_a2(sample(selected=1, tone=180), None, badge=False))
+        self.assertEqual((state.core.a2_unconfirmed_open, state.core.range_outcome), (1, "PARTIAL"))
+        self.assertEqual(state.core.verified, 0)
+        self.navigator.select.assert_not_called()
+
+    def test_a2_direct_open_uses_the_confirmed_selected_unread_without_second_click(self):
+        self.start_range()
+        self.poll(self.with_a2(sample(), 5))
+        state = self.poll(self.with_a2(sample(selected=1, unread={1: (2, False)}, tone=180), 5))
+        self.assertEqual(state.core.phase, "A2_VERIFYING_DIRECT_OPEN")
+        self.assertEqual(state.core.a2_unconfirmed_open, 0)
+        self.assertIsNotNone(self.service._core.task.direct_reference)
+        self.navigator.select.assert_not_called()
+
+    def test_a2_stop_does_not_schedule_another_double_click(self):
+        self.start_range()
+        self.poll(self.with_a2(sample(), 3))
+        self.service.stop()
+        state = self.poll(count=4)
+        self.assertEqual(state.core.range_outcome, "STOPPED")
+        self.assertEqual(self.navigator.locate_unread.call_count, 1)
+
+    def test_a2_storage_preflight_blocks_before_any_native_input(self):
+        self.start_range()
+        self.service._durability.before_click.side_effect = SavingBlocked("SYNTHETIC_STORAGE_BLOCK")
+        state = self.poll(self.with_a2(sample(), None))
+        self.assertEqual(state.status, "STOPPED")
+        self.navigator.locate_unread.assert_not_called()
 
     def test_unassigned_badge_requests_one_recheck_without_clicking(self):
         from autoim.wecom.visual_b2 import B2Badge

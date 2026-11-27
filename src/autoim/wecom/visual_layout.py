@@ -233,6 +233,26 @@ def _search_toolbar(pixels: np.ndarray, column: Box, title: int | None, unit: fl
                          rejected=tuple(rejected))
 
 
+def _pinned_header(pixels, title, unit, thresholds):
+    height, width = pixels.shape[:2]
+    reach = min(height, title + round(89 * unit))
+    first = title + round(13 * unit)
+    if first >= reach or width < 50 * unit:
+        return title
+    edge, _ = _find_seam(pixels, first / height, reach / height, False, thresholds)
+    if edge is None:
+        return title
+    ring = max(2, round(6 * unit))
+    if edge - ring * 2 < title or edge + ring * 2 > height:
+        return title
+    before = np.median(pixels[edge-ring*2:edge-ring, width//8:7*width//8:4], axis=0).astype(np.int16)
+    after = np.median(pixels[edge+ring:edge+ring*2, width//8:7*width//8:4], axis=0).astype(np.int16)
+    if (before.shape == after.shape and before.size and float(np.mean(
+            (before[:, 0] - before[:, 2]) - (after[:, 0] - after[:, 2]) >= 9)) >= .68):
+        return edge + max(1, round(2 * unit))
+    return title
+
+
 def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
                   known: Mapping[str, Box], unit: float):
     height, width = pixels.shape[:2]
@@ -303,6 +323,18 @@ def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
     regions["C"] = Box(b, 0, right, height)
     evidence["C"] = b_note
     c = regions["C"].crop(pixels)
+    history_top = title
+    if title is None and toolbar and toolbar.bottom is not None:
+        expected = toolbar.bottom
+        margin = max(3, round(6 * unit))
+        local, confirmation = _find_seam(c, max(.025, (expected - margin) / height),
+                                         min(.19, (expected + margin) / height), False, thresholds)
+        if local is not None:
+            title = local
+            title_note = f"以已确认 B1 下沿复核 C1 边缘 · {confirmation}"
+            history_top = _pinned_header(c, title, unit, thresholds)
+            if history_top != title:
+                title_note += " · 横跨会话的有色提示条独立排除"
     top, top_note = _find_seam(c, .59, .95, False, thresholds)
     if "C3" in known:
         top, top_note = known["C3"].top, "沿用 C3 人工上边界"
@@ -316,8 +348,8 @@ def _auto_regions(pixels: np.ndarray, thresholds: VisualThresholds,
         evidence["C3"] = top_note
     else:
         failures["C3"] = f"输入区上边界 · {top_note}"
-    if title is not None and top is not None and title < top:
-        regions["C2"] = Box(b, title, right, top)
+    if history_top is not None and top is not None and history_top < top:
+        regions["C2"] = Box(b, history_top, right, top)
         evidence["C2"] = f"{title_note} / {top_note}"
     else:
         failures["C2"] = "历史区缺少可隔离标题和草稿的上下边界"

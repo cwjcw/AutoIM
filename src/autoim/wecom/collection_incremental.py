@@ -129,6 +129,8 @@ def _matches(old, new):
     prior, current = _stamp(old["anchor"]), _stamp(new.clock.anchor)
     if prior and current:
         return prior == current
+    if new.kind in ("LINK_CARD", "CHAT_HISTORY_CARD", "UNKNOWN"):
+        return False
     return bool(prior or current or not old["time_text"] or not new.time
                 or normalize_time_label(old["time_text"])[0] == normalize_time_label(new.time)[0])
 
@@ -203,7 +205,8 @@ def preview_visible(store, account, analysis, captured_at):
         state = db.execute("SELECT last_anchor,gap FROM core_conversation_tail WHERE conversation_id=?", (cid,)).fetchone()
         anchor, gap = state if state else (None, False)
     decisions, _, _ = compare_visible(history, messages, anchor, gap=gap,
-                                       latest=analysis.latest != "UNKNOWN" and not analysis.gaps)
+                                       latest=analysis.latest != "UNKNOWN" and not analysis.gaps,
+                                       clear_tail=_clear_tail(analysis, messages))
     return messages, decisions
 
 
@@ -244,7 +247,39 @@ def _coverage_gap(gap, messages, decisions):
             "decisions": [decisions.count("FIRST"), decisions.count("NEW"), decisions.count("REVIEW")]}
 
 
-def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=False, matched=None):
+def _clear_tail(analysis, messages):
+    if analysis.latest == "UNKNOWN" or any(not item.get("box") for item in analysis.gaps):
+        return None
+    floor = max((item["box"][3] for item in analysis.gaps), default=-1)
+    return next((i for i, item in enumerate(messages) if item.box.top >= floor), None)
+
+
+def _after_observed_history(history, messages, start):
+    if start is None or not messages or messages[-1].unread not in ("CONFIRMED_UNREAD", "UNREAD_CANDIDATE"):
+        return None
+    observed = [_stamp(row.get("first_seen")) for row in history]
+    if not all(observed):
+        return None
+    # A stored message already existed when it was observed. A trustworthy
+    # current clock strictly after every stored observation independently
+    # places the reliable visible suffix after those records.
+    anchors = [_stamp(row.get("anchor")) for row in history]
+    floor = max(stamp for stamp in (*observed, *anchors) if stamp)
+    last = len(messages)
+    upper = None
+    while last > start:
+        item = messages[last - 1]
+        clock = _stamp(item.hover.anchor) if _usable_hover(item) else (
+            _stamp(item.clock.anchor) if not item.clock.issue and not item.clock.year_inferred else None)
+        if (item.quality != "RELIABLE" or not clock or clock <= floor or upper and clock > upper):
+            break
+        last -= 1
+        upper = clock
+    return last if last < len(messages) else None
+
+
+def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=False, matched=None,
+                    clear_tail=None):
     """Return per-observation decisions plus the independently aligned overlap."""
     defaults = ["REVIEW"] * len(messages)
     if not history:
@@ -316,6 +351,10 @@ def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=Fa
     if (not gap and boundary and anchors and all(value and value > boundary for value in anchors)
             and all(first <= second for first, second in zip(anchors, anchors[1:]))):
         return ["NEW" if item.quality == "RELIABLE" else "REVIEW" for item in messages], 0, "AFTER_TIME_ANCHOR"
+    observed_tail = _after_observed_history(history, messages, clear_tail)
+    if observed_tail is not None:
+        defaults[observed_tail:] = ["NEW"] * (len(messages) - observed_tail)
+        return defaults, 0, "AFTER_HISTORY_OBSERVATION"
     return defaults, 0, "NO_RELIABLE_ALIGNMENT"
 
 
@@ -357,7 +396,7 @@ def bind_core_account(db, account, at):
 
 
 def save_visible(store, account, analysis, conversation_kind, captured_at, run_id, check, *,
-                 batch_id="", batch_digest="", historical_recovery=False):
+                 batch_id="", batch_digest="", historical_recovery=False, review_id=None):
     messages = analysis.messages
     if (not messages or not messages[0].contact or any(
             item.contact != messages[0].contact or item.unread in ("INDEPENDENT_OCR", "ATTRIBUTION_UNCERTAIN")
@@ -415,7 +454,7 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
         matched = {}
         decisions, overlap, anchor_status = compare_visible(
             history, messages, last_anchor, gap=had_gap, latest=analysis.latest != "UNKNOWN" and not analysis.gaps,
-            matched=matched)
+            matched=matched, clear_tail=_clear_tail(analysis, messages))
         decisions = ["REVIEW" if item.hover and item.hover.issue else decision
                      for item, decision in zip(messages, decisions)]
         # A delayed observation can confirm already-saved content. It cannot
@@ -427,12 +466,27 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
             if "FIRST" in decisions or "NEW" in decisions:
                 decisions = ["REVIEW" if item in ("FIRST", "NEW") else item for item in decisions]
                 anchor_status = "OLDER_CAPTURE_REQUIRES_REVIEW"
+        if review_id is not None:
+            review = db.execute("""SELECT raw_ocr FROM message_observations
+                WHERE id=? AND account_id=? AND conversation_id=? AND capture_id=? AND observed_at=?
+                AND kind=? AND direction=? AND status='UNCERTAIN' AND message_id IS NULL
+                AND dedup_evidence='NO_RELIABLE_ALIGNMENT'""",
+                (review_id, aid, cid, run_id, at, messages[0].kind, messages[0].direction)).fetchone()
+            if (not historical_recovery or len(messages) != 1 or not review
+                    or json.loads(review[0]).get("text") != messages[0].text
+                    or decisions[0] not in ("NEW", "EXISTING")):
+                raise ValueError("HISTORICAL_REVIEW_NOT_RESOLVABLE")
         position = db.execute("SELECT COALESCE(MAX(position),0) FROM messages WHERE conversation_id=?", (cid,)).fetchone()[0]
         new_anchors = []
         for index, (item, decision) in enumerate(zip(messages, decisions)):
             check()
             if decision == "EXISTING" and use_hover and not delayed:
                 _save_hover(db, matched.get(index), item, at)
+            if review_id is not None and decision == "EXISTING":
+                if not matched.get(index):
+                    raise ValueError("HISTORICAL_REVIEW_NOT_RESOLVABLE")
+                db.execute("UPDATE message_observations SET status='RESOLVED',message_id=? WHERE id=?",
+                           (matched[index], review_id))
             if decision == "REVIEW":
                 store._observation(db, aid, cid, None, None, run_id, at, item.kind, item.direction,
                                    {"text": item.text, "time_text": item.time, "source": SOURCE,
@@ -456,6 +510,8 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                        (mid, item.clock.anchor, item.clock.time_source, item.clock.precision, item.clock_sequence, run_id,
                         item.clock.normalized, json.dumps(item.clock.correction), int(item.clock.year_inferred),
                         item.clock.issue, item.clock.local_date))
+            if review_id is not None:
+                db.execute("UPDATE message_observations SET status='RESOLVED',message_id=? WHERE id=?", (mid, review_id))
             if use_hover:
                 _save_hover(db, mid, item, at)
             if item.file or item.kind == "IMAGE":
