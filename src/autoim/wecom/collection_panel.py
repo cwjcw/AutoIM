@@ -1114,7 +1114,8 @@ class VisualCollectionPanel(QWidget):
                 f"累计可导航 {core.discovered} · 等待 {core.waiting} · 实际点击 {core.clicks} · 已确认会话 {core.verified}\n"
                 f"展示消息 {len(messages)} · 首次保存 {core.first_saved} · 新增保存 {core.new_saved} · 已有 {core.existing} · "
                 f"待复核 {core.review_messages} · 独立 OCR {core.independent_messages} · 保存失败 {core.save_failures}\n"
-                f"部分完成 {core.partial} · 失败 {core.failures} · 已点击且未完整读到 {core.read_unfinished}")
+                f"部分完成 {core.partial} · 失败 {core.failures} · 已点击且未完整读到 {core.read_unfinished} · "
+                f"待补采 {core.unfinished_jobs} · 持久化页面 {core.history_pages} · 秒级时间 {core.exact_times}")
             self.core_task.setText(
                 f"{core.contact or '—'} · {core.phase} · 点击前未读 {core.before_count if core.before_count is not None else '—'} · "
                 f"已点击 {'是' if core.clicked else '否'} · 标题核对 {'通过' if core.title_match else '待确认'} · "

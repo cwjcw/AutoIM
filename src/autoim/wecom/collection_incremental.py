@@ -101,9 +101,10 @@ def attach_times(messages, observed):
     order = 0
     for item in messages:
         raw = item.time
-        key = normalize_time_label(raw)[0], item.clock_source
+        captured = datetime.fromisoformat(item.observed_at) if item.observed_at else observed
+        key = normalize_time_label(raw)[0], item.clock_source, captured.date()
         if last_label != key:
-            stamp = parse_message_time(raw, observed, source=item.clock_source, prior=prior)
+            stamp = parse_message_time(raw, captured, source=item.clock_source, prior=prior)
             last_label, order = key, 0
             if stamp.anchor:
                 prior = datetime.fromisoformat(stamp.anchor)
@@ -118,7 +119,9 @@ def _body(value):
 
 
 def _matches(old, new):
-    if (new.kind == "IMAGE" and not new.text) or new.quality != "RELIABLE":
+    if new.kind == 'IMAGE' and (not new.media_signature or new.media_signature != old.get('media_signature')):
+        return False
+    if new.quality != "RELIABLE":
         return False
     if (old["direction"], old["kind"], old["sender_name"] or "", _body(old["body"])) != (
             new.direction, new.kind, new.sender, _body(new.text)):
@@ -179,7 +182,9 @@ def _history(db, cid):
     join = "LEFT JOIN core_hover_times h ON h.message_id=m.id" if hover else ""
     return list(reversed([_compatible_history(row) for row in db.execute(f"""
         SELECT m.id,m.position,m.direction,m.kind,m.sender_name,m.body,m.time_text,m.first_seen,
-               t.anchor,t.time_source,t.normalized_text,{precise} AS hover_anchor
+               t.anchor,t.time_source,t.normalized_text,{precise} AS hover_anchor,
+               (SELECT json_extract(o.raw_ocr,'$.signature') FROM message_observations o WHERE
+                o.message_id=m.id AND o.status='OBJECT_FINGERPRINT' LIMIT 1) AS media_signature
         FROM messages m JOIN core_message_times t ON m.id=t.message_id
         {join}
         WHERE m.conversation_id=? AND m.source=? ORDER BY m.position DESC LIMIT 160""", (cid, SOURCE))]))
@@ -358,6 +363,22 @@ def compare_visible(history, messages, last_anchor=None, *, gap=False, latest=Fa
     return defaults, 0, "NO_RELIABLE_ALIGNMENT"
 
 
+def recovered_prefix(history, messages, decisions, complete_count):
+    """Permit prepending only when the full known sequence has a unique position."""
+    if not history or len(history)!=complete_count or len(messages)<=len(history):
+        return 0
+    starts=[i for i in range(len(messages)-len(history)+1)
+            if all(_matches(old,new) for old,new in zip(history,messages[i:]))]
+    if len(starts)!=1 or starts[0]==0:
+        return 0
+    n=starts[0]
+    if (len(history)==1 and not (history[0].get('hover_anchor') and _usable_hover(messages[n]))
+            or any(item.quality!='RELIABLE' for item in messages[:n])
+            or any(d!='EXISTING' for d in decisions[n:n+len(history)])):
+        return 0
+    return n
+
+
 def _decided(messages, decisions):
     return tuple(replace(item, collection_status=decision,
                          save_status="SAVED" if decision in ("FIRST", "NEW") else
@@ -466,6 +487,11 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
             if "FIRST" in decisions or "NEW" in decisions:
                 decisions = ["REVIEW" if item in ("FIRST", "NEW") else item for item in decisions]
                 anchor_status = "OLDER_CAPTURE_REQUIRES_REVIEW"
+        prefix_count=0
+        if not delayed and analysis.completeness=='ACCESSIBLE_HISTORY_CONTIGUOUS' and not analysis.gaps:
+            prefix_count=recovered_prefix(history,messages,decisions,historical)
+            if prefix_count:
+                decisions[:prefix_count]=['NEW']*prefix_count
         if review_id is not None:
             review = db.execute("""SELECT raw_ocr FROM message_observations
                 WHERE id=? AND account_id=? AND conversation_id=? AND capture_id=? AND observed_at=?
@@ -477,11 +503,14 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                     or decisions[0] not in ("NEW", "EXISTING")):
                 raise ValueError("HISTORICAL_REVIEW_NOT_RESOLVABLE")
         position = db.execute("SELECT COALESCE(MAX(position),0) FROM messages WHERE conversation_id=?", (cid,)).fetchone()[0]
+        first_position = (db.execute('SELECT min(position) FROM messages WHERE conversation_id=?',(cid,)).fetchone()[0]
+                          if prefix_count else 0)
         new_anchors = []
         for index, (item, decision) in enumerate(zip(messages, decisions)):
             check()
+            item_at = datetime.fromisoformat(item.observed_at).isoformat(timespec='milliseconds') if item.observed_at else at
             if decision == "EXISTING" and use_hover and not delayed:
-                _save_hover(db, matched.get(index), item, at)
+                _save_hover(db, matched.get(index), item, item_at)
             if review_id is not None and decision == "EXISTING":
                 if not matched.get(index):
                     raise ValueError("HISTORICAL_REVIEW_NOT_RESOLVABLE")
@@ -495,15 +524,19 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
                                    item.box, "UNCERTAIN", anchor_status, (item.hover.issue if item.hover else "") or item.reason or "ORDER_OR_TIME_UNCERTAIN")
             if decision not in ("FIRST", "NEW"):
                 continue
-            position += 1
+            if index<prefix_count:
+                insert_position=first_position-prefix_count+index
+            else:
+                position+=1
+                insert_position=position
             mid = uuid4().hex
             db.execute("""INSERT INTO messages
                 (id,conversation_id,position,direction,kind,sender_name,body,time_text,actual_time,
                  first_seen,last_seen,status,completeness,source,origin)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,'VISUAL_CONFIRMED',?,?,?)""",
-                       (mid, cid, position, item.direction, item.kind, item.sender or None, item.text,
+                       (mid, cid, insert_position, item.direction, item.kind, item.sender or None, item.text,
                         item.time or None, item.clock.anchor if item.clock.time_source == "EXPLICIT" else None,
-                        at, at, analysis.completeness, SOURCE, decision))
+                        item_at, item_at, analysis.completeness, SOURCE, decision))
             db.execute("""INSERT INTO core_message_times (message_id,anchor,time_source,precision,group_sequence,
                           run_id,normalized_text,correction,year_inferred,time_issue,date_anchor)
                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -513,7 +546,11 @@ def save_visible(store, account, analysis, conversation_kind, captured_at, run_i
             if review_id is not None:
                 db.execute("UPDATE message_observations SET status='RESOLVED',message_id=? WHERE id=?", (mid, review_id))
             if use_hover:
-                _save_hover(db, mid, item, at)
+                _save_hover(db, mid, item, item_at)
+            if item.media_signature:
+                store._observation(db,aid,cid,mid,None,run_id,item_at,item.kind,item.direction,
+                                   {'signature':item.media_signature},item.confidence,item.box,
+                                   'OBJECT_FINGERPRINT','VISIBLE_IMAGE','SCREENSHOT_ONLY')
             if item.file or item.kind == "IMAGE":
                 file = item.file
                 db.execute("INSERT INTO attachments VALUES (?,?,?,?,?,0)", (mid, file.file_name if file else None,

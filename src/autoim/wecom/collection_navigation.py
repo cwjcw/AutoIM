@@ -23,6 +23,7 @@ from autoim.wecom.collection_hover import HoverRaster, changed_pixels, hover_reg
 from autoim.wecom.visual_capture import (CaptureError, VisualFrame, _coverage, _render_client,
                                          _render_complete_client, capture_screen_region, capture_visible_window)
 from autoim.wecom.visual_contacts import ContactObservation, name_key, recover_b2_start
+from autoim.wecom.visual_history import history_controls, same_history_viewport
 from autoim.wecom.visual_layout import Box, VisualThresholds, detect_layout
 from autoim.wecom.visual_observation import VisualObservation
 from autoim.wecom.window_manager import WeComWindowManager
@@ -104,6 +105,7 @@ def _default_desktop() -> bool:
 
 
 IDLE_THRESHOLD_MS = 1800
+MAX_HISTORY_NOTCHES = 10
 _WATCHED_KEYS = {1: "鼠标左键", 2: "鼠标右键", 4: "鼠标中键", 5: "鼠标侧键 1", 6: "鼠标侧键 2",
                  16: "Shift", 17: "Ctrl", 18: "Alt", 91: "左 Win", 92: "右 Win"}
 
@@ -173,7 +175,7 @@ def isolated_row(row, rows):
         and not row.box.contains(other.box.center)) for other in rows))
 
 
-def row_target(observation: VisualObservation, row: ContactObservation, *, allow_duplicate=False) -> tuple[int, int]:
+def row_target(observation: VisualObservation, row: ContactObservation, *, allow_duplicate=False, recovery_name=None) -> tuple[int, int]:
     """Only an independently recognized and fully visible B2 row is targetable."""
     area = observation.layout.get("B2")
     geometry_only = (row.geometry_reliable and row.status == "NAME_UNCERTAIN"
@@ -184,7 +186,9 @@ def row_target(observation: VisualObservation, row: ContactObservation, *, allow
             or not geometry_only and not (allow_duplicate and row.geometry_reliable and isolated_row(row, observation.contacts))
             and sum(r.name_reliable and name_key(r.display_name) == name_key(row.display_name)
                     for r in observation.contacts) != 1
-            or not row.has_unread_indicator or row.badge is None):
+            or (not row.has_unread_indicator or row.badge is None) and not (
+                recovery_name and name_key(row.display_name) == recovery_name and row.name_reliable
+                and row.status == 'CANDIDATE' and sum(name_key(r.display_name)==recovery_name for r in observation.contacts)==1)):
         raise NavigationPaused("B2 未读联系人行缺少可靠的可操作边界", local=True)
     box = row.box
     x = box.left + round(box.width * .53)
@@ -193,7 +197,7 @@ def row_target(observation: VisualObservation, row: ContactObservation, *, allow
     margin = max(4, round(4 * unit))
     if (not (area.top <= box.top < box.bottom <= area.bottom and area.top + margin <= y < area.bottom - margin and
              area.left <= box.left < box.right <= area.right and box.height >= 22 * unit)
-            or not area.contains((x, y)) or row.badge.contains((x, y))
+            or not area.contains((x, y)) or (row.badge and row.badge.contains((x, y)))
             or (row.avatar and row.avatar.contains((x, y)))):
         raise NavigationPaused("点击点过于靠近视口、头像或未读控件", local=True)
     return x, y
@@ -758,19 +762,217 @@ class CollectionNavigation:
         move(point)
         reached = monotonic()
         raster = None
-        for delay in (.26, .34, .38, .34):
+        for delay in (.32, .40, .46, .48):
             wait(delay)
             after = capture()
             finished = monotonic()
             raster = HoverRaster(region, cursor, before, after, round((finished - started) * 1000),
                                  bubble, unit, item.direction, round((finished - reached) * 1000))
-            if changed_pixels(raster) is not None:
+            if changed_pixels(raster, sensitive=True) is not None and finished-reached >= .7:
                 break
+        if changed_pixels(raster, sensitive=True) is None:
+            # Some themes expose the date beside the lower inside edge.
+            edge = (box.left + round(box.width*.72), box.bottom - max(2,round(3*unit)))
+            if edge != point and box.contains(edge):
+                move(edge)
+                reached = monotonic()
+                for delay in (0.55, 0.65):
+                    wait(delay)
+                    finished = monotonic()
+                    raster = HoverRaster(
+                        region,
+                        cursor,
+                        before,
+                        capture(),
+                        round((finished - started) * 1000),
+                        bubble,
+                        unit,
+                        item.direction,
+                        round((finished - reached) * 1000),
+                    )
+                    if changed_pixels(raster, sensitive=True) is not None:
+                        break
         return raster
 
-    def select(self, observation: VisualObservation, row: ContactObservation, *, fresh_capture=None, deadline_check=None) -> None:
-        self._act(observation, row_target(observation, row, allow_duplicate=deadline_check is not None), row.box, scroll=False,
-                  fresh_capture=fresh_capture, deadline_check=deadline_check)
+    def select(
+        self,
+        observation: VisualObservation,
+        row: ContactObservation,
+        *,
+        fresh_capture=None,
+        deadline_check=None,
+    ) -> None:
+        self._act(
+            observation,
+            row_target(observation, row, allow_duplicate=deadline_check is not None),
+            row.box,
+            scroll=False,
+            fresh_capture=fresh_capture,
+            deadline_check=deadline_check,
+        )
+
+    def select_recovery(self, observation, row, name, *, fresh_capture, deadline_check):
+        point = row_target(observation, row, recovery_name=name)
+        self._act(
+            observation,
+            point,
+            row.box,
+            scroll=False,
+            fresh_capture=fresh_capture,
+            deadline_check=deadline_check,
+        )
+
+    def locate_recovery_rows(self, observation, fresh_capture, deadline_check, *, upward=False):
+        self.verify_normal_message(observation)
+        area = observation.layout.get("B2")
+        if len(observation.contacts) < 3 or not observation.frame.coordinates:
+            raise NavigationPaused("RECOVERY_LIST_UNVERIFIED")
+        self._act(
+            observation,
+            area.center,
+            area,
+            scroll=True,
+            wheel=960 if upward else -960,
+            fresh_capture=fresh_capture,
+            deadline_check=deadline_check,
+        )
+
+    @physical_coordinates
+    def find_recovery(self, observation, name, *, fresh_capture, deadline_check):
+        """Only write the local task name into an addressable, verified B1 search edit."""
+        from pywinauto import Desktop
+
+        frame = observation.frame
+        toolbar = observation.layout.toolbar
+        if not name or not frame.coordinates or not toolbar or not toolbar.search:
+            return "SEARCH_FIELD_UNAVAILABLE"
+        self.verify_normal_message(observation)
+        area = toolbar.search
+        root = Desktop(backend="uia").window(handle=frame.capture.hwnd)
+
+        def bounds_of(node):
+            rect = node.rectangle()
+            left, top = frame.coordinates.screen_to_image((rect.left, rect.top))
+            right, bottom = frame.coordinates.screen_to_image((rect.right - 1, rect.bottom - 1))
+            return Box(left, top, right + 1, bottom + 1)
+
+        def inside(inner, outer):
+            return outer.contains((inner.left, inner.top)) and outer.contains(
+                (inner.right - 1, inner.bottom - 1)
+            )
+
+        def edit():
+            nodes = [
+                n
+                for n in root.descendants(control_type="Edit", depth=8)
+                if n.process_id() == frame.capture.pid
+                and n.is_visible()
+                and n.is_enabled()
+                and n.element_info.name in ("搜索", "搜索联系人", "搜索会话")
+                and inside(bounds_of(n), area)
+            ]
+            return nodes[0] if len(nodes) == 1 else None
+
+        def set_query(value, expected):
+            def apply():
+                deadline_check()
+                hit, _ = self.verify_view(observation, need_idle=True, purpose="B1_SEARCH")
+                hit(area.center)
+                node = edit()
+                if (
+                    node is None
+                    or node.iface_value.CurrentValue != expected
+                    or node.iface_value.CurrentIsReadOnly
+                ):
+                    raise NavigationPaused("SEARCH_FIELD_CHANGED")
+                deadline_check()
+                self.permit.ensure_current()
+                node.iface_value.SetValue(value)
+
+            self.permit.perform(apply, scroll=False)
+
+        field = edit()
+        if field is None:
+            return "SEARCH_FIELD_UNAVAILABLE"
+        if field.iface_value.CurrentValue:
+            return "SEARCH_FIELD_OCCUPIED"
+        fresh = fresh_capture()
+        if _identity(fresh) != _identity(frame) or not np.array_equal(
+            area.crop(fresh.pixels), area.crop(frame.pixels)
+        ):
+            return "SEARCH_FIELD_CHANGED"
+        set_query(name, "")
+        selected = False
+        try:
+            # Restrict results to native history/conversation groups. A name in
+            # a message, directory suggestion or web result cannot authorize a click.
+            for _ in range(8):
+                deadline_check()
+                sleep(0.12)
+            rows = root.descendants(control_type="ListItem", depth=8)
+            exact = [
+                row
+                for row in rows
+                if row.element_info.name == name and row.process_id() == frame.capture.pid and row.is_visible()
+            ]
+            if len(exact) != 1 or exact[0].parent().element_info.name not in ("聊天", "最近聊天", "会话"):
+                return "SEARCH_NO_UNIQUE_CONVERSATION"
+            box = bounds_of(exact[0])
+            if not inside(box, observation.layout.get("B2")):
+                return "SEARCH_RESULT_OUTSIDE_LIST"
+            fresh = fresh_capture()
+            if _identity(frame) != _identity(fresh) or not edit() or edit().iface_value.CurrentValue != name:
+                return "SEARCH_RESULT_CHANGED"
+            from dataclasses import replace
+
+            self._act(
+                replace(observation, frame=fresh),
+                box.center,
+                box,
+                scroll=False,
+                fresh_capture=fresh_capture,
+                deadline_check=deadline_check,
+            )
+            selected = True
+            return "MATCH_OPENED"
+        finally:
+            # Never type a global Escape or send text to the focused application.
+            deadline_check()
+            field = edit()
+            if field is not None and field.iface_value.CurrentValue == name:
+                set_query("", name)
+            elif not selected and field is None:
+                raise NavigationPaused("SEARCH_NORMAL_VIEW_UNVERIFIED")
+
+    def history_action(self, observation, command, *, fresh_capture, deadline_check, notches=1):
+        area = observation.layout.get("C2")
+        if (
+            not observation.frame.coordinates
+            or not area
+            or observation.conversation.match_status != "VISUAL_MATCH"
+            or not observation.conversation.title_name_reliable
+        ):
+            raise NavigationPaused("C2_HISTORY_IDENTITY_UNVERIFIED")
+        self.verify_normal_message(observation)
+        if command == "LOCATE":
+            buttons = [entry.span for entry in observation.message_ocr if entry.kind == "C2_N1"]
+            if len(buttons) != 1:
+                raise NavigationPaused("C2_N1_UNVERIFIED")
+            target = buttons[0].box
+        elif command in ("UP", "DOWN"):
+            target = area
+        else:
+            raise ValueError("UNKNOWN_HISTORY_ACTION")
+        self._act(
+            observation,
+            target.center,
+            target,
+            scroll=command != "LOCATE",
+            c2=True,
+            wheel=120 * max(1, min(MAX_HISTORY_NOTCHES, notches)) * (1 if command == "UP" else -1),
+            fresh_capture=fresh_capture,
+            deadline_check=deadline_check,
+        )
 
     def locate_unread(self, observation: VisualObservation, *, fresh_capture, deadline_check):
         self.verify_normal_message(observation)
@@ -796,19 +998,20 @@ class CollectionNavigation:
     @physical_coordinates
     def _act(self, observation: VisualObservation, point: tuple[int, int], target: Box, *, scroll: bool,
              profile: ProfileAction | None = None, known_windows=(), menu=None, fresh_capture=None,
-             deadline_check=None, a2=False) -> None:
+             deadline_check=None, a2=False, c2=False, wheel=-120) -> None:
         frame = observation.frame
-        purpose = "A2" if a2 else "B2"
+        purpose = "C2" if c2 else "A2" if a2 else "B2"
+        area_name = "A" if a2 else purpose
         if profile:
             profile_check = self._profile_point(observation, profile, known_windows, menu)
         else:
-            area = observation.layout.get("A" if a2 else "B2")
+            area = observation.layout.get(area_name)
             if area is None or not area.contains(point) or not target.contains(point):
                 raise NavigationPaused(f"操作点未通过 {purpose} 范围检查")
             age = (datetime.now(frame.captured_at.tzinfo) - frame.captured_at).total_seconds()
             if not 0 <= age <= 30:
                 raise NavigationPaused("联系人 OCR 结果已过期")
-            _, activity = self.verify_view(observation, need_idle=True, purpose=purpose) if a2 else self.verify_view(
+            _, activity = self.verify_view(observation, need_idle=True, purpose=purpose) if a2 or c2 else self.verify_view(
                 observation, need_idle=True)
             fresh = (fresh_capture or self.capture)()
             if _identity(frame) != _identity(fresh):
@@ -822,12 +1025,33 @@ class CollectionNavigation:
             automatic_layout = detect_layout(fresh.pixels, {}, thresholds, fresh.visual_unit)
             if fresh_capture and not (automatic_layout.toolbar and automatic_layout.toolbar.bottom):
                 automatic_layout = recover_b2_start(automatic_layout, fresh.pixels, fresh.visual_unit, thresholds)
-            automatic_area = automatic_layout.get("A" if a2 else "B2")
+            automatic_area = automatic_layout.get(area_name)
             if (automatic_area is None or not automatic_area.contains(point)
-                    or not a2 and automatic_layout.b2_boundary_uncertain(fresh.visual_unit)):
+                    or not a2 and not c2 and automatic_layout.b2_boundary_uncertain(fresh.visual_unit)):
                 raise NavigationPaused(f"自动分区无法独立确认该位置属于 {purpose}")
             regions = ((area, observation.layout.get("B2"), observation.layout.get("C1")) if a2 else
                        (target,) if fresh_capture else tuple(observation.layout.get(name) for name in ("B1", "B2", "C1")))
+            if scroll and not c2 and fresh_capture:
+                # No row is being selected. Confirm the fresh viewport bounds
+                # and title without requiring animations in every row to freeze.
+                if automatic_area!=area:
+                    raise NavigationPaused('RECOVERY_LIST_GEOMETRY_CHANGED')
+                regions=(observation.layout.get('C1'),)
+            if c2:
+                if not same_history_viewport(area, automatic_area):
+                    raise NavigationPaused('C2_HISTORY_GEOMETRY_CHANGED')
+                row=next((r for r in observation.contacts if r.is_selected is True and r.name_reliable),None)
+                title_boxes=[span.box for part in observation.ocr_areas if part.region.startswith('C1')
+                             for span in part.spans]
+                if not row or not row.name_spans or not title_boxes:
+                    raise NavigationPaused('C2_HISTORY_NAME_PIXELS_UNVERIFIED')
+                regions=(*title_boxes,*(span.box for span in row.name_spans))
+                if not scroll:
+                    controls=[e.span for e in observation.message_ocr if e.kind=='C2_N1']
+                    seen=history_controls(fresh.pixels,area,controls,fresh.visual_unit)
+                    if len(seen)!=1 or not next(iter(seen.values()))[1].contains(point):
+                        raise NavigationPaused('C2_N1_CHANGED')
+                    regions=(*regions,target)
             for region in regions:
                 if region is None or not np.array_equal(region.crop(frame.pixels), region.crop(fresh.pixels)):
                     raise NavigationPaused("操作前目标行已变化，重新定位" if fresh_capture else "操作前联系人列表或标题已变化，重新定位")
@@ -840,7 +1064,7 @@ class CollectionNavigation:
                 xy, foreground, current_activity = profile_check
                 expected_hwnd = profile.surface.hwnd
             else:
-                map_point, current_activity = (self.verify_view(observation, need_idle=True, purpose=purpose) if a2
+                map_point, current_activity = (self.verify_view(observation, need_idle=True, purpose=purpose) if a2 or c2
                                                 else self.verify_view(observation, need_idle=True))
                 xy = map_point(point)
                 foreground = expected_hwnd = frame.capture.hwnd
@@ -880,8 +1104,24 @@ class CollectionNavigation:
             if deadline_check:
                 deadline_check()
             self.permit.ensure_current()
-            if scroll:
-                win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
+            if scroll and c2:
+                # Qt can collapse a multi-notch delta into one wheel step.
+                # Emit discrete steps and recheck the same physical hit between them.
+                tick = self._read_input().last_tick
+                for step in range(abs(wheel) // 120):
+                    if step:
+                        sleep(.025)
+                    if deadline_check:
+                        deadline_check()
+                    self.permit.ensure_current()
+                    sample = self._read_input()
+                    if (sample.held or sample.last_tick != tick or cursor_position() != xy
+                            or win32gui.GetForegroundWindow() != foreground or map_point(point) != xy):
+                        raise NavigationPaused('HISTORY_USER_INPUT_OR_HIT_CHANGED')
+                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 120 if wheel > 0 else -120, 0)
+                    tick = self._read_input().last_tick
+            elif scroll:
+                win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, wheel, 0)
             else:
                 click_started = monotonic()
                 win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)

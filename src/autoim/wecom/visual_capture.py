@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
 
+import cv2
 import numpy as np
 
 from autoim.vision import WindowCapture
@@ -179,6 +180,42 @@ def capture_screen_region(region):
         return _read_bitmap(width, height, lambda target: draw(target, 0, 0, width, height, source, left, top, 0x00CC0020))
     finally:
         win_api("user32", "ReleaseDC", (wintypes.HWND, wintypes.HDC), ctypes.c_int)(None, source)
+
+
+def _physical_raster_match(pixels, health):
+    """Corroborate a changed RDP render scale with non-flat pixels across the client."""
+    import win32gui
+    from autoim.wecom.window_coordinates import inside, window_at
+
+    desktop = health.last.desktop
+    hwnd = health.window.hwnd
+    if not desktop.remote or not health.foreground or win32gui.GetForegroundWindow()!=hwnd:
+        return False
+    width,height=health.last.client_size
+    scaled=cv2.resize(pixels,(width,height),interpolation=cv2.INTER_AREA)
+    seen=set()
+    for x,y in ((.14,.15),(.14,.75),(.94,.06),(.94,.88),(.20,.42),(.34,.58),(.60,.88),(.75,.27)):
+        cx,cy=round(x*width),round(y*height)
+        left,top=cx-60,cy-35
+        ox,oy=desktop.client_origin
+        region=(ox+left,oy+top,ox+cx+60,oy+cy+35)
+        probes=(region[:2],(region[2]-1,region[1]),(region[0],region[3]-1),
+                (region[2]-1,region[3]-1),(ox+cx,oy+cy))
+        if any(not inside(desktop.monitor_rect,point) or not (hit:=window_at(point))
+               or win32gui.GetAncestor(hit,2)!=hwnd for point in probes):
+            continue
+        expected=scaled[top:cy+35,left:cx+60]
+        if cv2.cvtColor(expected,cv2.COLOR_BGR2GRAY).std()<10:
+            continue
+        actual=capture_screen_region(region)
+        # DWM interpolation can shift glyph edges by a device pixel.
+        template=expected[3:-3,3:-3]
+        score=cv2.matchTemplate(actual,template,cv2.TM_CCOEFF_NORMED)
+        _,confidence,_,location=cv2.minMaxLoc(score)
+        if confidence>=.92 and max(abs(i-3) for i in location)<=2:
+            seen.add((x<.5,y>.5))
+    return (len(seen)>=3 and len({a for a,_ in seen})==2 and len({b for _,b in seen})==2
+            and win32gui.GetForegroundWindow()==hwnd)
 
 
 def _identity(info: WeComWindowInfo) -> tuple:
@@ -354,7 +391,16 @@ def capture_visible_window(manager: WeComWindowManager | None = None, *,
             coordinates = build_coordinates(target.pid, target.hwnd, target.class_name, (state.width, state.height),
                                             (width, height), state.dpi, before.last.desktop, paint_verified=True)
         except CoordinateError as error:
-            raise failure("COORDINATE_MAPPING_UNVERIFIED", str(error), coverage) from error
+            if (str(error)!='RENDER_SCALE_UNEXPLAINED' or not _physical_raster_match(pixels,health)):
+                raise failure("COORDINATE_MAPPING_UNVERIFIED", str(error), coverage) from error
+            latest=probe(manager)
+            if latest.identity!=health.identity or latest.geometry_key!=health.geometry_key or not latest.foreground:
+                raise failure("COORDINATE_MAPPING_UNVERIFIED","RDP_GEOMETRY_CHANGED_DURING_PIXEL_CHECK")
+            try:
+                coordinates=build_coordinates(target.pid,target.hwnd,target.class_name,(state.width,state.height),
+                        (width,height),state.dpi,latest.last.desktop,paint_verified=True,desktop_pixels_verified=True)
+            except CoordinateError as remaining:
+                raise failure("COORDINATE_MAPPING_UNVERIFIED",str(remaining),coverage) from remaining
     elif inspect is None and render is _render_complete_client:
         raise failure("COORDINATE_MAPPING_UNVERIFIED", "未取得可独立复核的物理桌面与客户区映射", coverage)
     if mouse is not None:

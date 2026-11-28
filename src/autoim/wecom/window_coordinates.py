@@ -152,7 +152,7 @@ class WindowCoordinates:
 
 
 def build_coordinates(pid, hwnd, class_name, client_size, image_size, dpi, desktop, *, paint_verified,
-                      image_origin=(0, 0)):
+                      image_origin=(0, 0), desktop_pixels_verified=False):
     if not paint_verified or image_origin != (0, 0):
         raise CoordinateError("IMAGE_PAINT_OR_ORIGIN_UNVERIFIED")
     if not desktop or not desktop.awareness.thread.startswith("PER_MONITOR"):
@@ -178,13 +178,14 @@ def build_coordinates(pid, hwnd, class_name, client_size, image_size, dpi, deskt
     factors = tuple(image / client for image, client in zip(image_size, client_size))
     identity = all(abs(a-b) <= 1 for a,b in zip(client_size, image_size))
     dpi_scale = dpi / 96
-    if not identity and (abs(factors[0] - factors[1]) > .012
-                         or any(abs(image - client * dpi_scale) > 2
-                                for image, client in zip(image_size, client_size))
-                         or desktop.window_awareness == "UNKNOWN"):
+    dpi_explains = all(abs(image - client*dpi_scale)<=2 for image,client in zip(image_size,client_size))
+    measured = desktop.remote and desktop_pixels_verified and .65<=factors[0]<=3
+    if not identity and (abs(factors[0]-factors[1])>.012 or not (dpi_explains or measured)
+                         or desktop.window_awareness=="UNKNOWN"):
         raise CoordinateError("RENDER_SCALE_UNEXPLAINED")
     return WindowCoordinates(pid, hwnd, class_name, client_size, image_size, dpi, desktop,
-                             "NATIVE_CLIENT" if identity else "VERIFIED_DPI_RENDER", image_origin)
+                             "NATIVE_CLIENT" if identity else "VERIFIED_DPI_RENDER" if dpi_explains else
+                             "RDP_PHYSICAL_RASTER_MATCH", image_origin)
 
 
 def cursor_position():

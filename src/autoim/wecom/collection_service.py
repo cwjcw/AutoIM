@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from contextlib import closing
 from concurrent.futures import CancelledError
 from hashlib import blake2s
 from collections import Counter, OrderedDict
@@ -10,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock
-from time import perf_counter
+from time import perf_counter, sleep
 from uuid import uuid4
 
 import cv2
@@ -18,14 +20,16 @@ import numpy as np
 
 from autoim.calibration import CalibrationStore
 from autoim.runtime_paths import runtime_paths
+from autoim.wecom.collection_tasks import CaptureTasks
+from autoim.wecom.collection_history import Page, Sequence, page_displacement, resume_segment
 from autoim.wecom.collection_hover import HoverBudget
 from autoim.wecom.collection_core import (MAX_READ_POLLS, A2Attempt, CoreRun, CoreTask, CoreView, analyze_read, avatar_distance, bounds,
-                                         failure_crop_directory, history_changed, history_sample)
+                                         failure_crop_directory, history_changed, history_sample, normalized_text)
 from autoim.wecom.collection_events import CollectionTrace, EventTime, SaveNotice
 from autoim.wecom.collection_evidence import c2_evidence_regions, contact_scan, message_evidence, rect, title_evidence
 from autoim.wecom.collection_incremental import CoreAccount, DefaultAccountConflict, attach_times, preview_visible, save_visible
 from autoim.wecom.collection_pending import CoreDurability, PendingBatch, SavingBlocked, saving_reason
-from autoim.wecom.collection_navigation import CollectionNavigation, CollectionPermit, NavigationPaused, _identity, isolated_row, row_target
+from autoim.wecom.collection_navigation import MAX_HISTORY_NOTCHES, CollectionNavigation, CollectionPermit, NavigationPaused, _identity, isolated_row, row_target
 from autoim.wecom.collection_profile import (ProfileAction, ProfileCheck, ProfileSurface, ProfileWindows, card_close,
                                               email_from_spans, is_profile_card, menu_action, unique_cards, unique_menu)
 from autoim.wecom.collection_runtime import safe_reason
@@ -35,6 +39,7 @@ from autoim.wecom.visual_account import LoginEvidence, read_login
 from autoim.wecom.visual_capture import CaptureError, capture_visible_window
 from autoim.wecom.visual_b2 import mute_region
 from autoim.wecom.visual_contacts import ContactObservation, muted_icon_region
+from autoim.wecom.visual_history import same_history_viewport
 from autoim.wecom.visual_layout import Box, LayoutObservation, VisualThresholds, detect_layout
 from autoim.wecom.visual_monitor import _different, probe_frame, summarize
 from autoim.wecom.visual_observation import VisualObservation, observe_frame
@@ -629,7 +634,7 @@ class CollectionService:
         if email_test_only:
             self._force_email = True
             self._pending_email = None
-        self.permit.grant(scroll=scroll)
+        self.permit.grant(scroll=scroll or bool(core and isinstance(self._durability, CoreDurability)))
         self._run_id = uuid4().hex
         self._detection_finished = False
         self._isolated_run = None
@@ -667,7 +672,8 @@ class CollectionService:
                      "flow": "CORE_ISOLATED_INCREMENTAL" if core else "EMAIL_DIAGNOSTIC" if email_test_only else "FORMAL_OR_LEGACY"})
         if core:
             core.clock = TestClock(self._timed_core_event,
-                                   seconds=FULL_COLLECTION_SECONDS if self._durability else TEST_SECONDS)
+                                   seconds=FULL_COLLECTION_SECONDS if self._durability else TEST_SECONDS,
+                                   history=isinstance(self._durability, CoreDurability))
             core.clock.begin(1, "检查本机保存环境" if self._durability else "定位、恢复、最大化并激活企业微信")
             if self._isolate_core_reads:
                 core.reader = CoreReadWorker(self.read._calibration_path, self.read._thresholds_path)
@@ -685,6 +691,12 @@ class CollectionService:
             run.invalidated = True
             missing_read = bool(was_active and run.task and run.task.clicked_at)
             unresolved_a2 = bool(was_active and run.a2_pending and run.a2_pending.started_input)
+            range_outcome = run.view.range_outcome
+            if self._durability and not range_outcome:
+                if source == 'automatic':
+                    range_outcome = 'PARTIAL' if run.view.a2_status == 'NONE' else 'LOCATE_INCOMPLETE'
+                else:
+                    range_outcome = {'timeout': 'BUDGET', 'failure': 'BLOCKED'}.get(source, 'STOPPED')
             if missing_read:
                 self._core_event("TARGET_PARTIAL", run.task, "PARTIAL", reason="STOPPED_AFTER_CLICK", read_risk=True)
             self._core_state(phase="TEST_FINISHED" if source in ("automatic", "timeout", "failure") else "STOPPED", waiting=0,
@@ -692,9 +704,7 @@ class CollectionService:
                              partial=run.view.partial + missing_read,
                              read_unfinished=run.view.read_unfinished + missing_read,
                              a2_unconfirmed_open=run.view.a2_unconfirmed_open + unresolved_a2,
-                             range_outcome=run.view.range_outcome or (
-                                 {"timeout": "BUDGET", "failure": "BLOCKED", "control": "STOPPED"}.get(source, "STOPPED")
-                                 if self._durability and source != "automatic" else ""))
+                             range_outcome=range_outcome)
             if was_active and run.clock:
                 code = {"automatic": "TEST_COMPLETED", "timeout": "TEST_TIMEOUT", "failure": "TEST_FAILED"}.get(source, "TEST_STOPPED")
                 run.clock.finish(code, final_reason or "用户停止检测", clicks=run.view.clicks,
@@ -702,7 +712,8 @@ class CollectionService:
                                  failures=run.view.failures, partial=run.view.partial, a2_start=run.view.a2_first,
                                  a2_remaining=run.view.a2_current, a2_status=run.view.a2_status,
                                  a2_attempts=run.view.a2_attempts, a2_no_progress=run.view.a2_no_progress,
-                                 a2_new_targets=run.view.a2_new_targets, range_outcome=run.view.range_outcome)
+                                 a2_new_targets=run.view.a2_new_targets, range_outcome=run.view.range_outcome,
+                                 history_pages=run.view.history_pages, unfinished_jobs=run.view.unfinished_jobs)
             if not self._lock.locked() and run.reader:
                 run.reader.close()
         if self._profile_check and isinstance(self._profile_check.known_windows, ProfileWindows):
@@ -724,9 +735,20 @@ class CollectionService:
         self.finish_run()
 
     def finish_run(self):
-        if not self.runtime or self.active or self._lock.locked() or self._worker_in_flight or self._detection_finished:
+        if self.active or self._lock.locked() or self._worker_in_flight or self._detection_finished:
             return
         self._detection_finished = True
+        run = self._core
+        if run and run.jobs:
+            active_ids = {task.id for task in (run.task, run.navigation_task) if task}
+            if run.a2_pending and run.a2_pending.intent:
+                active_ids.add(run.a2_pending.intent)
+            try:
+                run.jobs.pause(active_ids)
+            except (sqlite3.Error, OSError, ValueError) as exc:
+                self._core_event('CAPTURE_CHECKPOINT_STATUS_FAILED', result='PARTIAL', reason=saving_reason(exc))
+        if not self.runtime:
+            return
         self._record("STOP", "WORKER_DRAINED", "AUTO_PASS",
                      details={"source": self._status.stop_reason})
         self._record("RUN", "DETECTION_FINISHED", details={"report": self.runtime.report(self._run_id)})
@@ -1953,6 +1975,8 @@ class CollectionService:
         run.task = None
         run.navigation_task = None
         missing_read = bool(task.clicked_at and code != "TARGET_COMPLETED")
+        if run.jobs:
+            run.jobs.update(task.id,'RETRY_PENDING',reason=reason or 'COVERAGE_NOT_YET_COMMITTED')
         if code != "TARGET_COMPLETED":
             self._keep_core_failure(reason, task)
             self._core_failure_crop(task, raw, analysis)
@@ -1961,7 +1985,7 @@ class CollectionService:
         self._core_event(code, task, result, reason=reason, read_risk=missing_read)
         if analysis and analysis.messages:
             run.clock.begin(7, "解析消息时间、比对本机历史、保存并展示")
-            if allow_persistence and self.active and task.verified and not task.target.duplicate_name:
+            if allow_persistence and self.active and task.verified and not task.target.duplicate_name and not task.history_session:
                 analysis = self._core_hover(task, raw, analysis)
             analysis = self._core_persist(task, raw, analysis, allow=allow_persistence)
             if self._core_account:
@@ -2038,6 +2062,9 @@ class CollectionService:
             if recovery.blocked:
                 raise SavingBlocked(recovery.blocked)
             self._core_account = account
+            if isinstance(self._durability, CoreDurability):
+                run.jobs = CaptureTasks(self._durability.queue, self.test_store.path, account)
+                self._reconcile_capture_tasks()
             run.storage_ready = True
             run.clock.progress("保存环境就绪，准备企业微信窗口")
             self._core_event("CORE_STORAGE_READY", result="AUTO_PASS", invalid=recovery.invalid)
@@ -2046,6 +2073,142 @@ class CollectionService:
             reason = saving_reason(error)
             self._stop_core_storage(reason)
             return False
+
+    def _reconcile_capture_tasks(self):
+        jobs = self._core.jobs
+        for job in jobs.outstanding():
+            if job['state'] != 'COMMIT_PENDING' or not job['batch']:
+                continue
+            with closing(sqlite3.connect(self.test_store.path.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+                if not db.execute("SELECT 1 FROM sqlite_master WHERE name='core_commit_receipts'").fetchone():
+                    continue
+                receipt = db.execute("SELECT summary FROM core_commit_receipts WHERE batch_id=? AND account_key=?",
+                                     (job['batch'],self._core_account.profile)).fetchone()
+            if receipt:
+                evidence=json.loads(job['evidence'])
+                done=bool(evidence.get('coverage_complete') and not json.loads(receipt[0])['uncertain'])
+                jobs.update(job['id'],'COMPLETED' if done else 'RETRY_PENDING',reason='COMMIT_RECEIPT_RECOVERED')
+
+    def _resume_visible(self, raw, *, locate=False):
+        run = self._core
+        outstanding = run.jobs.outstanding()
+        self._core_state(unfinished_jobs=len(outstanding))
+        absent = []
+        for job in outstanding:
+            if job["kind"] != "CONTACT" or job["id"] in run.resuming or job["run"] == self._run_id:
+                continue
+            proof = json.loads(job["evidence"])
+            if (
+                not proof.get("name_reliable")
+                or proof.get("duplicate")
+                or not raw.login.key
+                or raw.login.key != proof.get("login")
+            ):
+                continue
+            rows = [r for r in raw.contacts if name_key(r.display_name) == name_key(job["name"])]
+            if not rows:
+                if (
+                    self.scope.personal
+                    and self.scope.group
+                    or proof.get("kind") == "GROUP_CANDIDATE"
+                    and self.scope.group
+                    or proof.get("peer") == "PERSONAL_WECHAT"
+                    and self.scope.personal
+                ):
+                    absent.append(job)
+                continue
+            if len(rows) != 1:
+                continue
+            row = rows[0]
+            if (
+                not row.name_reliable
+                or row.status != "CANDIDATE"
+                or self.scope.exclusion(row)
+                or row.kind != proof.get("kind")
+                or row.peer_type != proof.get("peer")
+                or self.scope.personal != self.scope.group
+                and row.peer_type == "UNKNOWN"
+                and row.kind == "CONTACT"
+                or row.is_muted is None
+                and not self.scope.muted
+                and not (
+                    proof.get("count")
+                    and row.mute_evidence == "MUTE_ICON_UNCONFIRMED"
+                    and row.mute_score is not None
+                    and row.mute_score < 0.60
+                )
+            ):
+                continue
+            target = _Target(row, name_key(row.display_name), avatar_key(raw, row), ())
+            if proof.get("avatar") and target.avatar and target.avatar != proof["avatar"]:
+                self._core_event(
+                    "CAPTURE_TASK_RESUME_DEFERRED", job=job["id"], reason="RECOVERY_AVATAR_CONFLICT"
+                )
+                continue
+            task = CoreTask(
+                target,
+                raw,
+                EventTime.now().wall,
+                datetime.fromisoformat(job["created"]),
+                history_sample(raw),
+                id=job["id"],
+                recovering=True,
+            )
+            run.resuming.add(task.id)
+            if not _matches_target(raw, target):
+                self._durability.before_click(self._core_account, self._core_check)
+                run.jobs.update(task.id, "NAVIGATION_PENDING", reason="RESUME_VISIBLE_ROW")
+                try:
+                    self.navigator.select_recovery(
+                        raw, row, target.name, fresh_capture=self._core_capture, deadline_check=self._core_check
+                    )
+                except NavigationPaused as exc:
+                    run.jobs.update(task.id, "RETRY_PENDING", reason=safe_reason(exc))
+                    self._core_event("CAPTURE_TASK_RESUME_DEFERRED", task, "PARTIAL", reason=safe_reason(exc))
+                    continue
+                task.clicked_at = EventTime.now().wall
+                run.jobs.update(task.id, "CLICKED", clicked_at=task.clicked_at.isoformat())
+                self._core_state(clicks=run.view.clicks + 1)
+            run.clock.complete()
+            run.clock.begin_target()
+            run.clock.begin(5, "正在恢复未完成任务")
+            run.task = task
+            self._core_event("CAPTURE_TASK_RESUMED", task, "AUTO_PASS", already_open=not bool(task.clicked_at))
+            return self._set(reason="正在恢复已发现会话，重新核验 C1 与可见历史")
+        if locate and absent and not raw.layout.b2_boundary_uncertain(raw.frame.visual_unit):
+            job = absent[0]
+            if job["id"] not in run.searched:
+                run.searched.add(job["id"])
+                self._durability.before_click(self._core_account, self._core_check)
+                run.jobs.update(job["id"], "NAVIGATION_PENDING", reason="SEARCH_PERSISTED_TARGET")
+                try:
+                    result = self.navigator.find_recovery(
+                        raw, job["name"], fresh_capture=self._core_capture, deadline_check=self._core_check
+                    )
+                except NavigationPaused as exc:
+                    result = safe_reason(exc)
+                self._core_event("HISTORY_SEARCH_RESULT", job=job["id"], reason=result)
+                if result == "MATCH_OPENED":
+                    run.jobs.update(job["id"], "CLICKED", reason="SEARCH_RESULT_OPENED")
+                    return self._set(reason="搜索定位后重新核对当前消息页面")
+            view = tuple((r.display_name, r.box.top // 8) for r in raw.contacts if r.name_reliable)
+            if run.recovery_up and (view, "UP") in run.recovery_views:
+                run.recovery_up = False
+            upward = run.recovery_up
+            if view and (view, upward) not in run.recovery_views and len(run.recovery_views) < 22:
+                run.recovery_views.add((view, upward))
+                if upward:
+                    run.recovery_views.add((view, "UP"))
+                try:
+                    self.navigator.locate_recovery_rows(
+                        raw, self._core_capture, self._core_check, upward=upward
+                    )
+                except NavigationPaused as exc:
+                    self._core_event("HISTORY_LIST_LOCATE_DEFERRED", job=job["id"], reason=safe_reason(exc))
+                    return None
+                run.clock.complete("PARTIAL", "已滚动定位待补采会话")
+                return self._set(reason="已执行有限列表定位，重新读取可见行")
+        return None
 
     def _storage_blocked_state(self, reason):
         try:
@@ -2075,6 +2238,10 @@ class CollectionService:
             batch = PendingBatch.from_observation(
                 self._core_account, analysis, task.conversation_kind, at, task.match_evidence,
                 self._run_id, task.id, (task.before_evidence, task.c2_evidence))
+            if run.jobs:
+                task.batch_id=batch.batch_id
+                run.jobs.update(task.id,'COMMIT_PENDING',batch=batch.batch_id,
+                                coverage_complete=bool(task.coverage and not analysis.gaps))
             durable.queue.stage(batch)
             staged = True
             self._set(storage_pending=self._status.storage_pending + 1, storage_state="STAGED")
@@ -2108,7 +2275,7 @@ class CollectionService:
         run = self._core
         if (not run.reader or not self._core_account or not raw.frame.coordinates
                 or not isinstance(self.navigator, CollectionNavigation)
-                or (task and (raw is task.before or task.read_at != raw.frame.captured_at))):
+                or (task and ((raw is task.before and not task.recovering) or task.read_at != raw.frame.captured_at))):
             return analysis
         at = (task.read_at if task else None) or raw.frame.captured_at
         try:
@@ -2123,7 +2290,7 @@ class CollectionService:
                   and item.quality == "RELIABLE" and decisions[index] != "EXISTING"]
         if not chosen:
             return analysis
-        elapsed_limit = perf_counter() + 3.6
+        elapsed_limit = perf_counter() + (8.5 if run.jobs else 3.6)
         try:
             stage_end = run.clock.check()
         except TestDeadline:
@@ -2176,6 +2343,8 @@ class CollectionService:
                     time_precision=result.precision if result else "", fallback=not result or bool(result.issue))
                 if result:
                     updated[index] = replace(item, hover=result)
+                    if result.anchor and not result.issue:
+                        self._core_state(exact_times=run.view.exact_times+1)
                 if self.runtime and (result or attempt == 0):
                     height, width = raster.after.shape[:2]
                     local = Box(0, 0, width, height)
@@ -2245,6 +2414,10 @@ class CollectionService:
                        history=result.historical, visible=len(result.messages), overlap=result.overlap, gap=result.gap,
                        anchor_status=result.anchor_status, had_anchor=result.had_anchor, anchor_updated=result.anchor_updated,
                        receipt_reused=result.receipt_replayed, committed_at=result.committed_at)
+        if run.jobs:
+            done = bool(task.coverage and not analysis.gaps and not result.uncertain and result.committed_at)
+            run.jobs.update(task.id,'COMPLETED' if done else 'RETRY_PENDING',reason=task.coverage or 'COVERAGE_OPEN',
+                            receipt=result.committed_at,review=result.uncertain)
         event = self._core_event("CORE_DB_COMMITTED", task, "AUTO_PASS", **details)
         self._keep_core_database(task, raw, result.messages, {**details, "committed": True,
                                                               "previous_anchor": result.previous_anchor}, event)
@@ -2426,6 +2599,8 @@ class CollectionService:
             return self._core_blocked(str(exc), timeout=True)
         except CancelledError:
             return self._status
+        except (sqlite3.Error, SavingBlocked, OSError) as exc:
+            return self._stop_core_storage(saving_reason(exc))
         except (CaptureError, NavigationPaused, OcrUnavailable) as exc:
             if not self.active:
                 return self._status
@@ -2479,7 +2654,7 @@ class CollectionService:
 
         def allow_c2(header):
             nonlocal ready, phase
-            if not task or not task.clicked_at or not self.active or self._core_login_changed(header.login):
+            if not task or not (task.clicked_at or task.recovering) or not self.active or self._core_login_changed(header.login):
                 return False
             if _identity(header.frame) != _identity(task.before.frame):
                 phase = "WINDOW_GEOMETRY_CHANGED_AFTER_CLICK"
@@ -2495,6 +2670,14 @@ class CollectionService:
                 evidence, distance = _core_selection_evidence(task.direct_reference, candidate, task.target, refreshed)
             else:
                 evidence, distance = _core_selection_evidence(task.before, candidate, task.target, refreshed)
+            if task.recovering and not task.target.duplicate_name and _matches_target(candidate,task.target,
+                                                                                      avatar_corroborated=True):
+                selected=next(row for row in candidate.contacts if name_key(row.display_name)==task.target.name)
+                distance=avatar_distance(task.before,task.target.row,candidate,selected)
+                if distance is not None and distance>22:
+                    evidence='AVATAR_CONFLICT'
+                elif distance is not None or _matches_target(candidate,task.target):
+                    evidence='EXACT_VISUAL_IDENTITY'
             task.match_evidence = evidence
             task.match_distance = round(distance, 2) if distance is not None else None
             if evidence not in ("EXACT_VISUAL_IDENTITY", "CLICK_TITLE_ROW_BADGE_REFRESH_AND_AVATAR",
@@ -2516,6 +2699,8 @@ class CollectionService:
             cleared = not row.has_unread_indicator and row.badge is None
             if not task.verified and (refreshed or row.is_selected is True):
                 task.verified = True
+                if run.jobs:
+                    run.jobs.update(task.id,'VERIFIED',confirmation=evidence)
                 run.clock.complete(title_verified=True)
                 run.clock.begin(6, "定位最新消息并读取 C2")
                 self._core_state(verified=run.view.verified + 1, title_match=True)
@@ -2523,7 +2708,7 @@ class CollectionService:
                                  selection=candidate.conversation.selection_method, c2_changed=refreshed,
                                  match_evidence=evidence, avatar_distance=task.match_distance,
                                  after_avatar_contour=bool(row.avatar))
-            if not refreshed:
+            if not refreshed and not task.recovering:
                 task.previous = None
                 return False
             # Treat the first verified sample as the reference. Subsequent samples must
@@ -2644,6 +2829,10 @@ class CollectionService:
                 return self._finish_core_target(task, raw, "TARGET_PARTIAL",
                                                 reason="停止时已取得可靠会话观察", analysis=task.best,
                                                 allow_persistence=False)
+            if run.jobs and isinstance(self.navigator,CollectionNavigation) and not task.target.duplicate_name:
+                analysis=self._capture_history(task,raw,analysis)
+                return self._finish_core_target(task,raw,'TARGET_COMPLETED' if task.coverage and not analysis.gaps else
+                        'TARGET_PARTIAL',reason=task.coverage or 'HISTORY_COVERAGE_OPEN',analysis=analysis)
             if analysis.messages and not analysis.gaps:
                 return self._finish_core_target(task, raw, "TARGET_COMPLETED", analysis=analysis)
             retryable = any(gap["reason"] in ("C2_OCR_FAILED", "C2_OCR_SKIPPED", "BODY_OCR_UNCERTAIN",
@@ -2660,6 +2849,395 @@ class CollectionService:
         self._core_state(phase=phase, risk="CLICKED_AWAITING_READ")
         run.clock.progress("重新截图复核会话和 C2", phase, retry=True)
         return self._set(reason="已点击目标，等待独立截图复核与读取")
+
+    def _capture_history(self, task, raw, initial):
+        run = self._core
+        jobs = run.jobs
+        task.history_session = True
+        initial = self._core_hover(task, raw, initial)
+        current = raw
+        page = Page.read(raw, initial, task)
+        snap = _identity(raw.frame)
+        sequence = Sequence()
+        origin = 0
+        direction = "DOWN"
+        boundary = ""
+        bottom = page.bottom and not page.n1
+        first = page
+        visited = 0
+        stationary = 0
+        notches = 2
+        last_command = ""
+        native_count = None
+        divider = None
+        bottom_preview = ""
+        native_tail_seen = False
+        no_overlap_retries = 0
+        latest = initial.latest
+        saved_pages = jobs.pages(task.id) if task.recovering else []
+        original_id = task.id
+        segment = uuid4().hex
+
+        def target_preview(observation):
+            row = next(
+                (row for row in observation.contacts if name_key(row.display_name) == task.target.name), None
+            )
+            return normalized_text(row.preview) if row and row.preview_reliable else ""
+
+        def archive(*, connected=True):
+            data, marks = message_evidence(current, page.items)
+            shot = self._keep_core_evidence(
+                "history-page", current, data, c2_evidence_regions(current, marks), task=task
+            )
+            ordinal = jobs.page(
+                original_id,
+                page.at,
+                dict(
+                    direction=direction,
+                    origin=origin,
+                    page=page.encode(),
+                    segment=segment,
+                    connected=connected,
+                    bottom_verified=bottom,
+                    shot=shot,
+                    run=self._run_id,
+                ),
+            )
+            jobs.update(original_id, "CAPTURING", direction=direction, ordinal=ordinal)
+            self._core_state(history_pages=run.view.history_pages + 1, phase="HISTORY_" + direction)
+            self._core_event(
+                "HISTORY_PAGE",
+                task,
+                page_number=ordinal,
+                direction=direction,
+                origin=origin,
+                objects=len(page.items),
+                gaps=len(page.gaps),
+                n1=page.n1,
+                n2=page.n2,
+                top=page.top,
+                bottom=page.bottom,
+            )
+
+        def full_read():
+            # Poll scene stability before expensive OCR and recheck the header
+            # on the exact captured frame from which the message body is read.
+            previous = None
+            for _ in range(5):
+                self._core_check()
+                if self._cancel.wait(0.20):
+                    raise CancelledError()
+                frame = self._core_capture()
+                if _identity(frame) != snap:
+                    raise NavigationPaused("HISTORY_WINDOW_CHANGED")
+                area = page.area
+                sample = cv2.resize(area.crop(frame.pixels), (240, 144), interpolation=cv2.INTER_AREA)
+                if previous is not None and np.mean(cv2.absdiff(sample, previous) > 12) < 0.002:
+                    break
+                previous = sample
+            else:
+                raise NavigationPaused("HISTORY_PAGE_UNSTABLE")
+            header = self._core_read_frame(frame, "header")
+            self._validate_read_frame(header.frame, frame)
+            if header.frame.captured_at != frame.captured_at:
+                raise NavigationPaused("HISTORY_FRAME_MISMATCH")
+            if self._core_login_changed(header.login):
+                raise NavigationPaused("HISTORY_A1_CHANGED")
+            if not same_history_viewport(page.area, header.layout.get('C2')):
+                self._core_event('HISTORY_GEOMETRY_REJECTED', task, 'PARTIAL',
+                                 before_c2=bounds(page.area), after_c2=bounds(header.layout.get('C2')),
+                                 before_c1=bounds(current.layout.get('C1')), after_c1=bounds(header.layout.get('C1')),
+                                 before_c3=bounds(current.layout.get('C3')), after_c3=bounds(header.layout.get('C3')))
+                raise NavigationPaused("HISTORY_C2_GEOMETRY_CHANGED")
+            if not _matches_target(header, task.target, avatar_corroborated=True):
+                self._core_event(
+                    "HISTORY_IDENTITY_REJECTED",
+                    task,
+                    "PARTIAL",
+                    title_exact=name_key(header.conversation.title) == task.target.name,
+                    title_reliable=header.conversation.title_name_reliable,
+                    matching_rows=sum(
+                        name_key(row.display_name) == task.target.name for row in header.contacts
+                    ),
+                    match=header.conversation.match_status,
+                    selection=header.conversation.selection_method,
+                )
+                raise NavigationPaused("HISTORY_CONVERSATION_CHANGED")
+            selected = next(r for r in header.contacts if name_key(r.display_name) == task.target.name)
+            dist = avatar_distance(task.before, task.target.row, header, selected)
+            if dist is not None and dist > 22:
+                raise NavigationPaused("HISTORY_AVATAR_CONFLICT")
+            body = self._core_read_frame(frame, "body")
+            self._validate_read_frame(body.frame, frame)
+            if body.frame.captured_at != frame.captured_at:
+                raise NavigationPaused("HISTORY_FRAME_MISMATCH")
+            if (
+                not _matches_target(body, task.target, avatar_corroborated=True)
+                or body.layout.get('C2') != header.layout.get('C2')
+            ):
+                raise NavigationPaused("HISTORY_BODY_IDENTITY_CHANGED")
+            analysis = analyze_read(
+                body,
+                task.id,
+                body.conversation.title,
+                None,
+                "",
+                verified=True,
+                badge_cleared=False,
+                refreshed=False,
+            )
+            return body, Page.read(body, analysis, task)
+
+        resumed = resume_segment(saved_pages, page)
+        if resumed:
+            origin, old_pages = resumed
+            for old, offset in old_pages:
+                sequence.add(old, offset)
+            bottom = True
+            latest = "RESUMED_VERIFIED_BOTTOM"
+        sequence.add(page, origin)
+        if bottom:
+            bottom_preview = target_preview(current)
+        archive()
+        if saved_pages:
+            matches = sum(
+                page_displacement(page, Page.decode(p["page"]), "UP") == 0
+                for p in saved_pages
+                if p.get("page")
+            )
+            self._core_event("HISTORY_RESUME_ANCHOR", task, prior_pages=len(saved_pages), same_rasters=matches)
+        try:
+            locate = page.n1 and not resumed
+            seeking = not bottom
+            while visited < 36 and self._core.clock.check() - perf_counter() > 7:
+                self._core_check()
+                command = "LOCATE" if locate else ("DOWN" if seeking else "UP")
+                locate = False
+                direction = command
+                self._core.clock.progress(
+                    {"LOCATE": "正在定位新消息", "DOWN": "正在向下读取新消息", "UP": "正在向上读取历史"}[
+                        command
+                    ]
+                )
+                if command == "UP" and page.top and not page.loading and stationary >= 1:
+                    boundary = "ACCESSIBLE_HISTORY_TOP"
+                    break
+                if command == "UP" and bottom and not sequence.gaps and sequence.objects:
+                    assembled = sequence.result(latest)
+                    if not assembled.gaps and not task.recovering:
+                        _, decisions = preview_visible(
+                            self.test_store, self._core_account, assembled, raw.frame.captured_at
+                        )
+                        if (
+                            decisions.count("EXISTING") >= 2
+                            and "REVIEW" not in decisions
+                            and self._history_tail_clear(task)
+                        ):
+                            boundary = "ORDERED_DATABASE_BOUNDARY"
+                            break
+                if command == "LOCATE":
+                    control = next(entry for entry in current.message_ocr if entry.kind == "C2_N1")
+                    native_count = int("".join(ch for ch in control.span.text if ch.isdecimal()))
+                    self._core_event(
+                        "C2_N1_REQUESTED", task, count=native_count, button=bounds(control.span.box)
+                    )
+                try:
+                    self.navigator.history_action(
+                        current,
+                        command,
+                        fresh_capture=self._core_capture,
+                        deadline_check=self._core_check,
+                        notches=notches,
+                    )
+                except NavigationPaused as exc:
+                    if str(exc).startswith("等待用户空闲"):
+                        self._core_event("HISTORY_WAIT_FOR_IDLE", task, "PARTIAL", direction=command)
+                        if self._cancel.wait(1.8):
+                            raise CancelledError()
+                    elif not any(key in str(exc) for key in ("目标行已变化", "C2_N1_CHANGED")):
+                        raise
+                    current, refreshed = full_read()
+                    if page_displacement(page, refreshed, "UP") != 0:
+                        raise NavigationPaused("HISTORY_CHANGED_BEFORE_INPUT") from exc
+                    if command == "LOCATE" and not refreshed.n1:
+                        seeking = True
+                        continue
+                    self.navigator.history_action(
+                        current,
+                        command,
+                        fresh_capture=self._core_capture,
+                        deadline_check=self._core_check,
+                        notches=notches,
+                    )
+                visited += 1
+                current, next_page = full_read()
+                preview = target_preview(current)
+                if command == "UP" and bottom_preview and preview and preview != bottom_preview:
+                    raise NavigationPaused("HISTORY_LATEST_CHANGED_DURING_READ")
+                if command == "LOCATE":
+                    page = next_page
+                    segment = uuid4().hex
+                    sequence = Sequence()
+                    origin = 0
+                    bottom = False
+                    archive()
+                    sequence.add(page, 0)
+                    seeking = True
+                    bottom = False
+                    stationary = 0
+                    divider = page.n2
+                    first_below = next(
+                        (m.sequence for m in page.items if page.n2 and m.box.top >= page.n2), None
+                    )
+                    self._core_event(
+                        "C2_N1_NAVIGATED",
+                        task,
+                        n2=page.n2,
+                        first_below=first_below,
+                        count=native_count,
+                        path="DIVIDER_DOWN" if page.n2 else "REACQUIRE_LATEST",
+                    )
+                    continue
+                delta = page_displacement(page, next_page, command)
+                self._core_event(
+                    "HISTORY_SCROLL_RESULT",
+                    task,
+                    direction=command,
+                    delta=delta,
+                    overlap_ratio=1 - abs(delta) / page.area.height if delta is not None else None,
+                    target_overlap=0.25,
+                    notches=notches,
+                )
+                if delta is None:
+                    previous_page = page
+                    page = next_page
+                    archive(connected=False)
+                    if no_overlap_retries >= 2:
+                        raise NavigationPaused("HISTORY_OVERLAP_UNVERIFIED")
+                    # Try to re-enter the measured overlap in bounded reverse steps.
+                    # Disconnected observations remain available for review.
+                    reverse = 'UP' if command == 'DOWN' else 'DOWN'
+                    for _ in range(min(3, notches, 36 - visited)):
+                        self.navigator.history_action(current, reverse, fresh_capture=self._core_capture,
+                                                      deadline_check=self._core_check, notches=1)
+                        visited += 1
+                        current, page = full_read()
+                        delta = page_displacement(previous_page, page, command)
+                        self._core_event('HISTORY_OVERLAP_RETRY', task, direction=reverse, delta=delta)
+                        if delta is not None:
+                            break
+                        archive(connected=False)
+                    no_overlap_retries += 1
+                    if delta is None:
+                        raise NavigationPaused('HISTORY_OVERLAP_UNVERIFIED')
+                    next_page = page
+                    notches = 1
+                stationary = (stationary + 1 if last_command == command else 1) if delta == 0 else 0
+                last_command = command
+                origin += delta
+                page = next_page
+                if page.n2 is not None:
+                    seen_divider = page.n2 + origin
+                    if divider is not None and abs(seen_divider - divider) > 5:
+                        raise NavigationPaused("HISTORY_DIVIDER_MOVED")
+                    divider = seen_divider
+                if native_count is not None and command == "DOWN":
+                    native_tail_seen |= any(
+                        page_displacement(first, page, side) is not None for side in ("UP", "DOWN")
+                    )
+                archive()
+                sequence.add(page, origin)
+                if page.loading:
+                    raise NavigationPaused("HISTORY_LOADING")
+                if command == "DOWN" and not page.n1 and (page.bottom or stationary >= 2 and page.items):
+                    bottom = True
+                    latest = "VERIFIED_SCROLL_BOTTOM"
+                    bottom_preview = target_preview(current)
+                    seeking = False
+                    stationary = 0
+                elif (
+                    command == "UP"
+                    and stationary >= 2
+                    and page.items
+                    and (
+                        page.top
+                        or not current.history_scrollbar
+                        and not any(i.quality == "CLIPPED" for i in page.items)
+                    )
+                ):
+                    boundary = "ACCESSIBLE_HISTORY_TOP"
+                    break
+                elif stationary >= 3:
+                    raise NavigationPaused("HISTORY_SCROLL_NO_PROGRESS")
+                if delta:
+                    notches = max(
+                        1,
+                        min(
+                            MAX_HISTORY_NOTCHES,
+                            round(
+                                notches
+                                * page.area.height
+                                * (0.6 if any(i.quality == "CLIPPED" for i in page.items) else 0.75)
+                                / abs(delta)
+                            ),
+                        ),
+                    )
+            result = sequence.result(latest if bottom else "UNKNOWN")
+            after_divider = tuple(
+                item for item in result.messages if divider is not None and item.box.top >= divider
+            )
+            if (
+                bottom
+                and not result.gaps
+                and native_count is not None
+                and len(after_divider) == native_count
+                and all(item.direction == "INBOUND" for item in after_divider)
+            ):
+                result = replace(
+                    result,
+                    messages=tuple(
+                        replace(item, unread="CONFIRMED_UNREAD" if item in after_divider else "HISTORY_VISIBLE")
+                        for item in result.messages
+                    ),
+                )
+            if (
+                bottom
+                and boundary
+                and not result.gaps
+                and result.messages
+                and (native_count is None or native_tail_seen)
+            ):
+                task.coverage = boundary
+                if boundary == "ACCESSIBLE_HISTORY_TOP":
+                    result = replace(result, completeness="ACCESSIBLE_HISTORY_CONTIGUOUS")
+            self._core_event(
+                "HISTORY_RANGE_RESULT",
+                task,
+                boundary=boundary,
+                bottom=bottom,
+                pages=visited + 1,
+                repeated=sequence.repeated,
+                stitched=sequence.stitched,
+                complete=bool(task.coverage),
+                native_count=native_count,
+                independent_objects=len(result.messages),
+                original_tail_seen=native_tail_seen,
+                divider_objects=len(after_divider) if divider is not None else None,
+            )
+            return result if bottom and result.messages else initial
+        except (CaptureError, NavigationPaused, OcrUnavailable, TestDeadline, CancelledError) as exc:
+            self._core_event("HISTORY_RANGE_INTERRUPTED", task, "PARTIAL", reason=safe_reason(exc))
+            return sequence.result(latest) if bottom and sequence.objects else initial
+
+    def _history_tail_clear(self, task):
+        with closing(sqlite3.connect(self.test_store.path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            row = db.execute(
+                """SELECT t.gap FROM core_conversation_tail t JOIN conversations c
+                ON t.conversation_id=c.id JOIN accounts a ON c.account_id=a.id
+                WHERE a.profile=? AND c.name_key=?""",
+                (self._core_account.profile, task.target.name),
+            ).fetchall()
+        return row == [(0,)]
 
     def _a2_state(self, raw):
         unread = raw.global_unread
@@ -2741,17 +3319,26 @@ class CollectionService:
                              "result": result, "changed_title": changed_title, "decreased": decreased,
                              "new_targets": len(eligible), "no_progress": not progress,
                              "old_evidence": step.evidence, "scan": self._status.scan_id})
-        if self.runtime:
-            self._a2_evidence("a2-after", raw, event, state, result=result, before_evidence=step.evidence)
+        after_evidence = (self._a2_evidence('a2-after', raw, event, state, result=result, before_evidence=step.evidence)
+                          if self.runtime else '')
         self._core_state(a2_no_progress=0 if progress else run.view.a2_no_progress + 1,
                          a2_new_targets=run.view.a2_new_targets + len(eligible),
                          a2_unconfirmed_open=run.view.a2_unconfirmed_open + missing)
+        if run.jobs and step.intent:
+            run.jobs.update(step.intent,'REVIEW_REQUIRED' if missing or not geometry_ok or target else 'COMPLETED',
+                            reason=result, after_scan=self._status.scan_id, after=after_evidence)
         if target:
             stamp = EventTime.now().wall
             run.task = CoreTask(target, before, stamp, run.discovered_at.get(target.key, step.at),
                                 before_sample=history_sample(before), clicked_at=step.at,
                                 before_evidence=step.evidence, scan_id=self._status.scan_id,
                                 direct_reference=origin if origin is raw else None)
+            if run.jobs:
+                run.task.id = run.job_ids.get(target.key) or run.jobs.discover(self._run_id,target.row.display_name,
+                    dict(kind=target.row.kind,peer=target.row.peer_type,name_reliable=target.row.name_reliable,
+                         login=raw.login.key,duplicate=target.duplicate_name,count=target.unread_signature[0],
+                         locate_action=step.intent))
+                run.jobs.update(step.intent,'COMPLETED',linked_task=run.task.id)
             run.clock.complete()
             run.clock.begin_target()
             run.clock.begin(5, "确认 A2 直接打开的未读会话")
@@ -2786,6 +3373,10 @@ class CollectionService:
                     return self._core_blocked("A2 操作前视觉证据不完整")
             except OSError:
                 return self._core_blocked("A2 操作前视觉证据未能写入本机")
+        if run.jobs:
+            attempt.intent = run.jobs.discover(self._run_id,'',dict(before=attempt.evidence,unread=state[1],
+                    scan=self._status.scan_id, login=raw.login.key),kind='A2')
+            run.jobs.update(attempt.intent,'NAVIGATION_PENDING')
         run.a2_pending = attempt
         try:
             self.navigator.locate_unread(raw, fresh_capture=self._core_capture, deadline_check=self._core_check)
@@ -2795,6 +3386,8 @@ class CollectionService:
             if not self.active:
                 return self._status
             if not attempt.started_input:
+                if run.jobs and attempt.intent:
+                    run.jobs.update(attempt.intent, 'COMPLETED', reason='A2_INPUT_NOT_EXECUTED')
                 run.a2_pending = None
                 run.a2_failed_attempts += 1
             run.clock.complete("PARTIAL", safe_reason(exc))
@@ -2854,6 +3447,23 @@ class CollectionService:
             prior = run.signatures.get(key)
             changed = key in run.cleared or (prior is not None and _new_unread(prior, signature))
             if key not in run.seen or changed:
+                if run.jobs:
+                    prior_job=None
+                    if not changed:
+                        for entry in run.jobs.outstanding():
+                            proof=json.loads(entry['evidence'])
+                            if (entry['state']=='DISCOVERED' and entry['kind']=='CONTACT'
+                                    and proof.get('avatar')==target.avatar and proof.get('login')==raw.login.key
+                                    and name_key(entry['name'])==target.name and proof.get('count')==signature[0]
+                                    and proof.get('preview')==signature[1] and not proof.get('duplicate')):
+                                prior_job=entry['id']
+                                break
+                    run.job_ids[key] = run.jobs.discover(self._run_id,target.row.display_name,dict(
+                        name_reliable=target.row.name_reliable, duplicate=target.duplicate_name, kind=target.row.kind,
+                        peer=target.row.peer_type, login=raw.login.key, avatar=target.avatar, count=signature[0],
+                        preview=signature[1], badge=bounds(target.row.badge), scan=self._status.scan_id),
+                        identifier=prior_job,at=raw.frame.captured_at.isoformat())
+                    self._core_event('CAPTURE_TASK_DISCOVERED',job=run.job_ids[key])
                 run.discovered_at[key] = raw.frame.captured_at
                 self._core_event("UNREAD_DETECTED", scan=self._status.scan_id, row=target.row.sequence,
                                  target_id=blake2s((self._run_id + key).encode(), digest_size=8).hexdigest(),
@@ -2883,6 +3493,8 @@ class CollectionService:
             if run.selection_waits >= 2 and not run.navigation_task:
                 return self._core_blocked(foreground_block)
             return self._set(status="PAUSED", reason="已完成 B2 扫描，等待企业微信恢复前台")
+        if run.jobs:
+            self._core_state(unfinished_jobs=len(run.jobs.outstanding()))
         a2 = self._a2_state(raw) if self._durability else None
         if a2:
             if run.a2_pending:
@@ -2890,6 +3502,8 @@ class CollectionService:
                 if outcome is not None:
                     return outcome
         if not eligible:
+            if run.jobs and (resumed := self._resume_visible(raw)) is not None:
+                return resumed
             self._core_state(phase="WAITING_UNREAD")
             if mute_wait:
                 reason = "正在限次复核未知静音状态"
@@ -2915,11 +3529,13 @@ class CollectionService:
                         and not raw.layout.b2_boundary_uncertain(raw.frame.visual_unit)
                         and run.view.a2_no_progress < 3 and run.a2_failed_attempts < 3):
                     return self._a2_locate(raw, a2)
+                if run.jobs and (resumed := self._resume_visible(raw, locate=True)) is not None:
+                    return resumed
                 unresolved = bool(run.a2_uncertain_scans or run.view.a2_unconfirmed_open or
                                   self._status.unreliable_unread_count)
                 if a2[0] != "NONE":
                     result, reason = "LOCATE_INCOMPLETE", "A2 未读定位未完成，剩余未读或入口状态无法确认"
-                elif (unresolved or run.view.partial or run.view.failures or run.view.review_messages
+                elif (unresolved or run.jobs and run.jobs.outstanding() or run.view.partial or run.view.failures or run.view.review_messages
                       or self._status.storage_pending):
                     result, reason = "PARTIAL", "A2 无总未读，保留未归属、待复核或未完成任务"
                 elif self._status.skipped_unread:
@@ -2944,6 +3560,8 @@ class CollectionService:
         else:
             task = CoreTask(target, raw, EventTime.now().wall, run.discovered_at[target.key],
                             before_sample=history_sample(raw))
+            if run.jobs:
+                task.id = run.job_ids[target.key]
             clock.begin_target()
             clock.complete()
             clock.begin(4, "核对 B2 实际操作点并点击联系人")
@@ -2990,6 +3608,13 @@ class CollectionService:
                                         ([x-4, y-4, x+5, y+5], "POINT")]),
                  ("c1", raw.layout.get("C1"), markers)], task=task, source_event=event)
             # Keep the native action in the original gateway; capture runs in the read-only process.
+            if run.jobs:
+                if self.runtime:
+                    self.runtime.sync()
+                    before_record,_=self.runtime.evidence.read(self._run_id,task.before_evidence)
+                    if not before_record or any(region['missing'] for region in before_record['regions']):
+                        return self._stop_core_storage('BEFORE_NAVIGATION_EVIDENCE_INCOMPLETE')
+                run.jobs.update(task.id,'NAVIGATION_PENDING',before=task.before_evidence,point=point)
             run.task = task
             if isinstance(self.navigator, CollectionNavigation):
                 self.navigator.select(raw, target.row, fresh_capture=self._core_capture, deadline_check=self._core_check)
@@ -3019,6 +3644,8 @@ class CollectionService:
             return self._set(status="PAUSED", reason=str(exc), navigation_allowed=False,
                              navigation_block_reason=str(exc))
         task.clicked_at = task.clicked_at or EventTime.now().wall
+        if run.jobs:
+            run.jobs.update(task.id,'CLICKED',clicked_at=task.clicked_at.isoformat())
         if not self.active:
             self._core_state(phase="STOPPED", clicked=True, waiting=0,
                              risk="BEFORE_UNREAD_NOT_READ", clicks=run.view.clicks + 1)

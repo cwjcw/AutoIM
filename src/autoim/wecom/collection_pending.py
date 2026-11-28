@@ -204,6 +204,10 @@ class PendingBatch:
         if not self.analysis.viewport_limits:
             data["analysis"].pop("viewport_limits")
         for item in data["analysis"]["messages"]:
+            if not item.get('media_signature'):
+                item.pop('media_signature',None)
+            if not item.get("observed_at"):
+                item.pop("observed_at", None)
             if item["hover"] is None:
                 item.pop("hover")
         for field in ("captured_at", "created_at"):
@@ -241,15 +245,15 @@ class PendingBatch:
 
 
 def _decode_message(data):
+    data = data.copy()
     data["box"] = Box(**data["box"])
-    data["clock"]["correction"] = tuple(data["clock"]["correction"])
-    data["clock"] = MessageTime(**data["clock"])
-    if data.get("hover") is not None:
-        data["hover"]["correction"] = tuple(data["hover"]["correction"])
-        data["hover"] = MessageTime(**data["hover"])
+    for key in ('clock', 'hover'):
+        if data.get(key) is not None:
+            clock = data[key]
+            data[key] = MessageTime(**{**clock, 'correction': tuple(clock['correction'])})
     data["ocr_boxes"] = tuple(tuple(box) for box in data["ocr_boxes"])
     if data["file"] is not None:
-        file = data["file"]
+        file = data["file"].copy()
         file["card_bounds"] = Box(**file["card_bounds"])
         for key in ("name_ocr_blocks", "icon_evidence"):
             file[key] = tuple(TextSpan(span["text"], Box(**span["box"]), span["score"], span.get("angle"))

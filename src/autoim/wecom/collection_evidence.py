@@ -16,7 +16,7 @@ import numpy as np
 
 from autoim.wecom.visual_store import name_key
 
-KINDS = {"b2", "before", "after", "c2", "database", "failure", "capture_failure", "hover", "a2-before", "a2-after"}
+KINDS = {"b2", "before", "after", "c2", "database", "failure", "capture_failure", "hover", "a2-before", "a2-after", "history-page"}
 PRIVATE_RASTERS = ("c2-mask-foreground", "c2-mask-morphology")
 REGIONS = {"a2", "b1", "b2", "b2-edge", "c1", "c2", "capture", "hover-before", "hover-after", *PRIVATE_RASTERS}
 
@@ -417,7 +417,7 @@ def write_evidence(archive, store, events, report, *, full):
             raise EvidenceExportError("未知视觉证据阶段")
         item = {"id": identifier, "kind": kind, "detection": event["detection"], "task": event["task"],
                 "scan": details.get("scan", ""), "event": event["id"], "source_event": details.get("source_event", ""),
-                "redacted": not full, "contains_chat": full and kind in ("c2", "failure", "after"),
+                "redacted": not full, "contains_chat": full and kind in ("c2", "history-page", "failure", "after"),
                 "status": "AVAILABLE", "regions": []}
         manifest.append(item)
         record, folder = store.read(event["detection"], identifier)

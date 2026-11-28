@@ -76,6 +76,12 @@ def avatar_distance(before, previous, after, current):
         if (current.box.contains((projected.left, projected.top))
                 and current.box.contains((projected.right - 1, projected.bottom - 1)) and projected not in boxes):
             boxes.append(projected)
+    # Selected rows can lose their contour and their inferred pitch can change.
+    # Test the unchanged absolute avatar interior when the row still contains it.
+    old = previous.avatar
+    if (before.frame.state.dpi == after.frame.state.dpi and current.box.contains((old.left, old.top))
+            and current.box.contains((old.right-1, old.bottom-1)) and old not in boxes):
+        boxes.append(old)
     distances = []
     for box in boxes:
         second = tile(after.frame, box)
@@ -83,7 +89,12 @@ def avatar_distance(before, previous, after, current):
             # Allow a few pixels of registration error while comparing RGB texture.
             scores = cv2.matchTemplate(second, interior, cv2.TM_SQDIFF)
             distances.append(float(np.sqrt(max(0., scores.min()) / interior.size)))
-    return min(distances, default=None)
+    score = min(distances, default=None)
+    if score is not None and score > 22 and (not current.avatar or
+            abs(current.avatar.width-old.width) > old.width*.15 or
+            abs(current.avatar.height-old.height) > old.height*.15):
+        return None
+    return score
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +123,8 @@ class CoreMessage:
     method: str = "BUBBLE_FIRST"
     ocr_boxes: tuple = ()
     hover: MessageTime | None = None
+    observed_at: str = ''
+    media_signature: str = ''
 
     def diagnostic(self):
         return dict(observation_id=self.id, sequence=self.sequence, direction=self.direction,
@@ -167,11 +180,19 @@ def analyze_read(raw, task, contact, count, preview, *, verified, badge_cleared,
                     and entry.container_number is None)
     messages = tuple(_read_message(item, task, contact) for item in raw.messages
                      if item.viewport_limit != "TOP_VIEWPORT_CLIPPED")
+    def signature(item):
+        tile=item.box.crop(raw.frame.pixels)
+        if tile.size==0 or tile.std()<10:
+            return ""
+        grid=cv2.resize(tile,(16,16),interpolation=cv2.INTER_AREA)//8
+        return blake2s(grid.tobytes(),digest_size=12).hexdigest()
+    messages=tuple(replace(i,media_signature=signature(i)) if i.kind=='IMAGE' and i.quality=='RELIABLE' else i
+                   for i in messages)
     # C2 OCR text classified as a centered SYSTEM row by the existing parser.
-    separators = [entry.span.box for entry in raw.message_ocr if entry.kind == "SYSTEM"
-                  and entry.span.score >= .85 and normalized_text(entry.span.text) == "以下是新消息"]
-    jump_hint = any(entry.kind in ("SYSTEM", "UNASSIGNED") and entry.span.score >= .85
-                    and normalized_text(entry.span.text) in ("跳转到最新消息", "回到最新消息", "查看新消息")
+    separators = [entry.span.box for entry in raw.message_ocr if entry.kind == "C2_N2" or (entry.kind == "SYSTEM"
+                  and entry.span.score >= .85 and normalized_text(entry.span.text) == "以下是新消息")]
+    jump_hint = any(entry.kind == "C2_N1" or (entry.kind in ("SYSTEM", "UNASSIGNED") and entry.span.score >= .85
+                    and normalized_text(entry.span.text) in ("跳转到最新消息", "回到最新消息", "查看新消息"))
                     for entry in raw.message_ocr)
     gaps = tuple({"reason": "UNASSIGNED_MESSAGE_OCR", "box": bounds(entry.span.box),
                   "confidence": round(entry.span.score, 3), "character_count": len(entry.span.text)}
@@ -260,6 +281,9 @@ class CoreView:
     a2_new_targets: int = 0
     a2_unconfirmed_open: int = 0
     range_outcome: str = ""
+    unfinished_jobs: int = 0
+    history_pages: int = 0
+    exact_times: int = 0
 
 
 @dataclass(slots=True)
@@ -288,6 +312,10 @@ class CoreTask:
     c2_evidence: str = ""
     body_reads: int = 0
     direct_reference: object | None = None
+    recovering: bool = False
+    coverage: str = ""
+    batch_id: str = ""
+    history_session: object | None = None
 
 
 @dataclass(slots=True)
@@ -296,6 +324,7 @@ class A2Attempt:
     state: str
     at: datetime
     evidence: str = ""
+    intent: str = ""
     started_input: bool = False
     confirmed_input: bool = False
     polls: int = 0
@@ -335,6 +364,12 @@ class CoreRun:
     muted_crops: set = field(default_factory=set)
     evidence_raw: object | None = None
     evidence_frame: object | None = None
+    jobs: object | None = None
+    job_ids: dict = field(default_factory=dict)
+    resuming: set = field(default_factory=set)
+    searched: set = field(default_factory=set)
+    recovery_views: set = field(default_factory=set)
+    recovery_up: bool = True
     storage_ready: bool = False
     storage_blocked: str = ""
     view: CoreView = CoreView()

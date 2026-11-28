@@ -20,9 +20,9 @@ TARGET_SECONDS = 60
 
 
 class TestDeadline(Exception):
-    def __init__(self, stage, limit, test_seconds=TEST_SECONDS):
+    def __init__(self, stage, limit, test_seconds=TEST_SECONDS, target_seconds=TARGET_SECONDS):
         self.stage, self.limit = stage, limit
-        super().__init__({"TEST": f"本轮测试达到 {test_seconds} 秒", "TARGET": "联系人处理达到 60 秒",
+        super().__init__({"TEST": f"本轮测试达到 {test_seconds} 秒", "TARGET": f"联系人处理达到 {target_seconds} 秒",
                           "STAGE": f"{PHASES[stage][0]}超时" if stage else "阶段超时"}[limit])
 
 
@@ -36,11 +36,15 @@ class TestPhase:
 
 
 class TestClock:
-    def __init__(self, emit, now=perf_counter, *, seconds=TEST_SECONDS):
+    def __init__(self, emit, now=perf_counter, *, seconds=TEST_SECONDS, history=False):
         self.now = now
         self.emit = emit
         self.lock = RLock()
         self.started = now()
+        self.stage_limits = {number: seconds for number, (_, seconds) in PHASES.items()}
+        if history:
+            self.stage_limits.update({6: 145, 7: 20})
+        self.target_seconds = 180 if history else TARGET_SECONDS
         self.seconds = seconds
         self.end = self.started + seconds
         self.target_end = float("inf")
@@ -51,11 +55,11 @@ class TestClock:
         self.reason = ""
         self.last_issue = ""
         emit("TEST_STARTED", "", {})
-        emit("TEST_DEADLINE_SET", "", {"test_seconds": seconds, "target_seconds": TARGET_SECONDS,
-                                      "stage_limits": {k: v[1] for k, v in PHASES.items()}})
+        emit("TEST_DEADLINE_SET", "", {"test_seconds": seconds, "target_seconds": self.target_seconds,
+                                      "stage_limits": self.stage_limits.copy()})
 
     def begin_target(self):
-        self.target_end = self.now() + TARGET_SECONDS
+        self.target_end = self.now() + self.target_seconds
 
     def end_target(self):
         self.target_end = float("inf")
@@ -76,14 +80,14 @@ class TestClock:
 
     def _deadline(self):
         phase = self.phase
-        stage_end = phase.started + PHASES[phase.number][1] if phase else float("inf")
+        stage_end = phase.started + self.stage_limits[phase.number] if phase else float("inf")
         return min((self.end, "TEST"), (self.target_end, "TARGET"), (stage_end, "STAGE"), key=lambda item: item[0])
 
     def check(self):
         with self.lock:
             end, limit = self._deadline()
             if self.now() >= end:
-                raise TestDeadline(self.phase.number if self.phase else 0, limit, self.seconds)
+                raise TestDeadline(self.phase.number if self.phase else 0, limit, self.seconds, self.target_seconds)
             return end
 
     def _event(self, code, result="", **details):
@@ -95,7 +99,7 @@ class TestClock:
         self.emit(code, result, {"stage_number": phase.number, "stage_name": PHASES[phase.number][0],
                                  "started_at": phase.wall, "elapsed_ms": round((now - phase.started) * 1000),
                                  "remaining_ms": max(0, round((deadline - now) * 1000)),
-                                 "stage_limit_seconds": PHASES[phase.number][1], "active_limit": limit,
+                                 "stage_limit_seconds": self.stage_limits[phase.number], "active_limit": limit,
                                  "operation": phase.operation, "retries": phase.retries, **details})
 
     def progress(self, operation, reason="", *, retry=False):
@@ -150,8 +154,8 @@ class TestClock:
             return {"number": phase.number if phase else self.last_phase, "operation": phase.operation if phase else "",
                     "elapsed": max(0, now - phase.started) if phase else 0,
                     "remaining": max(0, deadline - now) if phase else 0,
-                    "duration": PHASES[phase.number][1] if phase else 0,
+                    "duration": self.stage_limits[phase.number] if phase else 0,
                     "total": now - self.started, "finished": self.finished is not None,
-                    "reason": str(TestDeadline(phase.number, limit, self.seconds)) if awaiting_timeout else self.reason,
+                    "reason": str(TestDeadline(phase.number, limit, self.seconds, self.target_seconds)) if awaiting_timeout else self.reason,
                     "awaiting_timeout": awaiting_timeout, "last_issue": self.last_issue,
                     "previous": self.last_phase, "outcomes": dict(self.outcomes)}

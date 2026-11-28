@@ -11,6 +11,7 @@ import numpy as np
 
 from autoim.vision import NormalizedRect
 from autoim.wecom.visual_files import FileCardObservation, parse_file_card, quiet_card_bounds
+from autoim.wecom.visual_history import history_controls, report_images
 from autoim.wecom.visual_layout import Box, VisualThresholds, contours, near_background
 from autoim.wecom.visual_ocr import TextSpan, text_lines
 from autoim.wecom.visual_time import is_time_label
@@ -508,6 +509,15 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                      spans: tuple[TextSpan, ...], unit: float,
                      calibration: Mapping[str, NormalizedRect],
                      thresholds: VisualThresholds, *, page_verified: bool = True, capture_masks=False) -> MessageAnalysis:
+    controls = history_controls(pixels, region, spans, unit) if page_verified else {}
+    media = report_images(pixels, region, spans, unit) if page_verified else ()
+    def owned(box, outer):
+        return outer.contains(box.center) and box.width <= outer.width * 1.15 and box.height <= outer.height * 1.6
+
+    containers = tuple(item for item in containers if not any(owned(item.box, box) for _, box in controls.values())
+                       and not any(owned(item.box, box) for box in media))
+    images = tuple(Container(box, box.top <= region.top+2*unit or box.bottom >= region.bottom-2*unit,
+                             'REPORT_IMAGE_OUTLINE') for box in media)
     center = region.center[0]
     time_like = {span for span in spans if span.score >= thresholds.text_score
                  and abs(span.box.center[0] - center) <= region.width * .12
@@ -516,13 +526,15 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                        and abs(span.box.center[0] - center) <= region.width * .12 and _SYSTEM.search(span.text)}
     watermarks, masks, reviews = set(), (), {}
     clipped_top = _large_top_fragment(pixels, region, unit, thresholds) if page_verified and spans else ()
+    clipped_top = tuple(box for box in clipped_top if not any(owned(box, image) for image in media))
     clipped_spans = {span for span in spans if any(
         area.left <= span.box.left and span.box.right <= area.right
         and span.box.top >= region.top and span.box.bottom <= area.bottom for area in clipped_top)}
     containers = tuple(item for item in containers if not any(_overlaps(item.box, area) for area in clipped_top))
     if page_verified and spans:
         containers, watermarks, masks, reviews = _recover_bubbles(pixels, region, containers, spans,
-                                                        time_like | centered_system | clipped_spans, unit, thresholds, capture_masks)
+                                                        time_like | centered_system | clipped_spans | set(controls) | {span for span in spans if any(box.contains(span.box.center) for box in media)}, unit, thresholds, capture_masks)
+    containers += images
     attachment_spans = tuple(span for span in spans if span not in time_like)
     preliminary = _file_candidates(containers, attachment_spans, unit, thresholds.text_score) if page_verified else {}
     structured = {item: found for item in containers if item.quiet_outline and item not in preliminary and page_verified
@@ -530,6 +542,9 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                               and outer.box.width * outer.box.height <= 3.5 * item.box.width * item.box.height
                               for outer in containers)
                   if (found := _structured_card(pixels, region, item, attachment_spans, unit, thresholds))}
+    for item in images:
+        preliminary.pop(item, None)
+        structured[item] = ('IMAGE', '连续着色图表外框和多列内部 OCR')
     owning_cards = (*preliminary, *structured)
     # Strong outer bounds own inner icon contours. Competing card-sized boxes
     # remain separate so the normal association check can flag ambiguous OCR.
@@ -541,6 +556,10 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
     grouped: dict[int, list[int]] = {}
     times = []
     for span in spans:
+        if span in controls:
+            kind, _ = controls[span]
+            dispositions.append(OcrDisposition(span, kind, None, None, "原生新消息控件"))
+            continue
         ranked = sorted(((score, index) for index, item in enumerate(containers, 1)
                          if not item.quiet_outline or item in owning_cards
                          if (score := _association_score(span.box, item.box, unit)) is not None),
@@ -618,6 +637,8 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
             file = replace(preliminary[item], file_name=None, file_extension=None, file_size_text=None,
                            parse_status="INCOMPLETE", failure_reasons=("文件卡片 OCR 未能唯一归属",))
         photo_shape = box.height >= 48 * unit and box.width >= 54 * unit
+        if item in images:
+            file = None
         if file is not None:
             kind = "FILE" if file.parse_status == "COMPLETE" else "FILE_CANDIDATE"
             evidence.extend(file.failure_reasons or ("卡片内文件名和大小已读取，附件内容未读取",))
@@ -653,7 +674,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                                                           for span in matching)):
                 viewport_limit = "TOP_VIEWPORT_CLIPPED"
             direction = "UNKNOWN"
-            if file is None:
+            if file is None and item not in images:
                 kind = "UNKNOWN"
             status = "PARTIALLY_VISIBLE"
             evidence.append("容器接触视口边缘，文字可能截断")
@@ -681,7 +702,7 @@ def analyze_messages(pixels: np.ndarray, region: Box, containers: tuple[Containe
                                                  viewport_limit=viewport_limit, container_confirmed=item in structured))
         for pos in positions:
             span = dispositions[pos].span
-            if viewport_limit == "TOP_VIEWPORT_CLIPPED":
+            if viewport_limit == "TOP_VIEWPORT_CLIPPED" and item not in images:
                 dispositions[pos] = OcrDisposition(span, viewport_limit, index, index, "顶部气泡经视口裁切")
             elif file is not None:
                 reason = ("已与文件卡片图标区关联" if span in file.icon_evidence else "已与文件卡片字段关联")

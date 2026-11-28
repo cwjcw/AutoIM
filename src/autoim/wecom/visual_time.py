@@ -117,6 +117,22 @@ def parse_hover_time(raw, observed, *, lower=None, upper=None):
     value = unicodedata.normalize("NFKC", raw).strip()
     found = _HOVER_TIME.fullmatch(value)
     base = MessageTime(raw, "HOVER", normalized=value, format="MONTH_DAY_CLOCK_SECONDS")
+    if not found:
+        compact = re.fullmatch(r"(\d{1,2})/(\d{2,4}):(\d{2}):(\d{2})",value)
+        if compact and observed.utcoffset() is not None:
+            month,digits,minute,second=compact.groups()
+            candidates=[]
+            for cut in (1,2):
+                day,hour=digits[:cut],digits[cut:]
+                if not hour or len(hour)>2:
+                    continue
+                parsed=parse_hover_time(f"{month}/{day} {hour}:{minute}:{second}",observed,lower=lower,upper=upper)
+                if not parsed.issue:
+                    candidates.append(parsed)
+            if len(candidates)==1:
+                return replace(candidates[0],raw=raw,correction=("OCR_DATE_CLOCK_SPACE_MISSING",))
+            if candidates:
+                return replace(base,issue="HOVER_DATE_CLOCK_AMBIGUOUS")
     if not found or observed.utcoffset() is None:
         return replace(base, issue="INVALID_HOVER_FORMAT")
     month, day, hour, minute, second = map(int, found.groups())
